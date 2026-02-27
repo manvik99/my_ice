@@ -31,6 +31,8 @@
 #define PCI_COMMAND_MASTER 0x4
 
 #define ALIGN_UP(v, a) (((v) + ((a) - 1)) & ~((size_t)((a) - 1)))
+#define TX_BURST_SIZE 64
+#define TX_RS_THRESH 32
 
 struct dma_block {
     void *vaddr;
@@ -57,9 +59,11 @@ struct io_ring_ctx {
 
     struct ice_tx_desc *tx_desc;
     uint64_t tx_desc_iova;
-    uint8_t *tx_pkt_buf;
+    uint8_t *tx_pkt_bufs;
     uint64_t tx_pkt_iova;
-    uint16_t tx_tail;
+    uint16_t tx_next_to_use;
+    uint16_t tx_next_to_clean;
+    uint16_t tx_pkts_since_rs;
 
     union ice_32b_rx_flex_desc *rx_desc;
     uint64_t rx_desc_iova;
@@ -331,7 +335,7 @@ static void layout_dma(struct dev_ctx *d)
     PLACE(d->arq.buf, d->arq.buf_iova, ICE_AQ_NUM_DESC * ICE_AQ_MAX_BUF_LEN, 4096);
 
     PLACE(d->io.tx_desc, d->io.tx_desc_iova, ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc), 128);
-    PLACE(d->io.tx_pkt_buf, d->io.tx_pkt_iova, ICE_TX_PKT_BUF_SIZE, 128);
+    PLACE(d->io.tx_pkt_bufs, d->io.tx_pkt_iova, ICE_TX_DESC_COUNT * ICE_TX_PKT_BUF_SIZE, 128);
     PLACE(d->io.rx_desc, d->io.rx_desc_iova, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc), 128);
     PLACE(d->io.rx_bufs, d->io.rx_bufs_iova, ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE, 128);
 
@@ -848,65 +852,94 @@ static int setup_and_enable_rxq(struct dev_ctx *d)
     return 0;
 }
 
-static int send_one_packet(struct dev_ctx *d, const uint8_t *pkt, uint16_t len)
+static void tx_ring_init(struct dev_ctx *d)
 {
-    uint16_t idx = d->io.tx_tail;
-    uint16_t next = (uint16_t)((idx + 1) % ICE_TX_DESC_COUNT);
-    uint64_t qw1;
+    memset(d->io.tx_desc, 0, ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc));
+    d->io.tx_next_to_use = 0;
+    d->io.tx_next_to_clean = 0;
+    d->io.tx_pkts_since_rs = 0;
+}
+
+static void tx_reclaim_completed(struct dev_ctx *d)
+{
+    uint16_t head = (uint16_t)(reg_read32(d, QTX_COMM_HEAD(d->io.txq_id)) & 0x1FFFU);
+    if (head >= ICE_TX_DESC_COUNT)
+        head = (uint16_t)(head % ICE_TX_DESC_COUNT);
+    d->io.tx_next_to_clean = head;
+}
+
+static uint16_t tx_desc_unused(struct dev_ctx *d)
+{
+    uint16_t ntu = d->io.tx_next_to_use;
+    uint16_t ntc = d->io.tx_next_to_clean;
+    uint16_t used;
+
+    if (ntu >= ntc)
+        used = (uint16_t)(ntu - ntc);
+    else
+        used = (uint16_t)(ICE_TX_DESC_COUNT - (ntc - ntu));
+
+    return (uint16_t)(ICE_TX_DESC_COUNT - used - 1);
+}
+
+/* Returns: 0=enqueued, 1=ring full, -1=invalid packet */
+static int tx_try_enqueue(struct dev_ctx *d, const uint8_t *pkt, uint16_t len)
+{
+    uint16_t idx;
+    uint16_t next;
+    uint8_t *buf;
     struct ice_tx_desc *txd;
-    struct timespec start, now;
-    int saw_desc_done = 0;
-    int i;
+    uint16_t cmd = ICE_TX_DESC_CMD_EOP;
+    uint64_t qw1;
 
     if (len > ICE_TX_PKT_BUF_SIZE)
         return -1;
 
-    memcpy(d->io.tx_pkt_buf, pkt, len);
+    tx_reclaim_completed(d);
+    if (tx_desc_unused(d) == 0)
+        return 1;
+
+    idx = d->io.tx_next_to_use;
+    next = (uint16_t)((idx + 1) % ICE_TX_DESC_COUNT);
+    buf = d->io.tx_pkt_bufs + ((size_t)idx * ICE_TX_PKT_BUF_SIZE);
+    memcpy(buf, pkt, len);
+
+    d->io.tx_pkts_since_rs++;
+    if (d->io.tx_pkts_since_rs >= TX_RS_THRESH) {
+        cmd |= ICE_TX_DESC_CMD_RS;
+        d->io.tx_pkts_since_rs = 0;
+    }
 
     txd = &d->io.tx_desc[idx];
-    memset(txd, 0, sizeof(*txd));
-    txd->buf_addr = htole64(d->io.tx_pkt_iova);
-
+    txd->buf_addr = htole64(d->io.tx_pkt_iova + ((uint64_t)idx * ICE_TX_PKT_BUF_SIZE));
     qw1 = ((uint64_t)ICE_TX_DESC_DTYPE_DATA << ICE_TXD_QW1_DTYPE_S) |
-          ((uint64_t)(ICE_TX_DESC_CMD_EOP | ICE_TX_DESC_CMD_RS) << ICE_TXD_QW1_CMD_S) |
+          ((uint64_t)cmd << ICE_TXD_QW1_CMD_S) |
           ((uint64_t)len << ICE_TXD_QW1_TX_BUF_SZ_S);
     txd->cmd_type_offset_bsz = htole64(qw1);
 
     __sync_synchronize();
-    d->io.tx_tail = next;
-    reg_write32(d, QTX_COMM_DBELL(d->io.txq_id), d->io.tx_tail);
-
-    if (clock_gettime(CLOCK_MONOTONIC, &start) != 0)
-        die_errno("clock_gettime start");
-
-    for (i = 0; i < 20000; i++) {
-        uint64_t ctb = le64toh(txd->cmd_type_offset_bsz);
-        uint64_t dtype = (ctb & (0xFULL << ICE_TXD_QW1_DTYPE_S)) >>
-                         ICE_TXD_QW1_DTYPE_S;
-        long elapsed_ms;
-
-        if (dtype == ICE_TX_DESC_DTYPE_DESC_DONE) {
-            saw_desc_done = 1;
-            break;
-        }
-
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-            die_errno("clock_gettime now");
-        elapsed_ms = (now.tv_sec - start.tv_sec) * 1000L +
-                     (now.tv_nsec - start.tv_nsec) / 1000000L;
-        if (elapsed_ms >= 200)
-            break;
-
-        usleep(10);
-    }
-
-    if (!saw_desc_done) {
-        uint32_t head = reg_read32(d, QTX_COMM_HEAD(d->io.txq_id)) & 0x1FFFU;
-        fprintf(stderr, "[my_ice] tx desc done not observed (QTX head=%u tail=%u), continuing to RX poll\n",
-                head, d->io.tx_tail);
-    }
-
+    d->io.tx_next_to_use = next;
     return 0;
+}
+
+static inline void tx_ring_doorbell(struct dev_ctx *d)
+{
+    reg_write32(d, QTX_COMM_DBELL(d->io.txq_id), d->io.tx_next_to_use);
+}
+
+static int tx_wait_drain(struct dev_ctx *d, int timeout_ms)
+{
+    uint64_t start_ns = monotonic_ns();
+    uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
+
+    while (monotonic_ns() - start_ns < timeout_ns) {
+        tx_reclaim_completed(d);
+        if (d->io.tx_next_to_clean == d->io.tx_next_to_use)
+            return 0;
+        usleep(50);
+    }
+
+    return -1;
 }
 
 static void rearm_rx_desc(struct dev_ctx *d, uint16_t idx)
@@ -1146,8 +1179,7 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
         return -1;
     }
 
-    memset(d->io.tx_desc, 0, ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc));
-    d->io.tx_tail = 0;
+    tx_ring_init(d);
 
     memcpy(pkt + 0, dst_mac, ETHER_ADDR_LEN);
     memcpy(pkt + 6, d->io.mac, ETHER_ADDR_LEN);
@@ -1177,14 +1209,29 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
                                      GLV_GOTCH(d->io.vsi_num));
 
     for (i = 0; i < count; i++) {
-        if (send_one_packet(d, pkt, frame_len) < 0) {
-            fprintf(stderr, "[my_ice] tx-send failed at packet %d/%d\n",
+        int tries;
+        for (tries = 0; tries < 100000; tries++) {
+            int enq = tx_try_enqueue(d, pkt, frame_len);
+            if (enq == 0) {
+                tx_ring_doorbell(d);
+                break;
+            }
+            if (enq < 0) {
+                fprintf(stderr, "[my_ice] tx-send invalid packet at %d/%d\n",
+                        i + 1, count);
+                return -1;
+            }
+        }
+        if (tries == 100000) {
+            fprintf(stderr, "[my_ice] tx-send ring full at packet %d/%d\n",
                     i + 1, count);
             return -1;
         }
         if (interval_ms > 0)
             usleep((useconds_t)interval_ms * 1000U);
     }
+
+    (void)tx_wait_drain(d, 1000);
 
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
@@ -1226,8 +1273,7 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
         return -1;
     }
 
-    memset(d->io.tx_desc, 0, ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc));
-    d->io.tx_tail = 0;
+    tx_ring_init(d);
 
     memcpy(pkt + 0, dst_mac, ETHER_ADDR_LEN);
     memcpy(pkt + 6, d->io.mac, ETHER_ADDR_LEN);
@@ -1259,55 +1305,72 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
     next_report_ns = start_ns + one_sec_ns;
 
     while (true) {
+        uint16_t burst_pkts = 0;
+        int i;
+
         now_ns = monotonic_ns();
         if (now_ns >= end_ns)
             break;
 
-        if (send_one_packet(d, pkt, frame_len) < 0) {
-            fprintf(stderr, "[my_ice] tx-bench send failed after %" PRIu64 " packets\n",
-                    pkts_total);
-            return -1;
-        }
-        pkts_total++;
-
-        if ((pkts_total & 0x3FFU) == 0) {
-            now_ns = monotonic_ns();
-            if (now_ns >= next_report_ns) {
-                uint64_t interval_ns;
-                uint64_t interval_pkts;
-                uint64_t interval_bytes;
-                double interval_s;
-                double mbps;
-                double pps;
-                double mpps;
-
-                gotc_now = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                              GLV_GOTCH(d->io.vsi_num));
-                interval_ns = now_ns - last_report_ns;
-                interval_pkts = pkts_total - pkts_prev;
-                interval_bytes = gotc_now - gotc_prev;
-                interval_s = (double)interval_ns / (double)one_sec_ns;
-
-                mbps = interval_s > 0.0 ?
-                    ((double)interval_bytes * 8.0) / (interval_s * 1e6) : 0.0;
-                pps = interval_s > 0.0 ?
-                    (double)interval_pkts / interval_s : 0.0;
-                mpps = pps / 1e6;
-
-                fprintf(stderr,
-                        "[my_ice] tx-bench t=%.2fs interval: Mbps=%.3f Mpps=%.3f PPS=%.0f bytes=%" PRIu64 " pkts=%" PRIu64 "\n",
-                        (double)(now_ns - start_ns) / (double)one_sec_ns,
-                        mbps, mpps, pps, interval_bytes, interval_pkts);
-
-                last_report_ns = now_ns;
-                gotc_prev = gotc_now;
-                pkts_prev = pkts_total;
-                next_report_ns += one_sec_ns;
-                if (next_report_ns < now_ns)
-                    next_report_ns = now_ns + one_sec_ns;
+        for (i = 0; i < TX_BURST_SIZE; i++) {
+            int enq = tx_try_enqueue(d, pkt, frame_len);
+            if (enq == 0) {
+                burst_pkts++;
+                continue;
             }
+            if (enq < 0) {
+                fprintf(stderr, "[my_ice] tx-bench enqueue failed after %" PRIu64 " packets\n",
+                        pkts_total);
+                return -1;
+            }
+            break;
+        }
+
+        if (burst_pkts > 0) {
+            tx_ring_doorbell(d);
+            pkts_total += burst_pkts;
+        } else {
+            tx_reclaim_completed(d);
+        }
+
+        now_ns = monotonic_ns();
+        if (now_ns >= next_report_ns) {
+            uint64_t interval_ns;
+            uint64_t interval_pkts;
+            uint64_t interval_bytes;
+            double interval_s;
+            double mbps;
+            double pps;
+            double mpps;
+
+            gotc_now = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
+                                          GLV_GOTCH(d->io.vsi_num));
+            interval_ns = now_ns - last_report_ns;
+            interval_pkts = pkts_total - pkts_prev;
+            interval_bytes = gotc_now - gotc_prev;
+            interval_s = (double)interval_ns / (double)one_sec_ns;
+
+            mbps = interval_s > 0.0 ?
+                ((double)interval_bytes * 8.0) / (interval_s * 1e6) : 0.0;
+            pps = interval_s > 0.0 ?
+                (double)interval_pkts / interval_s : 0.0;
+            mpps = pps / 1e6;
+
+            fprintf(stderr,
+                    "[my_ice] tx-bench t=%.2fs interval: Mbps=%.3f Mpps=%.3f PPS=%.0f bytes=%" PRIu64 " pkts=%" PRIu64 "\n",
+                    (double)(now_ns - start_ns) / (double)one_sec_ns,
+                    mbps, mpps, pps, interval_bytes, interval_pkts);
+
+            last_report_ns = now_ns;
+            gotc_prev = gotc_now;
+            pkts_prev = pkts_total;
+            next_report_ns += one_sec_ns;
+            if (next_report_ns < now_ns)
+                next_report_ns = now_ns + one_sec_ns;
         }
     }
+
+    (void)tx_wait_drain(d, 1000);
 
     now_ns = monotonic_ns();
     gotc_now = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
@@ -1463,7 +1526,7 @@ int main(int argc, char **argv)
         ICE_AQ_NUM_DESC * ICE_AQ_MAX_BUF_LEN +
         ICE_AQ_NUM_DESC * ICE_AQ_MAX_BUF_LEN +
         ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc) +
-        ICE_TX_PKT_BUF_SIZE +
+        ICE_TX_DESC_COUNT * ICE_TX_PKT_BUF_SIZE +
         ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc) +
         ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE +
         8192;
