@@ -625,56 +625,6 @@ static int aq_get_qparent_teid(struct dev_ctx *d)
     return 0;
 }
 
-static int aq_set_mac_loopback(struct dev_ctx *d, bool enable)
-{
-    struct ice_aq_desc desc;
-
-    fill_dflt_direct_desc(&desc, ICE_AQC_OPC_SET_MAC_LB);
-    desc.params.set_mac_lb.lb_mode = enable ? ICE_AQ_MAC_LB_EN : 0;
-
-    return aq_send_cmd(d, &desc, NULL, 0);
-}
-
-static int aq_set_phy_loopback(struct dev_ctx *d, bool enable)
-{
-    struct ice_aq_desc desc;
-    uint8_t modes[2];
-    int nmode = 1;
-    int i;
-
-    if (!enable) {
-        fill_dflt_direct_desc(&desc, ICE_AQC_OPC_SET_PHY_LB);
-        desc.params.set_phy_lb.lport_num = d->io.lport;
-        desc.params.set_phy_lb.lport_num_valid = ICE_AQ_PHY_LB_PORT_NUM_VALID;
-        desc.params.set_phy_lb.phy_index = 0;
-        desc.params.set_phy_lb.lb_mode = 0;
-        return aq_send_cmd(d, &desc, NULL, 0);
-    }
-
-    modes[0] = ICE_AQ_PHY_LB_EN |
-               ICE_AQ_PHY_LB_TYPE_LOCAL |
-               ICE_AQ_PHY_LB_LEVEL_PMD;
-    modes[1] = ICE_AQ_PHY_LB_EN |
-               ICE_AQ_PHY_LB_TYPE_LOCAL |
-               ICE_AQ_PHY_LB_LEVEL_PCS;
-    nmode = 2;
-
-    for (i = 0; i < nmode; i++) {
-        fill_dflt_direct_desc(&desc, ICE_AQC_OPC_SET_PHY_LB);
-        desc.params.set_phy_lb.lport_num = d->io.lport;
-        desc.params.set_phy_lb.lport_num_valid = ICE_AQ_PHY_LB_PORT_NUM_VALID;
-        desc.params.set_phy_lb.phy_index = 0;
-        desc.params.set_phy_lb.lb_mode = modes[i];
-        if (aq_send_cmd(d, &desc, NULL, 0) == 0) {
-            fprintf(stderr, "[my_ice] PHY loopback enabled (mode=0x%02x)\n",
-                    modes[i]);
-            return 0;
-        }
-    }
-
-    return -1;
-}
-
 struct my_sw_rule_lkup_rx_tx {
     struct {
         uint16_t type;
@@ -687,44 +637,6 @@ struct my_sw_rule_lkup_rx_tx {
     uint16_t hdr_len;
     uint8_t hdr_data[ICE_DUMMY_ETH_HDR_LEN];
 } __attribute__((packed));
-
-static int aq_add_tx_lb_promisc_rule(struct dev_ctx *d, uint16_t *rule_idx)
-{
-    static const uint8_t dummy_eth_header[ICE_DUMMY_ETH_HDR_LEN] = {
-        0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x81, 0x00, 0x00, 0x00
-    };
-    struct my_sw_rule_lkup_rx_tx rule = {0};
-    struct ice_aq_desc desc;
-    uint32_t act = 0;
-
-    rule.hdr.type = htole16(ICE_AQC_SW_RULES_T_LKUP_TX);
-    rule.recipe_id = htole16(ICE_SW_LKUP_PROMISC);
-    rule.src = htole16(d->io.vsi_num);
-    act |= ((uint32_t)d->io.vsi_num << ICE_SINGLE_ACT_VSI_ID_S) &
-           ICE_SINGLE_ACT_VSI_ID_M;
-    act |= ICE_SINGLE_ACT_VSI_FORWARDING |
-           ICE_SINGLE_ACT_LB_ENABLE |
-           ICE_SINGLE_ACT_VALID_BIT |
-           ICE_SINGLE_ACT_LAN_ENABLE;
-    rule.act = htole32(act);
-    rule.hdr_len = htole16(ICE_DUMMY_ETH_HDR_LEN);
-    memcpy(rule.hdr_data, dummy_eth_header, sizeof(dummy_eth_header));
-
-    fill_dflt_direct_desc(&desc, ICE_AQC_OPC_ADD_SW_RULES);
-    desc.flags = htole16(le16toh(desc.flags) | ICE_AQ_FLAG_RD);
-    desc.params.sw_rules.num_rules_fltr_entry_index = htole16(1);
-
-    if (aq_send_cmd(d, &desc, &rule, sizeof(rule)) < 0)
-        return -1;
-
-    if (rule_idx)
-        *rule_idx = le16toh(rule.index);
-    fprintf(stderr, "[my_ice] ADD_SW_RULES TX-LB promisc index=%u\n",
-            le16toh(rule.index));
-    return 0;
-}
 
 static int aq_add_rx_mac_rule(struct dev_ctx *d, uint16_t *rule_idx)
 {
@@ -1127,129 +1039,6 @@ static void print_payload_dump(const uint8_t *pkt, uint16_t len)
     }
 }
 
-static int run_txrx_selftest(struct dev_ctx *d, bool use_phy_loopback)
-{
-    uint32_t tx_alloc, rx_alloc;
-    uint8_t pkt[64] = {0};
-    uint8_t rxpkt[2048];
-    uint16_t rxlen = 0;
-    uint16_t promisc_rule_idx = UINT16_MAX;
-    uint64_t gotc_before, gorc_before;
-    uint64_t gotc_after, gorc_after;
-    bool mac_loopback_enabled = false;
-    bool phy_loopback_enabled = false;
-    int rc = -1;
-    int i;
-
-    tx_alloc = reg_read32(d, PFLAN_TX_QALLOC);
-    rx_alloc = reg_read32(d, PFLAN_RX_QALLOC);
-
-    if (!(tx_alloc & PFLAN_TX_QALLOC_VALID_M) || !(rx_alloc & PFLAN_RX_QALLOC_VALID_M)) {
-        fprintf(stderr, "queue alloc not valid (TX=0x%08x RX=0x%08x)\n", tx_alloc, rx_alloc);
-        goto out;
-    }
-
-    d->io.txq_id = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
-    d->io.rxq_id = (uint16_t)(rx_alloc & PFLAN_RX_QALLOC_FIRSTQ_M);
-
-    fprintf(stderr, "[my_ice] txq=%u rxq=%u\n", d->io.txq_id, d->io.rxq_id);
-
-    if (aq_get_default_vsi_and_lport(d) < 0) {
-        fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
-        goto out;
-    }
-
-    if (aq_get_qparent_teid(d) < 0) {
-        fprintf(stderr, "[my_ice] failed to get parent TEID\n");
-        goto out;
-    }
-
-    fprintf(stderr, "[my_ice] vsi=%u lport=%u parent_teid=0x%x\n",
-            d->io.vsi_num, d->io.lport, d->io.qparent_teid);
-
-    if (use_phy_loopback) {
-        fprintf(stderr, "[my_ice] enabling PHY loopback on lport=%u\n", d->io.lport);
-        if (aq_set_phy_loopback(d, true) < 0) {
-            fprintf(stderr, "[my_ice] enabling PHY loopback failed\n");
-            goto out;
-        }
-        phy_loopback_enabled = true;
-    }
-
-    if (add_one_tx_queue(d) < 0) {
-        fprintf(stderr, "[my_ice] add tx queue failed\n");
-        goto out;
-    }
-
-    if (setup_and_enable_rxq(d) < 0) {
-        fprintf(stderr, "[my_ice] setup/enable rx queue failed\n");
-        goto out;
-    }
-
-    if (aq_add_tx_lb_promisc_rule(d, &promisc_rule_idx) < 0)
-        fprintf(stderr, "[my_ice] warning: failed to add TX-LB promisc rule\n");
-
-    if (aq_set_mac_loopback(d, true) < 0) {
-        fprintf(stderr, "[my_ice] enabling MAC loopback failed\n");
-        goto out;
-    }
-    mac_loopback_enabled = true;
-
-    memset(d->io.tx_desc, 0, ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc));
-    d->io.tx_tail = 0;
-
-    memcpy(pkt + 0, d->io.mac, 6);
-    memcpy(pkt + 6, d->io.mac, 6);
-    pkt[12] = 0x88;
-    pkt[13] = 0xB5;
-    memcpy(pkt + 14, "my_ice-txrx-selftest", 19);
-
-    fprintf(stderr, "[my_ice] sending one loopback test frame\n");
-    gotc_before = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                     GLV_GOTCH(d->io.vsi_num));
-    gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                     GLV_GORCH(d->io.vsi_num));
-    if (send_one_packet(d, pkt, 60) < 0) {
-        fprintf(stderr, "[my_ice] tx send timeout\n");
-        goto out;
-    }
-
-    for (i = 0; i < 500; i++) {
-        int got = poll_one_rx_packet(d, rxpkt, sizeof(rxpkt), &rxlen);
-        if (got < 0) {
-            dump_mdet_regs(d);
-            goto out;
-        }
-        if (got > 0) {
-            printf("TXRX: received %u bytes, ethertype 0x%02x%02x\n",
-                   rxlen, rxpkt[12], rxpkt[13]);
-            print_payload_dump(rxpkt, rxlen);
-            rc = 0;
-            goto out;
-        }
-        usleep(1000);
-    }
-
-    gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                    GLV_GOTCH(d->io.vsi_num));
-    gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                    GLV_GORCH(d->io.vsi_num));
-
-    fprintf(stderr, "[my_ice] rx poll timeout (no packet)\n");
-    fprintf(stderr, "[my_ice] VSI%u counters: GOTC +%" PRIu64 " bytes, GORC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, gotc_after - gotc_before, gorc_after - gorc_before);
-    dump_rx_desc_snapshot(d);
-    dump_mdet_regs(d);
-
-out:
-    if (mac_loopback_enabled)
-        (void)aq_set_mac_loopback(d, false);
-    if (phy_loopback_enabled)
-        (void)aq_set_phy_loopback(d, false);
-    aq_remove_sw_rule_best_effort(d, ICE_AQC_SW_RULES_T_LKUP_TX, promisc_rule_idx);
-    return rc;
-}
-
 static int run_rx_listen(struct dev_ctx *d, int timeout_ms)
 {
     uint32_t rx_alloc;
@@ -1573,9 +1362,7 @@ int main(int argc, char **argv)
         .device_fd = -1,
     };
     const char *bdf;
-    bool run_txrx = false;
     bool run_rx_listen_mode = false;
-    bool run_phy_loopback_test = false;
     bool run_tx_send_mode = false;
     bool run_tx_bench_mode = false;
     int rx_listen_timeout_s = 30;
@@ -1590,9 +1377,7 @@ int main(int argc, char **argv)
     int rc = EXIT_FAILURE;
 
     if (argc < 2 || argc > 7) {
-        fprintf(stderr, "Usage: %s <BDF> [--txrx-test|--phy-loopback-test|--rx-listen [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>]\n", argv[0]);
-        fprintf(stderr, "Example: %s 0000:17:00.0 --txrx-test\n", argv[0]);
-        fprintf(stderr, "Example: %s 0000:17:00.0 --phy-loopback-test\n", argv[0]);
+        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>]\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen 60\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send 40:a6:b7:c3:43:e8\n", argv[0]);
@@ -1603,19 +1388,7 @@ int main(int argc, char **argv)
 
     bdf = argv[1];
     if (argc >= 3) {
-        if (strcmp(argv[2], "--txrx-test") == 0) {
-            if (argc != 3) {
-                fprintf(stderr, "--txrx-test does not take extra args\n");
-                return EXIT_FAILURE;
-            }
-            run_txrx = true;
-        } else if (strcmp(argv[2], "--phy-loopback-test") == 0) {
-            if (argc != 3) {
-                fprintf(stderr, "--phy-loopback-test does not take extra args\n");
-                return EXIT_FAILURE;
-            }
-            run_phy_loopback_test = true;
-        } else if (strcmp(argv[2], "--rx-listen") == 0) {
+        if (strcmp(argv[2], "--rx-listen") == 0) {
             run_rx_listen_mode = true;
             if (argc == 4 &&
                 parse_int_range(argv[3], 1, 3600, &rx_listen_timeout_s) < 0) {
@@ -1707,15 +1480,7 @@ int main(int argc, char **argv)
     if (aq_manage_mac_read(&d) < 0)
         goto out;
 
-    if (run_txrx) {
-        fprintf(stderr, "[my_ice] running tx/rx self-test path\n");
-        if (run_txrx_selftest(&d, false) < 0)
-            goto out;
-    } else if (run_phy_loopback_test) {
-        fprintf(stderr, "[my_ice] running phy loopback tx/rx self-test path\n");
-        if (run_txrx_selftest(&d, true) < 0)
-            goto out;
-    } else if (run_rx_listen_mode) {
+    if (run_rx_listen_mode) {
         fprintf(stderr, "[my_ice] running rx listen path\n");
         if (run_rx_listen(&d, rx_listen_timeout_s * 1000) < 0)
             goto out;
