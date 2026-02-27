@@ -4,6 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MYICE_BIN="${SCRIPT_DIR}/my_ice"
+MYICE_RUST_DIR="${SCRIPT_DIR}/my_ice_rust"
+MYICE_RUST_BIN="${MYICE_RUST_DIR}/my_ice_rust"
+MYICE_RUST_BUILD="${MYICE_RUST_DIR}/build.sh"
 PKTGEN_SCRIPT="${SCRIPT_DIR}/pktgen_bench.sh"
 DPDK_DEVBIND=""
 
@@ -15,6 +18,7 @@ PAYLOAD_LEN=1000
 PKTGEN_THREAD=0
 
 RUN_MYICE=1
+RUN_MYICE_RUST=1
 RUN_PKTGEN=1
 
 MYICE_MBPS="-"
@@ -22,6 +26,12 @@ MYICE_MPPS="-"
 MYICE_PPS="-"
 MYICE_BYTES="-"
 MYICE_PKTS="-"
+
+MYICE_RUST_MBPS="-"
+MYICE_RUST_MPPS="-"
+MYICE_RUST_PPS="-"
+MYICE_RUST_BYTES="-"
+MYICE_RUST_PKTS="-"
 
 PKTGEN_MBPS="-"
 PKTGEN_MPPS="-"
@@ -41,12 +51,13 @@ Options:
   --payload-len <n>       payload length in bytes (default: 1000)
   --pktgen-thread <n>     kpktgend thread index (default: 0)
   --skip-myice            skip my_ice benchmark
+  --skip-myice-rust       skip my_ice_rust benchmark
   --skip-pktgen           skip pktgen benchmark
   -h, --help              show help
 
 Notes:
   - This script auto-binds --bdf:
-      1) bind to vfio-pci and run my_ice
+      1) bind to vfio-pci and run my_ice + my_ice_rust
       2) bind to ice and run pktgen
   - Requires dpdk-devbind.py from DPDK tools.
   - pktgen requires carrier=1 on the selected interface.
@@ -143,6 +154,10 @@ while [[ $# -gt 0 ]]; do
       RUN_MYICE=0
       shift
       ;;
+    --skip-myice-rust)
+      RUN_MYICE_RUST=0
+      shift
+      ;;
     --skip-pktgen)
       RUN_PKTGEN=0
       shift
@@ -205,6 +220,48 @@ run_myice() {
   MYICE_PKTS="$(parse_metric "${line}" "total_pkts")"
 }
 
+build_myice_rust_if_needed() {
+  if [[ -x "${MYICE_RUST_BIN}" ]]; then
+    return 0
+  fi
+  if [[ ! -f "${MYICE_RUST_BUILD}" ]]; then
+    echo "[compare] my_ice_rust build script missing: ${MYICE_RUST_BUILD}" >&2
+    return 1
+  fi
+
+  echo "[compare] building my_ice_rust..."
+  bash "${MYICE_RUST_BUILD}"
+}
+
+run_myice_rust() {
+  local log line
+
+  if ! build_myice_rust_if_needed; then
+    echo "[compare] my_ice_rust build failed." >&2
+    return 1
+  fi
+
+  log="$(mktemp)"
+  echo "[compare] running my_ice_rust..."
+  set +e
+  "${MYICE_RUST_BIN}" "${MYICE_BDF}" --tx-bench "${DURATION_S}" "${DST_MAC}" "${PAYLOAD_LEN}" 2>&1 | tee "${log}"
+  local rc=${PIPESTATUS[0]}
+  set -e
+
+  line="$(grep -E '\[my_ice\] tx-bench done:' "${log}" | tail -n1 || true)"
+  rm -f "${log}"
+  if [[ ${rc} -ne 0 || -z "${line}" ]]; then
+    echo "[compare] my_ice_rust result unavailable (check binding/driver)." >&2
+    return 1
+  fi
+
+  MYICE_RUST_MBPS="$(parse_metric "${line}" "avg_Mbps")"
+  MYICE_RUST_MPPS="$(parse_metric "${line}" "avg_Mpps")"
+  MYICE_RUST_PPS="$(parse_metric "${line}" "avg_PPS")"
+  MYICE_RUST_BYTES="$(parse_metric "${line}" "total_bytes")"
+  MYICE_RUST_PKTS="$(parse_metric "${line}" "total_pkts")"
+}
+
 run_pktgen() {
   local log line
   if [[ ! -x "${PKTGEN_SCRIPT}" ]]; then
@@ -233,10 +290,11 @@ run_pktgen() {
   PKTGEN_PKTS="$(parse_metric "${line}" "pkts")"
 }
 
-if (( RUN_MYICE )); then
+if (( RUN_MYICE || RUN_MYICE_RUST )); then
   bind_bdf_to_driver "${MYICE_BDF}" "vfio-pci" || true
-  run_myice || true
 fi
+(( RUN_MYICE )) && run_myice || true
+(( RUN_MYICE_RUST )) && run_myice_rust || true
 
 if (( RUN_PKTGEN )); then
   bind_bdf_to_driver "${MYICE_BDF}" "ice" || true
@@ -253,4 +311,5 @@ fi
 echo
 printf "%-8s %12s %10s %12s %16s %16s\n" "Method" "Mbps" "Mpps" "PPS" "Bytes" "Pkts"
 printf "%-8s %12s %10s %12s %16s %16s\n" "my_ice" "${MYICE_MBPS}" "${MYICE_MPPS}" "${MYICE_PPS}" "${MYICE_BYTES}" "${MYICE_PKTS}"
+printf "%-8s %12s %10s %12s %16s %16s\n" "my_ice_rs" "${MYICE_RUST_MBPS}" "${MYICE_RUST_MPPS}" "${MYICE_RUST_PPS}" "${MYICE_RUST_BYTES}" "${MYICE_RUST_PKTS}"
 printf "%-8s %12s %10s %12s %16s %16s\n" "pktgen" "${PKTGEN_MBPS}" "${PKTGEN_MPPS}" "${PKTGEN_PPS}" "${PKTGEN_BYTES}" "${PKTGEN_PKTS}"
