@@ -4,6 +4,9 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/vfio.h>
+#include <limits.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -11,6 +14,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/statfs.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -26,6 +30,10 @@
 #define VFIO_PCI_CONFIG_REGION_INDEX 7
 #endif
 
+#ifndef HUGETLBFS_MAGIC
+#define HUGETLBFS_MAGIC 0x958458f6
+#endif
+
 #define PCI_COMMAND_OFF 0x04
 #define PCI_COMMAND_MEM 0x2
 #define PCI_COMMAND_MASTER 0x4
@@ -33,6 +41,10 @@
 #define ALIGN_UP(v, a) (((v) + ((a) - 1)) & ~((size_t)((a) - 1)))
 #define TX_BURST_SIZE 64
 #define TX_RS_THRESH 32
+
+static bool g_dump_topo = false;
+static bool g_qparent_override_set = false;
+static uint32_t g_qparent_override = 0;
 
 struct dma_block {
     void *vaddr;
@@ -53,17 +65,8 @@ struct io_ring_ctx {
     uint8_t mac[ETHER_ADDR_LEN];
     uint8_t lport;
     uint16_t vsi_num;
-    uint16_t txq_id;
     uint16_t rxq_id;
     uint32_t qparent_teid;
-
-    struct ice_tx_desc *tx_desc;
-    uint64_t tx_desc_iova;
-    uint8_t *tx_pkt_bufs;
-    uint64_t tx_pkt_iova;
-    uint16_t tx_next_to_use;
-    uint16_t tx_next_to_clean;
-    uint16_t tx_pkts_since_rs;
 
     union ice_32b_rx_flex_desc *rx_desc;
     uint64_t rx_desc_iova;
@@ -72,13 +75,31 @@ struct io_ring_ctx {
     uint16_t rx_ntc;
 };
 
+struct txq_ctx {
+    uint16_t txq_id;
+    uint16_t desc_count;
+    struct ice_tx_desc *tx_desc;
+    uint64_t tx_desc_iova;
+    uint8_t *tx_pkt_bufs;
+    uint64_t tx_pkt_iova;
+    uint16_t tx_next_to_use;
+    uint16_t tx_next_to_clean;
+    uint16_t tx_free;
+    uint16_t tx_pkts_since_rs;
+};
+
 struct dev_ctx {
     int container_fd;
     int group_fd;
     int device_fd;
     int group_id;
+    int huge_fd;
+    char huge_path[PATH_MAX];
     uint8_t *bar0;
     size_t bar0_size;
+    uint16_t txq_count;
+    uint16_t tx_desc_count;
+    struct txq_ctx *txqs;
 
     struct dma_block dma;
     struct aq_ring_ctx atq;
@@ -190,6 +211,21 @@ static int parse_mac_addr(const char *s, uint8_t *out)
     return 0;
 }
 
+static int parse_u32_hex(const char *s, uint32_t *out)
+{
+    char *end = NULL;
+    unsigned long v;
+
+    errno = 0;
+    v = strtoul(s, &end, 0);
+    if (errno != 0 || end == s || *end != '\0')
+        return -1;
+    if (v > 0xFFFFFFFFUL)
+        return -1;
+    *out = (uint32_t)v;
+    return 0;
+}
+
 static uint64_t monotonic_ns(void)
 {
     struct timespec ts;
@@ -198,6 +234,33 @@ static uint64_t monotonic_ns(void)
         die_errno("clock_gettime");
 
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static int build_cpu_list(int *out, int max_out)
+{
+    cpu_set_t set;
+    int count = 0;
+    int cpu;
+
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) != 0)
+        return -1;
+
+    for (cpu = 0; cpu < CPU_SETSIZE && count < max_out; cpu++) {
+        if (CPU_ISSET(cpu, &set))
+            out[count++] = cpu;
+    }
+
+    return count;
+}
+
+static void pin_thread_to_cpu(int cpu)
+{
+    cpu_set_t set;
+
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
 static uint32_t reg_read32(struct dev_ctx *d, uint32_t off)
@@ -210,6 +273,64 @@ static void reg_write32(struct dev_ctx *d, uint32_t off, uint32_t val)
 {
     volatile uint32_t *p = (volatile uint32_t *)(d->bar0 + off);
     *p = val;
+}
+
+static void dump_hex(const uint8_t *buf, size_t len, size_t max_len)
+{
+    size_t n = len < max_len ? len : max_len;
+    size_t i;
+
+    for (i = 0; i < n; i += 16) {
+        size_t j;
+        fprintf(stderr, "  %04zx:", i);
+        for (j = 0; j < 16 && i + j < n; j++)
+            fprintf(stderr, " %02x", buf[i + j]);
+        fprintf(stderr, "\n");
+    }
+}
+
+static void dump_topo_response(const uint8_t *buf, size_t len, uint8_t num_branches)
+{
+    const struct ice_aqc_get_topo_elem *topo = (const struct ice_aqc_get_topo_elem *)buf;
+    size_t max_branches = len / sizeof(*topo);
+    uint16_t b;
+
+    if (max_branches == 0) {
+        fprintf(stderr, "[my_ice] topo dump: buffer too small\n");
+        return;
+    }
+
+    if (num_branches == 0 || num_branches > max_branches)
+        num_branches = (uint8_t)max_branches;
+
+    fprintf(stderr, "[my_ice] topo dump: branches=%u (max=%zu)\n",
+            num_branches, max_branches);
+
+    for (b = 0; b < num_branches; b++) {
+        uint16_t num_elems = le16toh(topo[b].hdr.num_elems);
+        uint16_t i;
+
+        fprintf(stderr, "  branch %u: parent_teid=0x%08x num_elems=%u\n",
+                b, le32toh(topo[b].hdr.parent_teid), num_elems);
+
+        if (num_elems > ICE_AQC_TOPO_MAX_LEVEL_NUM)
+            num_elems = ICE_AQC_TOPO_MAX_LEVEL_NUM;
+
+        for (i = 0; i < num_elems; i++) {
+            const struct ice_aqc_txsched_elem_data *e = &topo[b].generic[i];
+            fprintf(stderr,
+                    "    [%u] type=%u node_teid=0x%08x parent_teid=0x%08x valid=0x%02x cir_prof=%u cir_alloc=%u eir_prof=%u eir_alloc=%u\n",
+                    i, e->data.elem_type, le32toh(e->node_teid), le32toh(e->parent_teid),
+                    e->data.valid_sections,
+                    le16toh(e->data.cir_bw.bw_profile_idx),
+                    le16toh(e->data.cir_bw.bw_alloc),
+                    le16toh(e->data.eir_bw.bw_profile_idx),
+                    le16toh(e->data.eir_bw.bw_alloc));
+        }
+    }
+
+    fprintf(stderr, "[my_ice] topo raw (first 256 bytes):\n");
+    dump_hex(buf, len, 256);
 }
 
 static int get_iommu_group_id(const char *bdf)
@@ -295,8 +416,13 @@ static void dma_map(struct dev_ctx *d, size_t size)
     struct vfio_iommu_type1_dma_map map = {0};
 
     size = ALIGN_UP(size, 4096);
-    d->dma.vaddr = mmap(NULL, size, PROT_READ | PROT_WRITE,
-                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (d->huge_fd >= 0) {
+        d->dma.vaddr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                            MAP_SHARED, d->huge_fd, 0);
+    } else {
+        d->dma.vaddr = mmap(NULL, size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
     if (d->dma.vaddr == MAP_FAILED)
         die_errno("mmap dma");
 
@@ -317,6 +443,11 @@ static void layout_dma(struct dev_ctx *d)
 {
     uint8_t *base = (uint8_t *)d->dma.vaddr;
     size_t off = 0;
+    struct ice_tx_desc *tx_desc_base = NULL;
+    uint64_t tx_desc_iova = 0;
+    uint8_t *tx_buf_base = NULL;
+    uint64_t tx_buf_iova = 0;
+    uint16_t i;
 
 #define PLACE(ptr, iova_out, sz, align) \
     do { \
@@ -334,12 +465,29 @@ static void layout_dma(struct dev_ctx *d)
     PLACE(d->atq.buf, d->atq.buf_iova, ICE_AQ_NUM_DESC * ICE_AQ_MAX_BUF_LEN, 4096);
     PLACE(d->arq.buf, d->arq.buf_iova, ICE_AQ_NUM_DESC * ICE_AQ_MAX_BUF_LEN, 4096);
 
-    PLACE(d->io.tx_desc, d->io.tx_desc_iova, ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc), 128);
-    PLACE(d->io.tx_pkt_bufs, d->io.tx_pkt_iova, ICE_TX_DESC_COUNT * ICE_TX_PKT_BUF_SIZE, 128);
+    PLACE(tx_desc_base, tx_desc_iova,
+          (size_t)d->txq_count * d->tx_desc_count * sizeof(struct ice_tx_desc), 128);
+    PLACE(tx_buf_base, tx_buf_iova,
+          (size_t)d->txq_count * d->tx_desc_count * ICE_TX_PKT_BUF_SIZE, 128);
     PLACE(d->io.rx_desc, d->io.rx_desc_iova, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc), 128);
     PLACE(d->io.rx_bufs, d->io.rx_bufs_iova, ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE, 128);
 
 #undef PLACE
+
+    for (i = 0; i < d->txq_count; i++) {
+        struct txq_ctx *q = &d->txqs[i];
+        size_t desc_off = (size_t)i * d->tx_desc_count * sizeof(struct ice_tx_desc);
+        size_t buf_off = (size_t)i * d->tx_desc_count * ICE_TX_PKT_BUF_SIZE;
+
+        q->desc_count = d->tx_desc_count;
+        q->tx_desc = (struct ice_tx_desc *)((uint8_t *)tx_desc_base + desc_off);
+        q->tx_desc_iova = tx_desc_iova + desc_off;
+        q->tx_pkt_bufs = tx_buf_base + buf_off;
+        q->tx_pkt_iova = tx_buf_iova + buf_off;
+        q->tx_next_to_use = 0;
+        q->tx_next_to_clean = 0;
+        q->tx_pkts_since_rs = 0;
+    }
 
     if (off > d->dma.size)
         die_msg("DMA layout overflow");
@@ -600,6 +748,13 @@ static int aq_get_qparent_teid(struct dev_ctx *d)
     uint8_t num_branches;
     uint16_t num_elems;
 
+    if (g_qparent_override_set) {
+        d->io.qparent_teid = g_qparent_override;
+        fprintf(stderr, "[my_ice] using override qparent_teid=0x%08x\n",
+                d->io.qparent_teid);
+        return 0;
+    }
+
     memset(topo_buf, 0, sizeof(topo_buf));
     fill_dflt_direct_desc(&desc, ICE_AQC_OPC_GET_DFLT_TOPO);
     desc.params.get_topo.port_num = d->io.lport;
@@ -610,6 +765,8 @@ static int aq_get_qparent_teid(struct dev_ctx *d)
     }
 
     num_branches = desc.params.get_topo.num_branches;
+    if (g_dump_topo)
+        dump_topo_response(topo_buf, sizeof(topo_buf), num_branches);
     if (num_branches < 1 || num_branches > 8) {
         fprintf(stderr, "[my_ice] GET_DFLT_TOPO invalid num_branches=%u\n", num_branches);
         return -1;
@@ -625,7 +782,7 @@ static int aq_get_qparent_teid(struct dev_ctx *d)
         d->io.qparent_teid = le32toh(topo[0].generic[num_elems - 2].node_teid);
     else
         d->io.qparent_teid = le32toh(topo[0].generic[num_elems - 1].node_teid);
-
+    fprintf(stderr, "[my_ice] selected qparent_teid=0x%08x\n", d->io.qparent_teid);
     return 0;
 }
 
@@ -727,48 +884,70 @@ static void set_ctx_bits(uint8_t *src_ctx, uint8_t *dest_ctx,
     }
 }
 
-static int add_one_tx_queue(struct dev_ctx *d)
+static int add_tx_queues(struct dev_ctx *d, uint16_t count)
 {
-    struct ice_aqc_add_tx_qgrp qg;
+    struct ice_aqc_add_tx_qgrp *qg;
     struct ice_aq_desc desc;
-    struct ice_tlan_ctx tlan = {0};
+    size_t qg_size;
+    uint16_t i;
 
-    memset(&qg, 0, sizeof(qg));
+    if (count == 0)
+        return -1;
+    if (count > 255)
+        count = 255;
 
-    tlan.port_num = d->io.lport;
-    tlan.qlen = ICE_TX_DESC_COUNT;
-    tlan.base = d->io.tx_desc_iova >> 7;
-    tlan.pf_num = 0;
-    tlan.vmvf_type = ICE_TLAN_CTX_VMVF_TYPE_PF;
-    tlan.src_vsi = d->io.vsi_num;
-    tlan.tso_ena = 1;
-    tlan.internal_usage_flag = 1;
-    tlan.tso_qnum = d->io.txq_id;
-    tlan.legacy_int = 1;
+    qg_size = sizeof(*qg) + (size_t)(count - 1) * sizeof(struct ice_aqc_add_txqs_perq);
+    qg = calloc(1, qg_size);
+    if (!qg)
+        return -1;
 
-    qg.parent_teid = htole32(d->io.qparent_teid);
-    qg.num_txqs = 1;
-    qg.txqs[0].txq_id = htole16(d->io.txq_id);
-    set_ctx_bits((uint8_t *)&tlan, qg.txqs[0].txq_ctx, tlan_ctx_info);
+    qg->parent_teid = htole32(d->io.qparent_teid);
+    qg->num_txqs = (uint8_t)count;
 
-    qg.txqs[0].info.valid_sections =
-        ICE_AQC_ELEM_VALID_GENERIC | ICE_AQC_ELEM_VALID_CIR | ICE_AQC_ELEM_VALID_EIR;
-    qg.txqs[0].info.generic = 0;
-    qg.txqs[0].info.cir_bw.bw_profile_idx = htole16(ICE_SCHED_DFLT_RL_PROF_ID);
-    qg.txqs[0].info.cir_bw.bw_alloc = htole16(ICE_SCHED_DFLT_BW_WT);
-    qg.txqs[0].info.eir_bw.bw_profile_idx = htole16(ICE_SCHED_DFLT_RL_PROF_ID);
-    qg.txqs[0].info.eir_bw.bw_alloc = htole16(ICE_SCHED_DFLT_BW_WT);
+    for (i = 0; i < count; i++) {
+        struct txq_ctx *q = &d->txqs[i];
+        struct ice_tlan_ctx tlan = {0};
+
+        tlan.port_num = d->io.lport;
+        tlan.qlen = d->tx_desc_count;
+        tlan.base = q->tx_desc_iova >> 7;
+        tlan.pf_num = 0;
+        tlan.vmvf_type = ICE_TLAN_CTX_VMVF_TYPE_PF;
+        tlan.src_vsi = d->io.vsi_num;
+        tlan.tso_ena = 1;
+        tlan.internal_usage_flag = 1;
+        tlan.tso_qnum = q->txq_id;
+        tlan.legacy_int = 1;
+
+        qg->txqs[i].txq_id = htole16(q->txq_id);
+        set_ctx_bits((uint8_t *)&tlan, qg->txqs[i].txq_ctx, tlan_ctx_info);
+
+        qg->txqs[i].info.valid_sections =
+            ICE_AQC_ELEM_VALID_GENERIC | ICE_AQC_ELEM_VALID_CIR | ICE_AQC_ELEM_VALID_EIR;
+        qg->txqs[i].info.generic = 0;
+        qg->txqs[i].info.cir_bw.bw_profile_idx = htole16(ICE_SCHED_DFLT_RL_PROF_ID);
+        qg->txqs[i].info.cir_bw.bw_alloc = htole16(ICE_SCHED_DFLT_BW_WT);
+        qg->txqs[i].info.eir_bw.bw_profile_idx = htole16(ICE_SCHED_DFLT_RL_PROF_ID);
+        qg->txqs[i].info.eir_bw.bw_alloc = htole16(ICE_SCHED_DFLT_BW_WT);
+    }
 
     fill_dflt_direct_desc(&desc, ICE_AQC_OPC_ADD_TXQS);
     desc.flags = htole16(le16toh(desc.flags) | ICE_AQ_FLAG_RD);
     desc.params.add_txqs.num_qgrps = 1;
 
-    if (aq_send_cmd(d, &desc, &qg, sizeof(qg)) < 0)
+    if (aq_send_cmd(d, &desc, qg, (uint16_t)qg_size) < 0) {
+        free(qg);
         return -1;
+    }
 
-    fprintf(stderr, "[my_ice] ADD_TXQS resp: txq_id=%u q_teid=0x%x\n",
-            le16toh(qg.txqs[0].txq_id), le32toh(qg.txqs[0].q_teid));
+    fprintf(stderr, "[my_ice] ADD_TXQS resp:");
+    for (i = 0; i < count; i++) {
+        fprintf(stderr, " txq_id=%u q_teid=0x%x",
+                le16toh(qg->txqs[i].txq_id), le32toh(qg->txqs[i].q_teid));
+    }
+    fprintf(stderr, "\n");
 
+    free(qg);
     return 0;
 }
 
@@ -854,36 +1033,39 @@ static int setup_and_enable_rxq(struct dev_ctx *d)
 
 static void tx_ring_init(struct dev_ctx *d)
 {
-    memset(d->io.tx_desc, 0, ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc));
-    d->io.tx_next_to_use = 0;
-    d->io.tx_next_to_clean = 0;
-    d->io.tx_pkts_since_rs = 0;
+    uint16_t i;
+
+    for (i = 0; i < d->txq_count; i++) {
+        struct txq_ctx *q = &d->txqs[i];
+        memset(q->tx_desc, 0, (size_t)q->desc_count * sizeof(struct ice_tx_desc));
+        q->tx_next_to_use = 0;
+        q->tx_next_to_clean = 0;
+        q->tx_free = (uint16_t)(q->desc_count - 1);
+        q->tx_pkts_since_rs = 0;
+    }
 }
 
-static void tx_reclaim_completed(struct dev_ctx *d)
+static void tx_update_free(struct dev_ctx *d, struct txq_ctx *q)
 {
-    uint16_t head = (uint16_t)(reg_read32(d, QTX_COMM_HEAD(d->io.txq_id)) & 0x1FFFU);
-    if (head >= ICE_TX_DESC_COUNT)
-        head = (uint16_t)(head % ICE_TX_DESC_COUNT);
-    d->io.tx_next_to_clean = head;
-}
-
-static uint16_t tx_desc_unused(struct dev_ctx *d)
-{
-    uint16_t ntu = d->io.tx_next_to_use;
-    uint16_t ntc = d->io.tx_next_to_clean;
+    uint16_t head = (uint16_t)(reg_read32(d, QTX_COMM_HEAD(q->txq_id)) & 0x1FFFU);
+    uint16_t ntu = q->tx_next_to_use;
     uint16_t used;
 
-    if (ntu >= ntc)
-        used = (uint16_t)(ntu - ntc);
-    else
-        used = (uint16_t)(ICE_TX_DESC_COUNT - (ntc - ntu));
+    if (head >= q->desc_count)
+        head = (uint16_t)(head % q->desc_count);
+    q->tx_next_to_clean = head;
 
-    return (uint16_t)(ICE_TX_DESC_COUNT - used - 1);
+    if (ntu >= head)
+        used = (uint16_t)(ntu - head);
+    else
+        used = (uint16_t)(q->desc_count - (head - ntu));
+
+    q->tx_free = (uint16_t)(q->desc_count - used - 1);
 }
 
 /* Returns: 0=enqueued, 1=ring full, -1=invalid packet */
-static int tx_try_enqueue(struct dev_ctx *d, const uint8_t *pkt, uint16_t len)
+static int tx_try_enqueue(struct dev_ctx *d, struct txq_ctx *q, const uint8_t *pkt,
+                          uint16_t len, bool copy)
 {
     uint16_t idx;
     uint16_t next;
@@ -895,46 +1077,50 @@ static int tx_try_enqueue(struct dev_ctx *d, const uint8_t *pkt, uint16_t len)
     if (len > ICE_TX_PKT_BUF_SIZE)
         return -1;
 
-    tx_reclaim_completed(d);
-    if (tx_desc_unused(d) == 0)
-        return 1;
-
-    idx = d->io.tx_next_to_use;
-    next = (uint16_t)((idx + 1) % ICE_TX_DESC_COUNT);
-    buf = d->io.tx_pkt_bufs + ((size_t)idx * ICE_TX_PKT_BUF_SIZE);
-    memcpy(buf, pkt, len);
-
-    d->io.tx_pkts_since_rs++;
-    if (d->io.tx_pkts_since_rs >= TX_RS_THRESH) {
-        cmd |= ICE_TX_DESC_CMD_RS;
-        d->io.tx_pkts_since_rs = 0;
+    if (q->tx_free == 0) {
+        tx_update_free(d, q);
+        if (q->tx_free == 0)
+            return 1;
     }
 
-    txd = &d->io.tx_desc[idx];
-    txd->buf_addr = htole64(d->io.tx_pkt_iova + ((uint64_t)idx * ICE_TX_PKT_BUF_SIZE));
+    idx = q->tx_next_to_use;
+    next = (uint16_t)((idx + 1) % q->desc_count);
+    buf = q->tx_pkt_bufs + ((size_t)idx * ICE_TX_PKT_BUF_SIZE);
+    if (copy && pkt && len)
+        memcpy(buf, pkt, len);
+
+    q->tx_pkts_since_rs++;
+    if (q->tx_pkts_since_rs >= TX_RS_THRESH) {
+        cmd |= ICE_TX_DESC_CMD_RS;
+        q->tx_pkts_since_rs = 0;
+    }
+
+    txd = &q->tx_desc[idx];
+    txd->buf_addr = htole64(q->tx_pkt_iova + ((uint64_t)idx * ICE_TX_PKT_BUF_SIZE));
     qw1 = ((uint64_t)ICE_TX_DESC_DTYPE_DATA << ICE_TXD_QW1_DTYPE_S) |
           ((uint64_t)cmd << ICE_TXD_QW1_CMD_S) |
           ((uint64_t)len << ICE_TXD_QW1_TX_BUF_SZ_S);
     txd->cmd_type_offset_bsz = htole64(qw1);
 
     __sync_synchronize();
-    d->io.tx_next_to_use = next;
+    q->tx_next_to_use = next;
+    q->tx_free--;
     return 0;
 }
 
-static inline void tx_ring_doorbell(struct dev_ctx *d)
+static inline void tx_ring_doorbell(struct dev_ctx *d, struct txq_ctx *q)
 {
-    reg_write32(d, QTX_COMM_DBELL(d->io.txq_id), d->io.tx_next_to_use);
+    reg_write32(d, QTX_COMM_DBELL(q->txq_id), q->tx_next_to_use);
 }
 
-static int tx_wait_drain(struct dev_ctx *d, int timeout_ms)
+static int tx_wait_drain(struct dev_ctx *d, struct txq_ctx *q, int timeout_ms)
 {
     uint64_t start_ns = monotonic_ns();
     uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
 
     while (monotonic_ns() - start_ns < timeout_ns) {
-        tx_reclaim_completed(d);
-        if (d->io.tx_next_to_clean == d->io.tx_next_to_use)
+        tx_update_free(d, q);
+        if (q->tx_next_to_clean == q->tx_next_to_use)
             return 0;
         usleep(50);
     }
@@ -1152,11 +1338,13 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
                        int interval_ms, const char *payload)
 {
     uint32_t tx_alloc;
+    uint16_t first_q, last_q, avail_q;
     uint8_t pkt[ICE_TX_PKT_BUF_SIZE] = {0};
     size_t payload_len;
     uint16_t frame_len;
     uint64_t gotc_before, gotc_after;
     int i;
+    struct txq_ctx *q;
 
     tx_alloc = reg_read32(d, PFLAN_TX_QALLOC);
     if (!(tx_alloc & PFLAN_TX_QALLOC_VALID_M)) {
@@ -1164,7 +1352,20 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
         return -1;
     }
 
-    d->io.txq_id = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
+    first_q = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
+    last_q = (uint16_t)((tx_alloc & PFLAN_TX_QALLOC_LASTQ_M) >> PFLAN_TX_QALLOC_LASTQ_S);
+    avail_q = (uint16_t)(last_q - first_q + 1);
+    if (avail_q == 0) {
+        fprintf(stderr, "no available TX queues (first=%u last=%u)\n", first_q, last_q);
+        return -1;
+    }
+    if (d->txq_count > avail_q) {
+        fprintf(stderr, "[my_ice] requested %u tx queues, clamping to %u available\n",
+                d->txq_count, avail_q);
+        d->txq_count = avail_q;
+    }
+    for (i = 0; i < d->txq_count; i++)
+        d->txqs[i].txq_id = (uint16_t)(first_q + i);
 
     if (aq_get_default_vsi_and_lport(d) < 0) {
         fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
@@ -1174,12 +1375,13 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
         fprintf(stderr, "[my_ice] failed to get parent TEID\n");
         return -1;
     }
-    if (add_one_tx_queue(d) < 0) {
-        fprintf(stderr, "[my_ice] add tx queue failed\n");
+    if (add_tx_queues(d, d->txq_count) < 0) {
+        fprintf(stderr, "[my_ice] add tx queues failed\n");
         return -1;
     }
 
     tx_ring_init(d);
+    q = &d->txqs[0];
 
     memcpy(pkt + 0, dst_mac, ETHER_ADDR_LEN);
     memcpy(pkt + 6, d->io.mac, ETHER_ADDR_LEN);
@@ -1198,7 +1400,7 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
 
     fprintf(stderr,
             "[my_ice] tx-send on vsi=%u lport=%u txq=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x count=%d interval_ms=%d payload_len=%zu frame_len=%u\n",
-            d->io.vsi_num, d->io.lport, d->io.txq_id,
+            d->io.vsi_num, d->io.lport, q->txq_id,
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
             d->io.mac[3], d->io.mac[4], d->io.mac[5],
             dst_mac[0], dst_mac[1], dst_mac[2],
@@ -1211,9 +1413,11 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
     for (i = 0; i < count; i++) {
         int tries;
         for (tries = 0; tries < 100000; tries++) {
-            int enq = tx_try_enqueue(d, pkt, frame_len);
+            if (q->tx_free == 0)
+                tx_update_free(d, q);
+            int enq = tx_try_enqueue(d, q, pkt, frame_len, true);
             if (enq == 0) {
-                tx_ring_doorbell(d);
+                tx_ring_doorbell(d, q);
                 break;
             }
             if (enq < 0) {
@@ -1231,7 +1435,7 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
             usleep((useconds_t)interval_ms * 1000U);
     }
 
-    (void)tx_wait_drain(d, 1000);
+    (void)tx_wait_drain(d, q, 1000);
 
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
@@ -1240,17 +1444,71 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
     return 0;
 }
 
+struct tx_bench_worker {
+    struct dev_ctx *d;
+    struct txq_ctx *q;
+    uint64_t end_ns;
+    uint16_t frame_len;
+    int cpu_id;
+    uint8_t pkt[ICE_TX_PKT_BUF_SIZE];
+    int err;
+};
+
+static void *tx_bench_worker_main(void *arg)
+{
+    struct tx_bench_worker *w = arg;
+
+    if (w->cpu_id >= 0)
+        pin_thread_to_cpu(w->cpu_id);
+
+    while (true) {
+        uint16_t burst_pkts = 0;
+        int i;
+
+        if (monotonic_ns() >= w->end_ns)
+            break;
+
+        if (w->q->tx_free < TX_BURST_SIZE)
+            tx_update_free(w->d, w->q);
+
+        for (i = 0; i < TX_BURST_SIZE; i++) {
+            int enq = tx_try_enqueue(w->d, w->q, w->pkt, w->frame_len, false);
+            if (enq == 0) {
+                burst_pkts++;
+                continue;
+            }
+            if (enq < 0) {
+                w->err = -1;
+                return NULL;
+            }
+            break;
+        }
+
+        if (burst_pkts > 0) {
+            tx_ring_doorbell(w->d, w->q);
+        } else {
+            tx_update_free(w->d, w->q);
+        }
+    }
+
+    return NULL;
+}
+
 static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
-                        int payload_len)
+                        int payload_len, bool pin_cpus)
 {
     const uint64_t one_sec_ns = 1000000000ULL;
     uint32_t tx_alloc;
+    uint16_t first_q, last_q, avail_q;
     uint8_t pkt[ICE_TX_PKT_BUF_SIZE] = {0};
     uint16_t frame_len;
     uint64_t gotc_start, gotc_prev, gotc_now;
     uint64_t start_ns, end_ns, now_ns, next_report_ns, last_report_ns;
-    uint64_t pkts_total = 0;
-    uint64_t pkts_prev = 0;
+    uint16_t q_idx = 0;
+    pthread_t *threads = NULL;
+    struct tx_bench_worker *workers = NULL;
+    int cpu_list[CPU_SETSIZE];
+    int cpu_count = 0;
 
     tx_alloc = reg_read32(d, PFLAN_TX_QALLOC);
     if (!(tx_alloc & PFLAN_TX_QALLOC_VALID_M)) {
@@ -1258,7 +1516,21 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
         return -1;
     }
 
-    d->io.txq_id = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
+    first_q = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
+    last_q = (uint16_t)((tx_alloc & PFLAN_TX_QALLOC_LASTQ_M) >> PFLAN_TX_QALLOC_LASTQ_S);
+    avail_q = (uint16_t)(last_q - first_q + 1);
+    if (avail_q == 0) {
+        fprintf(stderr, "no available TX queues (first=%u last=%u)\n", first_q, last_q);
+        return -1;
+    }
+    if (d->txq_count > avail_q) {
+        fprintf(stderr, "[my_ice] requested %u tx queues, clamping to %u available\n",
+                d->txq_count, avail_q);
+        d->txq_count = avail_q;
+    }
+    for (q_idx = 0; q_idx < d->txq_count; q_idx++)
+        d->txqs[q_idx].txq_id = (uint16_t)(first_q + q_idx);
+    q_idx = 0;
 
     if (aq_get_default_vsi_and_lport(d) < 0) {
         fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
@@ -1268,8 +1540,8 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
         fprintf(stderr, "[my_ice] failed to get parent TEID\n");
         return -1;
     }
-    if (add_one_tx_queue(d) < 0) {
-        fprintf(stderr, "[my_ice] add tx queue failed\n");
+    if (add_tx_queues(d, d->txq_count) < 0) {
+        fprintf(stderr, "[my_ice] add tx queues failed\n");
         return -1;
     }
 
@@ -1286,9 +1558,28 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
     if (frame_len < 60)
         frame_len = 60;
 
+    for (q_idx = 0; q_idx < d->txq_count; q_idx++) {
+        struct txq_ctx *q = &d->txqs[q_idx];
+        uint16_t di;
+        for (di = 0; di < q->desc_count; di++) {
+            uint8_t *buf = q->tx_pkt_bufs + ((size_t)di * ICE_TX_PKT_BUF_SIZE);
+            memcpy(buf, pkt, frame_len);
+        }
+    }
+
+    if (pin_cpus) {
+        cpu_count = build_cpu_list(cpu_list, (int)(sizeof(cpu_list) / sizeof(cpu_list[0])));
+        if (cpu_count <= 0) {
+            fprintf(stderr, "[my_ice] warning: failed to read CPU affinity, disabling pinning\n");
+            pin_cpus = false;
+        } else {
+            fprintf(stderr, "[my_ice] pinning tx threads to CPUs (count=%d)\n", cpu_count);
+        }
+    }
+
     fprintf(stderr,
-            "[my_ice] tx-bench on vsi=%u lport=%u txq=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x seconds=%d payload_len=%d frame_len=%u\n",
-            d->io.vsi_num, d->io.lport, d->io.txq_id,
+            "[my_ice] tx-bench on vsi=%u lport=%u txqs=%u txq_base=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x seconds=%d payload_len=%d frame_len=%u\n",
+            d->io.vsi_num, d->io.lport, d->txq_count, d->txqs[0].txq_id,
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
             d->io.mac[3], d->io.mac[4], d->io.mac[5],
             dst_mac[0], dst_mac[1], dst_mac[2],
@@ -1304,73 +1595,89 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
     last_report_ns = start_ns;
     next_report_ns = start_ns + one_sec_ns;
 
-    while (true) {
-        uint16_t burst_pkts = 0;
-        int i;
+    threads = calloc(d->txq_count, sizeof(*threads));
+    workers = calloc(d->txq_count, sizeof(*workers));
+    if (!threads || !workers) {
+        fprintf(stderr, "[my_ice] failed to allocate tx bench workers\n");
+        free(threads);
+        free(workers);
+        return -1;
+    }
 
+    for (q_idx = 0; q_idx < d->txq_count; q_idx++) {
+        struct tx_bench_worker *w = &workers[q_idx];
+
+        w->d = d;
+        w->q = &d->txqs[q_idx];
+        w->end_ns = end_ns;
+        w->frame_len = frame_len;
+        w->cpu_id = -1;
+        w->err = 0;
+        memcpy(w->pkt, pkt, frame_len);
+
+        if (pin_cpus && cpu_count > 0)
+            w->cpu_id = cpu_list[q_idx % cpu_count];
+
+        if (pthread_create(&threads[q_idx], NULL, tx_bench_worker_main, w) != 0) {
+            fprintf(stderr, "[my_ice] failed to create tx thread %u\n", q_idx);
+            workers[q_idx].err = -1;
+            threads[q_idx] = 0;
+        }
+    }
+
+    while (true) {
         now_ns = monotonic_ns();
         if (now_ns >= end_ns)
             break;
 
-        for (i = 0; i < TX_BURST_SIZE; i++) {
-            int enq = tx_try_enqueue(d, pkt, frame_len);
-            if (enq == 0) {
-                burst_pkts++;
-                continue;
-            }
-            if (enq < 0) {
-                fprintf(stderr, "[my_ice] tx-bench enqueue failed after %" PRIu64 " packets\n",
-                        pkts_total);
-                return -1;
-            }
-            break;
-        }
-
-        if (burst_pkts > 0) {
-            tx_ring_doorbell(d);
-            pkts_total += burst_pkts;
-        } else {
-            tx_reclaim_completed(d);
-        }
-
-        now_ns = monotonic_ns();
         if (now_ns >= next_report_ns) {
             uint64_t interval_ns;
-            uint64_t interval_pkts;
             uint64_t interval_bytes;
             double interval_s;
-            double mbps;
-            double pps;
-            double mpps;
+            double gbps;
 
             gotc_now = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                           GLV_GOTCH(d->io.vsi_num));
             interval_ns = now_ns - last_report_ns;
-            interval_pkts = pkts_total - pkts_prev;
             interval_bytes = gotc_now - gotc_prev;
             interval_s = (double)interval_ns / (double)one_sec_ns;
 
-            mbps = interval_s > 0.0 ?
-                ((double)interval_bytes * 8.0) / (interval_s * 1e6) : 0.0;
-            pps = interval_s > 0.0 ?
-                (double)interval_pkts / interval_s : 0.0;
-            mpps = pps / 1e6;
+            gbps = interval_s > 0.0 ?
+                ((double)interval_bytes * 8.0) / (interval_s * 1e9) : 0.0;
 
             fprintf(stderr,
-                    "[my_ice] tx-bench t=%.2fs interval: Mbps=%.3f Mpps=%.3f PPS=%.0f bytes=%" PRIu64 " pkts=%" PRIu64 "\n",
+                    "[my_ice] tx-bench t=%.2fs interval: Gbps=%.3f\n",
                     (double)(now_ns - start_ns) / (double)one_sec_ns,
-                    mbps, mpps, pps, interval_bytes, interval_pkts);
+                    gbps);
 
             last_report_ns = now_ns;
             gotc_prev = gotc_now;
-            pkts_prev = pkts_total;
             next_report_ns += one_sec_ns;
             if (next_report_ns < now_ns)
                 next_report_ns = now_ns + one_sec_ns;
         }
+        usleep(1000);
     }
 
-    (void)tx_wait_drain(d, 1000);
+    for (q_idx = 0; q_idx < d->txq_count; q_idx++) {
+        if (threads[q_idx])
+            pthread_join(threads[q_idx], NULL);
+    }
+
+    for (q_idx = 0; q_idx < d->txq_count; q_idx++)
+        (void)tx_wait_drain(d, &d->txqs[q_idx], 1000);
+
+    for (q_idx = 0; q_idx < d->txq_count; q_idx++) {
+        if (workers[q_idx].err) {
+            fprintf(stderr, "[my_ice] tx-bench worker %u reported error\n", q_idx);
+            free(threads);
+            free(workers);
+            return -1;
+        }
+    }
+
+    free(threads);
+    free(workers);
 
     now_ns = monotonic_ns();
     gotc_now = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
@@ -1380,15 +1687,12 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
         uint64_t total_ns = now_ns - start_ns;
         uint64_t total_bytes = gotc_now - gotc_start;
         double total_s = (double)total_ns / (double)one_sec_ns;
-        double avg_mbps = total_s > 0.0 ?
-            ((double)total_bytes * 8.0) / (total_s * 1e6) : 0.0;
-        double avg_pps = total_s > 0.0 ?
-            (double)pkts_total / total_s : 0.0;
-        double avg_mpps = avg_pps / 1e6;
+        double avg_gbps = total_s > 0.0 ?
+            ((double)total_bytes * 8.0) / (total_s * 1e9) : 0.0;
 
         fprintf(stderr,
-                "[my_ice] tx-bench done: seconds=%.3f total_bytes=%" PRIu64 " total_pkts=%" PRIu64 " avg_Mbps=%.3f avg_Mpps=%.3f avg_PPS=%.0f\n",
-                total_s, total_bytes, pkts_total, avg_mbps, avg_mpps, avg_pps);
+                "[my_ice] tx-bench done: seconds=%.3f avg_Gbps=%.3f\n",
+                total_s, avg_gbps);
     }
 
     return 0;
@@ -1415,6 +1719,69 @@ static void cleanup(struct dev_ctx *d)
         close(d->group_fd);
     if (d->container_fd >= 0)
         close(d->container_fd);
+    if (d->huge_fd >= 0)
+        close(d->huge_fd);
+    if (d->huge_path[0] != '\0')
+        unlink(d->huge_path);
+    free(d->txqs);
+}
+
+static size_t get_hugepage_size(void)
+{
+    FILE *fp;
+    char line[256];
+    long kb = 0;
+
+    fp = fopen("/proc/meminfo", "r");
+    if (!fp)
+        return 2U * 1024U * 1024U;
+
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "Hugepagesize: %ld kB", &kb) == 1)
+            break;
+    }
+    fclose(fp);
+
+    if (kb <= 0)
+        return 2U * 1024U * 1024U;
+    return (size_t)kb * 1024U;
+}
+
+static size_t prepare_hugepage_file(struct dev_ctx *d, size_t size, const char *dir)
+{
+    int fd;
+    int n;
+    size_t hp_size;
+    size_t aligned;
+    struct statfs sfs;
+
+    n = snprintf(d->huge_path, sizeof(d->huge_path),
+                 "%s/my_ice_hp_%d", dir, getpid());
+    if (n < 0 || (size_t)n >= sizeof(d->huge_path))
+        die_msg("hugepage dir path too long");
+
+    if (statfs(dir, &sfs) != 0)
+        die_errno("statfs hugepage dir");
+    if ((unsigned long)sfs.f_type != HUGETLBFS_MAGIC)
+        die_msg("hugepage dir is not hugetlbfs (mount -t hugetlbfs nodev /mnt/huge)");
+
+    fd = open(d->huge_path, O_CREAT | O_RDWR, 0600);
+    if (fd < 0)
+        die_errno("open hugepage file");
+
+    hp_size = get_hugepage_size();
+    aligned = ALIGN_UP(size, hp_size);
+    if (ftruncate(fd, (off_t)aligned) < 0) {
+        if (errno == EINVAL) {
+            fprintf(stderr,
+                    "ftruncate hugepage file: Invalid argument (size=%zu, hugepage=%zu)\n",
+                    aligned, hp_size);
+        }
+        die_errno("ftruncate hugepage file");
+    }
+
+    d->huge_fd = fd;
+    return aligned;
 }
 
 int main(int argc, char **argv)
@@ -1423,11 +1790,21 @@ int main(int argc, char **argv)
         .container_fd = -1,
         .group_fd = -1,
         .device_fd = -1,
+        .huge_fd = -1,
+        .huge_path = {0},
     };
     const char *bdf;
     bool run_rx_listen_mode = false;
     bool run_tx_send_mode = false;
     bool run_tx_bench_mode = false;
+    bool use_hugepages = false;
+    const char *huge_dir = "/mnt/huge";
+    uint16_t txq_count = 1;
+    uint16_t tx_desc_count = ICE_TX_DESC_COUNT;
+    bool pin_cpus = false;
+    bool dump_topo = false;
+    uint32_t qparent_override = 0;
+    bool qparent_override_set = false;
     int rx_listen_timeout_s = 30;
     uint8_t tx_send_dst_mac[ETHER_ADDR_LEN] = {0};
     int tx_send_count = 1;
@@ -1437,84 +1814,181 @@ int main(int argc, char **argv)
     int tx_bench_seconds = 0;
     int tx_bench_payload_len = 0;
     size_t dma_bytes;
+    size_t dma_map_bytes;
     int rc = EXIT_FAILURE;
 
-    if (argc < 2 || argc > 7) {
-        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>]\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--tx-queues <n>] [--tx-desc-count <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen 60\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send 40:a6:b7:c3:43:e8\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send 40:a6:b7:c3:43:e8 20 100 hello\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-bench 10 40:a6:b7:c3:43:e8 46\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-bench 15 40:a6:b7:c3:43:e8 1472 --hugepages --hugepage-dir /mnt/huge\n", argv[0]);
         return EXIT_FAILURE;
     }
 
     bdf = argv[1];
     if (argc >= 3) {
-        if (strcmp(argv[2], "--rx-listen") == 0) {
-            run_rx_listen_mode = true;
-            if (argc == 4 &&
-                parse_int_range(argv[3], 1, 3600, &rx_listen_timeout_s) < 0) {
-                fprintf(stderr, "invalid --rx-listen timeout '%s' (expected 1..3600 seconds)\n",
-                        argv[3]);
+        int i = 2;
+        bool mode_set = false;
+
+        while (i < argc) {
+            if (strcmp(argv[i], "--rx-listen") == 0) {
+                if (mode_set) {
+                    fprintf(stderr, "only one mode allowed (--rx-listen/--tx-send/--tx-bench)\n");
+                    return EXIT_FAILURE;
+                }
+                mode_set = true;
+                run_rx_listen_mode = true;
+                i++;
+                if (i < argc && strncmp(argv[i], "--", 2) != 0) {
+                    if (parse_int_range(argv[i], 1, 3600, &rx_listen_timeout_s) < 0) {
+                        fprintf(stderr, "invalid --rx-listen timeout '%s' (expected 1..3600 seconds)\n",
+                                argv[i]);
+                        return EXIT_FAILURE;
+                    }
+                    i++;
+                }
+            } else if (strcmp(argv[i], "--tx-send") == 0) {
+                if (mode_set) {
+                    fprintf(stderr, "only one mode allowed (--rx-listen/--tx-send/--tx-bench)\n");
+                    return EXIT_FAILURE;
+                }
+                mode_set = true;
+                run_tx_send_mode = true;
+                i++;
+                if (i >= argc) {
+                    fprintf(stderr, "--tx-send requires <dst-mac>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_mac_addr(argv[i], tx_send_dst_mac) < 0) {
+                    fprintf(stderr, "invalid dst MAC '%s' (expected aa:bb:cc:dd:ee:ff)\n",
+                            argv[i]);
+                    return EXIT_FAILURE;
+                }
+                i++;
+                if (i < argc && strncmp(argv[i], "--", 2) != 0) {
+                    if (parse_int_range(argv[i], 1, 1000000, &tx_send_count) < 0) {
+                        fprintf(stderr, "invalid --tx-send count '%s' (expected 1..1000000)\n",
+                                argv[i]);
+                        return EXIT_FAILURE;
+                    }
+                    i++;
+                }
+                if (i < argc && strncmp(argv[i], "--", 2) != 0) {
+                    if (parse_int_range(argv[i], 0, 60000, &tx_send_interval_ms) < 0) {
+                        fprintf(stderr, "invalid --tx-send interval '%s' ms (expected 0..60000)\n",
+                                argv[i]);
+                        return EXIT_FAILURE;
+                    }
+                    i++;
+                }
+                if (i < argc && strncmp(argv[i], "--", 2) != 0) {
+                    tx_send_payload = argv[i];
+                    i++;
+                }
+            } else if (strcmp(argv[i], "--tx-bench") == 0) {
+                if (mode_set) {
+                    fprintf(stderr, "only one mode allowed (--rx-listen/--tx-send/--tx-bench)\n");
+                    return EXIT_FAILURE;
+                }
+                mode_set = true;
+                run_tx_bench_mode = true;
+                if (i + 3 >= argc) {
+                    fprintf(stderr, "--tx-bench requires <seconds> <dst-mac> <payload-len>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_int_range(argv[i + 1], 1, 3600, &tx_bench_seconds) < 0) {
+                    fprintf(stderr, "invalid --tx-bench seconds '%s' (expected 1..3600)\n",
+                            argv[i + 1]);
+                    return EXIT_FAILURE;
+                }
+                if (parse_mac_addr(argv[i + 2], tx_bench_dst_mac) < 0) {
+                    fprintf(stderr, "invalid dst MAC '%s' (expected aa:bb:cc:dd:ee:ff)\n",
+                            argv[i + 2]);
+                    return EXIT_FAILURE;
+                }
+                if (parse_int_range(argv[i + 3], 0, ICE_TX_PKT_BUF_SIZE - 14,
+                                    &tx_bench_payload_len) < 0) {
+                    fprintf(stderr, "invalid --tx-bench payload-len '%s' (expected 0..%d)\n",
+                            argv[i + 3], ICE_TX_PKT_BUF_SIZE - 14);
+                    return EXIT_FAILURE;
+                }
+                i += 4;
+            } else if (strcmp(argv[i], "--hugepages") == 0) {
+                use_hugepages = true;
+                i++;
+            } else if (strcmp(argv[i], "--hugepage-dir") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--hugepage-dir requires <dir>\n");
+                    return EXIT_FAILURE;
+                }
+                huge_dir = argv[i + 1];
+                i += 2;
+            } else if (strcmp(argv[i], "--tx-queues") == 0) {
+                int v;
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--tx-queues requires <n>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_int_range(argv[i + 1], 1, 1024, &v) < 0) {
+                    fprintf(stderr, "invalid --tx-queues '%s' (expected 1..1024)\n",
+                            argv[i + 1]);
+                    return EXIT_FAILURE;
+                }
+                txq_count = (uint16_t)v;
+                i += 2;
+            } else if (strcmp(argv[i], "--tx-desc-count") == 0) {
+                int v;
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--tx-desc-count requires <n>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_int_range(argv[i + 1], 32, 8192, &v) < 0) {
+                    fprintf(stderr, "invalid --tx-desc-count '%s' (expected 32..8192)\n",
+                            argv[i + 1]);
+                    return EXIT_FAILURE;
+                }
+                tx_desc_count = (uint16_t)v;
+                i += 2;
+            } else if (strcmp(argv[i], "--pin-cpus") == 0) {
+                pin_cpus = true;
+                i++;
+            } else if (strcmp(argv[i], "--dump-topo") == 0) {
+                dump_topo = true;
+                i++;
+            } else if (strcmp(argv[i], "--qparent-teid") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--qparent-teid requires <hex>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_u32_hex(argv[i + 1], &qparent_override) < 0) {
+                    fprintf(stderr, "invalid --qparent-teid '%s'\n", argv[i + 1]);
+                    return EXIT_FAILURE;
+                }
+                qparent_override_set = true;
+                i += 2;
+            } else {
+                fprintf(stderr, "unknown option: %s\n", argv[i]);
                 return EXIT_FAILURE;
             }
-            if (argc > 4) {
-                fprintf(stderr, "too many arguments for --rx-listen\n");
-                return EXIT_FAILURE;
-            }
-        } else if (strcmp(argv[2], "--tx-send") == 0) {
-            run_tx_send_mode = true;
-            if (argc < 4) {
-                fprintf(stderr, "--tx-send requires <dst-mac>\n");
-                return EXIT_FAILURE;
-            }
-            if (parse_mac_addr(argv[3], tx_send_dst_mac) < 0) {
-                fprintf(stderr, "invalid dst MAC '%s' (expected aa:bb:cc:dd:ee:ff)\n",
-                        argv[3]);
-                return EXIT_FAILURE;
-            }
-            if (argc >= 5 &&
-                parse_int_range(argv[4], 1, 1000000, &tx_send_count) < 0) {
-                fprintf(stderr, "invalid --tx-send count '%s' (expected 1..1000000)\n",
-                        argv[4]);
-                return EXIT_FAILURE;
-            }
-            if (argc >= 6 &&
-                parse_int_range(argv[5], 0, 60000, &tx_send_interval_ms) < 0) {
-                fprintf(stderr, "invalid --tx-send interval '%s' ms (expected 0..60000)\n",
-                        argv[5]);
-                return EXIT_FAILURE;
-            }
-            if (argc >= 7)
-                tx_send_payload = argv[6];
-        } else if (strcmp(argv[2], "--tx-bench") == 0) {
-            run_tx_bench_mode = true;
-            if (argc != 6) {
-                fprintf(stderr, "--tx-bench requires <seconds> <dst-mac> <payload-len>\n");
-                return EXIT_FAILURE;
-            }
-            if (parse_int_range(argv[3], 1, 3600, &tx_bench_seconds) < 0) {
-                fprintf(stderr, "invalid --tx-bench seconds '%s' (expected 1..3600)\n",
-                        argv[3]);
-                return EXIT_FAILURE;
-            }
-            if (parse_mac_addr(argv[4], tx_bench_dst_mac) < 0) {
-                fprintf(stderr, "invalid dst MAC '%s' (expected aa:bb:cc:dd:ee:ff)\n",
-                        argv[4]);
-                return EXIT_FAILURE;
-            }
-            if (parse_int_range(argv[5], 0, ICE_TX_PKT_BUF_SIZE - 14,
-                                &tx_bench_payload_len) < 0) {
-                fprintf(stderr, "invalid --tx-bench payload-len '%s' (expected 0..%d)\n",
-                        argv[5], ICE_TX_PKT_BUF_SIZE - 14);
-                return EXIT_FAILURE;
-            }
-        } else {
-            fprintf(stderr, "unknown option: %s\n", argv[2]);
+        }
+
+        if (!mode_set) {
+            fprintf(stderr, "one mode is required (--rx-listen/--tx-send/--tx-bench)\n");
             return EXIT_FAILURE;
         }
     }
+
+    d.txq_count = txq_count;
+    d.tx_desc_count = tx_desc_count;
+    d.txqs = calloc(d.txq_count, sizeof(*d.txqs));
+    if (!d.txqs)
+        die_errno("calloc txqs");
+    g_dump_topo = dump_topo;
+    g_qparent_override_set = qparent_override_set;
+    g_qparent_override = qparent_override;
 
     fprintf(stderr, "[my_ice] opening VFIO device %s\n", bdf);
     vfio_init(&d, bdf);
@@ -1525,13 +1999,19 @@ int main(int argc, char **argv)
         ICE_AQ_NUM_DESC * sizeof(struct ice_aq_desc) +
         ICE_AQ_NUM_DESC * ICE_AQ_MAX_BUF_LEN +
         ICE_AQ_NUM_DESC * ICE_AQ_MAX_BUF_LEN +
-        ICE_TX_DESC_COUNT * sizeof(struct ice_tx_desc) +
-        ICE_TX_DESC_COUNT * ICE_TX_PKT_BUF_SIZE +
+        (size_t)d.txq_count * d.tx_desc_count * sizeof(struct ice_tx_desc) +
+        (size_t)d.txq_count * d.tx_desc_count * ICE_TX_PKT_BUF_SIZE +
         ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc) +
         ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE +
         8192;
 
-    dma_map(&d, dma_bytes);
+    dma_map_bytes = dma_bytes;
+    if (use_hugepages) {
+        fprintf(stderr, "[my_ice] using hugepages from %s\n", huge_dir);
+        dma_map_bytes = prepare_hugepage_file(&d, dma_bytes, huge_dir);
+    }
+
+    dma_map(&d, dma_map_bytes);
     layout_dma(&d);
     adminq_hw_init(&d);
 
@@ -1555,7 +2035,7 @@ int main(int argc, char **argv)
     } else if (run_tx_bench_mode) {
         fprintf(stderr, "[my_ice] running tx bench path\n");
         if (run_tx_bench(&d, tx_bench_dst_mac, tx_bench_seconds,
-                         tx_bench_payload_len) < 0)
+                         tx_bench_payload_len, pin_cpus) < 0)
             goto out;
     }
 
