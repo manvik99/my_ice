@@ -107,6 +107,8 @@ struct dev_ctx {
     struct io_ring_ctx io;
 };
 
+static void rearm_rx_desc(struct dev_ctx *d, uint16_t idx);
+
 static const struct ice_ctx_ele rlan_ctx_info[] = {
     ICE_CTX_STORE(ice_rlan_ctx, head,        13, 0),
     ICE_CTX_STORE(ice_rlan_ctx, cpuid,        8, 13),
@@ -1063,9 +1065,42 @@ static void tx_update_free(struct dev_ctx *d, struct txq_ctx *q)
     q->tx_free = (uint16_t)(q->desc_count - used - 1);
 }
 
+static int poll_one_rx_desc(struct dev_ctx *d, uint16_t *out_idx, uint16_t *out_len)
+{
+    uint16_t n;
+
+    for (n = 0; n < ICE_RX_DESC_COUNT; n++) {
+        uint16_t idx = (uint16_t)((d->io.rx_ntc + n) % ICE_RX_DESC_COUNT);
+        union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
+        uint16_t status0 = le16toh(rxd->wb.status_error0);
+        uint16_t pkt_len;
+
+        if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)))
+            continue;
+
+        pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
+        if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_EOF_S)) ||
+            (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S)) ||
+            pkt_len == 0) {
+            fprintf(stderr,
+                    "[my_ice] rx descriptor error idx=%u status0=0x%04x pkt_len=%u\n",
+                    idx, status0, pkt_len);
+            rearm_rx_desc(d, idx);
+            return -1;
+        }
+
+        *out_idx = idx;
+        *out_len = pkt_len;
+        return 1;
+    }
+
+    return 0;
+}
+
 /* Returns: 0=enqueued, 1=ring full, -1=invalid packet */
 static int tx_try_enqueue(struct dev_ctx *d, struct txq_ctx *q, const uint8_t *pkt,
-                          uint16_t len, bool copy)
+                          uint16_t len, bool copy, const uint8_t *dst_mac,
+                          const uint8_t *src_mac)
 {
     uint16_t idx;
     uint16_t next;
@@ -1088,6 +1123,12 @@ static int tx_try_enqueue(struct dev_ctx *d, struct txq_ctx *q, const uint8_t *p
     buf = q->tx_pkt_bufs + ((size_t)idx * ICE_TX_PKT_BUF_SIZE);
     if (copy && pkt && len)
         memcpy(buf, pkt, len);
+    if ((dst_mac || src_mac) && len < 2 * ETHER_ADDR_LEN)
+        return -1;
+    if (dst_mac)
+        memcpy(buf, dst_mac, ETHER_ADDR_LEN);
+    if (src_mac)
+        memcpy(buf + ETHER_ADDR_LEN, src_mac, ETHER_ADDR_LEN);
 
     q->tx_pkts_since_rs++;
     if (q->tx_pkts_since_rs >= TX_RS_THRESH) {
@@ -1142,38 +1183,18 @@ static void rearm_rx_desc(struct dev_ctx *d, uint16_t idx)
 
 static int poll_one_rx_packet(struct dev_ctx *d, uint8_t *out, uint16_t out_sz, uint16_t *out_len)
 {
-    uint16_t n;
+    uint16_t idx;
+    int got = poll_one_rx_desc(d, &idx, out_len);
 
-    for (n = 0; n < ICE_RX_DESC_COUNT; n++) {
-        uint16_t idx = (uint16_t)((d->io.rx_ntc + n) % ICE_RX_DESC_COUNT);
-        union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
-        uint16_t status0 = le16toh(rxd->wb.status_error0);
-        uint16_t pkt_len;
+    if (got <= 0)
+        return got;
 
-        if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)))
-            continue;
+    if (*out_len > out_sz)
+        *out_len = out_sz;
 
-        pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
-        if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_EOF_S)) ||
-            (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S)) ||
-            pkt_len == 0) {
-            fprintf(stderr,
-                    "[my_ice] rx descriptor error idx=%u status0=0x%04x pkt_len=%u\n",
-                    idx, status0, pkt_len);
-            rearm_rx_desc(d, idx);
-            return -1;
-        }
-
-        *out_len = pkt_len;
-        if (*out_len > out_sz)
-            *out_len = out_sz;
-
-        memcpy(out, d->io.rx_bufs + ((size_t)idx * ICE_RX_BUF_SIZE), *out_len);
-        rearm_rx_desc(d, idx);
-        return 1;
-    }
-
-    return 0;
+    memcpy(out, d->io.rx_bufs + ((size_t)idx * ICE_RX_BUF_SIZE), *out_len);
+    rearm_rx_desc(d, idx);
+    return 1;
 }
 
 static void dump_mdet_regs(struct dev_ctx *d)
@@ -1334,6 +1355,173 @@ out:
     return rc;
 }
 
+static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
+{
+    const uint16_t reflect_batch = 64;
+    uint32_t rx_alloc;
+    uint32_t tx_alloc;
+    uint16_t first_q, last_q, avail_q;
+    uint16_t rx_mac_rule_idx = UINT16_MAX;
+    uint64_t rx_pkts = 0, rx_bytes = 0;
+    uint64_t tx_pkts = 0, tx_bytes = 0;
+    uint64_t copy_bytes = 0, tx_ring_full = 0;
+    uint64_t rx_short = 0, rx_errors = 0;
+    uint64_t doorbells = 0;
+    uint64_t gorc_before, gorc_after, gotc_before, gotc_after;
+    uint64_t start_ns, now_ns;
+    struct txq_ctx *q;
+    int rc = -1;
+
+    if (d->txq_count != 1) {
+        fprintf(stderr, "[my_ice] rx-reflect uses one TX queue, forcing txq_count=1 (was %u)\n",
+                d->txq_count);
+        d->txq_count = 1;
+    }
+
+    rx_alloc = reg_read32(d, PFLAN_RX_QALLOC);
+    if (!(rx_alloc & PFLAN_RX_QALLOC_VALID_M)) {
+        fprintf(stderr, "queue alloc not valid (RX=0x%08x)\n", rx_alloc);
+        goto out;
+    }
+    d->io.rxq_id = (uint16_t)(rx_alloc & PFLAN_RX_QALLOC_FIRSTQ_M);
+
+    tx_alloc = reg_read32(d, PFLAN_TX_QALLOC);
+    if (!(tx_alloc & PFLAN_TX_QALLOC_VALID_M)) {
+        fprintf(stderr, "queue alloc not valid (TX=0x%08x)\n", tx_alloc);
+        goto out;
+    }
+
+    first_q = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
+    last_q = (uint16_t)((tx_alloc & PFLAN_TX_QALLOC_LASTQ_M) >> PFLAN_TX_QALLOC_LASTQ_S);
+    avail_q = (uint16_t)(last_q - first_q + 1);
+    if (avail_q == 0) {
+        fprintf(stderr, "no available TX queues (first=%u last=%u)\n", first_q, last_q);
+        goto out;
+    }
+    d->txqs[0].txq_id = first_q;
+
+    if (aq_get_default_vsi_and_lport(d) < 0) {
+        fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
+        goto out;
+    }
+    if (aq_get_qparent_teid(d) < 0) {
+        fprintf(stderr, "[my_ice] failed to get parent TEID\n");
+        goto out;
+    }
+    if (setup_and_enable_rxq(d) < 0) {
+        fprintf(stderr, "[my_ice] setup/enable rx queue failed\n");
+        goto out;
+    }
+    if (aq_add_rx_mac_rule(d, &rx_mac_rule_idx) < 0) {
+        fprintf(stderr, "[my_ice] failed to add RX MAC rule\n");
+        goto out;
+    }
+    if (add_tx_queues(d, 1) < 0) {
+        fprintf(stderr, "[my_ice] add tx queues failed\n");
+        goto out;
+    }
+
+    tx_ring_init(d);
+    q = &d->txqs[0];
+
+    fprintf(stderr,
+            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d\n",
+            d->io.vsi_num, d->io.lport, d->io.rxq_id, q->txq_id,
+            d->io.mac[0], d->io.mac[1], d->io.mac[2],
+            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms);
+
+    gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
+                                     GLV_GORCH(d->io.vsi_num));
+    gotc_before = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
+                                     GLV_GOTCH(d->io.vsi_num));
+    start_ns = monotonic_ns();
+
+    while (monotonic_ns() - start_ns < (uint64_t)timeout_ms * 1000000ULL) {
+        uint16_t enqueued = 0;
+        bool rx_seen = false;
+        bool tx_blocked = false;
+
+        while (enqueued < reflect_batch) {
+            const uint8_t *rxpkt;
+            uint16_t rx_idx, rx_len;
+            int got;
+            int enq;
+
+            got = poll_one_rx_desc(d, &rx_idx, &rx_len);
+            if (got < 0) {
+                rx_errors++;
+                dump_mdet_regs(d);
+                goto out;
+            }
+            if (got == 0)
+                break;
+
+            rx_seen = true;
+            rxpkt = d->io.rx_bufs + ((size_t)rx_idx * ICE_RX_BUF_SIZE);
+            if (rx_len < 14) {
+                rx_short++;
+                rearm_rx_desc(d, rx_idx);
+                continue;
+            }
+
+            enq = tx_try_enqueue(d, q, rxpkt, rx_len, true, rxpkt + ETHER_ADDR_LEN,
+                                 d->io.mac);
+            if (enq < 0) {
+                rx_errors++;
+                rearm_rx_desc(d, rx_idx);
+                continue;
+            }
+            if (enq > 0) {
+                tx_ring_full++;
+                tx_blocked = true;
+                break;
+            }
+
+            rearm_rx_desc(d, rx_idx);
+            enqueued++;
+            rx_pkts++;
+            rx_bytes += rx_len;
+            tx_pkts++;
+            tx_bytes += rx_len;
+            copy_bytes += rx_len;
+        }
+
+        if (enqueued > 0) {
+            tx_ring_doorbell(d, q);
+            doorbells++;
+        }
+
+        if (tx_blocked) {
+            tx_update_free(d, q);
+            usleep(50);
+            continue;
+        }
+        if (!rx_seen)
+            usleep(1000);
+    }
+
+    (void)tx_wait_drain(d, q, 1000);
+    now_ns = monotonic_ns();
+    gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
+                                    GLV_GORCH(d->io.vsi_num));
+    gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
+                                    GLV_GOTCH(d->io.vsi_num));
+    fprintf(stderr,
+            "[my_ice] rx-reflect done: seconds=%.3f rx_pkts=%" PRIu64 " rx_bytes=%" PRIu64
+            " tx_pkts=%" PRIu64 " tx_bytes=%" PRIu64 " copy_bytes=%" PRIu64
+            " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
+            " doorbells=%" PRIu64 " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
+            (double)(now_ns - start_ns) / 1e9,
+            rx_pkts, rx_bytes, tx_pkts, tx_bytes, copy_bytes, tx_ring_full,
+            rx_short, rx_errors, doorbells, d->io.vsi_num,
+            gorc_after - gorc_before, gotc_after - gotc_before);
+    rc = 0;
+
+out:
+    aq_remove_sw_rule_best_effort(d, ICE_AQC_SW_RULES_T_LKUP_RX, rx_mac_rule_idx);
+    return rc;
+}
+
 static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
                        int interval_ms, const char *payload)
 {
@@ -1415,7 +1603,7 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
         for (tries = 0; tries < 100000; tries++) {
             if (q->tx_free == 0)
                 tx_update_free(d, q);
-            int enq = tx_try_enqueue(d, q, pkt, frame_len, true);
+            int enq = tx_try_enqueue(d, q, pkt, frame_len, true, NULL, NULL);
             if (enq == 0) {
                 tx_ring_doorbell(d, q);
                 break;
@@ -1472,7 +1660,7 @@ static void *tx_bench_worker_main(void *arg)
             tx_update_free(w->d, w->q);
 
         for (i = 0; i < TX_BURST_SIZE; i++) {
-            int enq = tx_try_enqueue(w->d, w->q, w->pkt, w->frame_len, false);
+            int enq = tx_try_enqueue(w->d, w->q, w->pkt, w->frame_len, false, NULL, NULL);
             if (enq == 0) {
                 burst_pkts++;
                 continue;
@@ -1795,6 +1983,7 @@ int main(int argc, char **argv)
     };
     const char *bdf;
     bool run_rx_listen_mode = false;
+    bool run_rx_reflect_mode = false;
     bool run_tx_send_mode = false;
     bool run_tx_bench_mode = false;
     bool use_hugepages = false;
@@ -1806,6 +1995,7 @@ int main(int argc, char **argv)
     uint32_t qparent_override = 0;
     bool qparent_override_set = false;
     int rx_listen_timeout_s = 30;
+    int rx_reflect_timeout_s = 30;
     uint8_t tx_send_dst_mac[ETHER_ADDR_LEN] = {0};
     int tx_send_count = 1;
     int tx_send_interval_ms = 100;
@@ -1818,13 +2008,14 @@ int main(int argc, char **argv)
     int rc = EXIT_FAILURE;
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--tx-queues <n>] [--tx-desc-count <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--tx-queues <n>] [--tx-desc-count <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen 60\n", argv[0]);
-        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send 40:a6:b7:c3:43:e8\n", argv[0]);
-        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send 40:a6:b7:c3:43:e8 20 100 hello\n", argv[0]);
-        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-bench 10 40:a6:b7:c3:43:e8 46\n", argv[0]);
-        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-bench 15 40:a6:b7:c3:43:e8 1472 --hugepages --hugepage-dir /mnt/huge\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send aa:bb:cc:dd:ee:ff\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send aa:bb:cc:dd:ee:ff 20 100 hello\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-bench 10 aa:bb:cc:dd:ee:ff 46\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --tx-bench 15 aa:bb:cc:dd:ee:ff 1472 --hugepages --hugepage-dir /mnt/huge\n", argv[0]);
         return EXIT_FAILURE;
     }
 
@@ -1836,7 +2027,7 @@ int main(int argc, char **argv)
         while (i < argc) {
             if (strcmp(argv[i], "--rx-listen") == 0) {
                 if (mode_set) {
-                    fprintf(stderr, "only one mode allowed (--rx-listen/--tx-send/--tx-bench)\n");
+                    fprintf(stderr, "only one mode allowed (--rx-listen/--rx-reflect/--tx-send/--tx-bench)\n");
                     return EXIT_FAILURE;
                 }
                 mode_set = true;
@@ -1850,9 +2041,25 @@ int main(int argc, char **argv)
                     }
                     i++;
                 }
+            } else if (strcmp(argv[i], "--rx-reflect") == 0) {
+                if (mode_set) {
+                    fprintf(stderr, "only one mode allowed (--rx-listen/--rx-reflect/--tx-send/--tx-bench)\n");
+                    return EXIT_FAILURE;
+                }
+                mode_set = true;
+                run_rx_reflect_mode = true;
+                i++;
+                if (i < argc && strncmp(argv[i], "--", 2) != 0) {
+                    if (parse_int_range(argv[i], 1, 3600, &rx_reflect_timeout_s) < 0) {
+                        fprintf(stderr, "invalid --rx-reflect timeout '%s' (expected 1..3600 seconds)\n",
+                                argv[i]);
+                        return EXIT_FAILURE;
+                    }
+                    i++;
+                }
             } else if (strcmp(argv[i], "--tx-send") == 0) {
                 if (mode_set) {
-                    fprintf(stderr, "only one mode allowed (--rx-listen/--tx-send/--tx-bench)\n");
+                    fprintf(stderr, "only one mode allowed (--rx-listen/--rx-reflect/--tx-send/--tx-bench)\n");
                     return EXIT_FAILURE;
                 }
                 mode_set = true;
@@ -1890,7 +2097,7 @@ int main(int argc, char **argv)
                 }
             } else if (strcmp(argv[i], "--tx-bench") == 0) {
                 if (mode_set) {
-                    fprintf(stderr, "only one mode allowed (--rx-listen/--tx-send/--tx-bench)\n");
+                    fprintf(stderr, "only one mode allowed (--rx-listen/--rx-reflect/--tx-send/--tx-bench)\n");
                     return EXIT_FAILURE;
                 }
                 mode_set = true;
@@ -1976,7 +2183,7 @@ int main(int argc, char **argv)
         }
 
         if (!mode_set) {
-            fprintf(stderr, "one mode is required (--rx-listen/--tx-send/--tx-bench)\n");
+            fprintf(stderr, "one mode is required (--rx-listen/--rx-reflect/--tx-send/--tx-bench)\n");
             return EXIT_FAILURE;
         }
     }
@@ -2026,6 +2233,10 @@ int main(int argc, char **argv)
     if (run_rx_listen_mode) {
         fprintf(stderr, "[my_ice] running rx listen path\n");
         if (run_rx_listen(&d, rx_listen_timeout_s * 1000) < 0)
+            goto out;
+    } else if (run_rx_reflect_mode) {
+        fprintf(stderr, "[my_ice] running rx reflect path\n");
+        if (run_rx_reflect(&d, rx_reflect_timeout_s * 1000) < 0)
             goto out;
     } else if (run_tx_send_mode) {
         fprintf(stderr, "[my_ice] running tx send path\n");

@@ -15,7 +15,7 @@ bash /users/manvik12/my_ice/my_ice_rust/build.sh
 ## Run
 
 ```bash
-/users/manvik12/my_ice/my_ice_rust/my_ice_rust 0000:17:00.0 --tx-bench 10 40:a6:b7:c3:43:e8 1000
+/users/manvik12/my_ice/my_ice_rust/my_ice_rust <BDF> --tx-bench 10 <dst-mac> 1000
 ```
 
 ## Compare all three
@@ -23,5 +23,5 @@ bash /users/manvik12/my_ice/my_ice_rust/build.sh
 Use:
 
 ```bash
-sudo /users/manvik12/my_ice/dpdk_compare.sh --bdf 0000:17:00.0 --dst-mac 40:a6:b7:c3:43:e8 --seconds 10 --payload-len 1000
+sudo /users/manvik12/my_ice/dpdk_compare.sh --bdf <BDF> --dst-mac <dst-mac> --seconds 10 --payload-len 1000
 ```
