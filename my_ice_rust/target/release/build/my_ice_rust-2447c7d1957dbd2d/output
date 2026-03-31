@@ -1,4 +1,0 @@
-cargo:rustc-link-search=native=/users/manvik12/my_ice/my_ice_rust/target/release/build/my_ice_rust-2447c7d1957dbd2d/out
-cargo:rustc-link-lib=static=my_ice_core
-cargo:rerun-if-changed=/users/manvik12/my_ice/main.c
-cargo:rerun-if-changed=/users/manvik12/my_ice/ice_min.h

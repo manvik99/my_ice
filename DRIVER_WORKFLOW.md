@@ -13,88 +13,117 @@ It is not linked against DPDK, but it follows the same overall deployment model:
 
 - bind the NIC to `vfio-pci`
 - enable IOMMU
-- map DMA memory into the device
-- program Rx/Tx queues from userspace
+- map DMA-visible memory into the device
+- program Rx/Tx queues directly from userspace
 
-The code is concentrated in:
+The most important files are:
 
-- [`main.c`](/users/manvik12/my_ice/main.c)
-- [`ice_min.h`](/users/manvik12/my_ice/ice_min.h)
+- [`main.c`](main.c)
+- [`ice_min.h`](ice_min.h)
+- [`ixy-memory-model.md`](ixy-memory-model.md)
+- [`RX_TX_REFLECTOR_DESIGN.md`](RX_TX_REFLECTOR_DESIGN.md)
 
-## High-level architecture
+The current reflector implementation follows the zero-copy ownership model from `ixy-memory-model.md`, not the older copy-first phase described in `RX_TX_REFLECTOR_DESIGN.md`.
+
+## One-Page Code Map
+
+These links are repo-relative so local Markdown viewers can open them. If your viewer ignores the `#L...` suffix, it should still open the file; then jump to the referenced line number manually.
+
+- Process entry and mode dispatch: [`main()`](main.c#L2224)
+- VFIO bring-up and BAR0 mapping: [`vfio_init()`](main.c#L475)
+- DMA mapping: [`dma_map()`](main.c#L533)
+- DMA sub-region layout: [`layout_dma()`](main.c#L561)
+- Software ownership arrays and mempool metadata: [`alloc_queue_sw_state()`](main.c#L314)
+- Reflect mempool initialization: [`pkt_pool_init()`](main.c#L337)
+- AdminQ hardware setup: [`adminq_hw_init()`](main.c#L623)
+- Firmware and switch discovery:
+  - [`aq_get_fw_ver()`](main.c#L744)
+  - [`aq_manage_mac_read()`](main.c#L763)
+  - [`aq_get_default_vsi_and_lport()`](main.c#L804)
+  - [`aq_get_qparent_teid()`](main.c#L863)
+  - [`aq_add_rx_mac_rule()`](main.c#L922)
+- Tx queue creation: [`add_tx_queues()`](main.c#L1007)
+- Rx queue setup:
+  - flat Rx buffer mode: [`setup_and_enable_rxq()`](main.c#L1145)
+  - pool-backed Rx mode: [`setup_and_enable_rxq_pool()`](main.c#L1161)
+- Tx ring lifecycle:
+  - init: [`tx_ring_init()`](main.c#L1181)
+  - completion/recycle: [`tx_update_free()`](main.c#L1196)
+- Rx polling and rearm:
+  - descriptor completion scan: [`poll_one_rx_desc()`](main.c#L1224)
+  - repost buffer to hardware: [`rearm_rx_desc()`](main.c#L1363)
+- Tx enqueue helpers:
+  - queue-owned copy/static-buffer path: [`tx_try_enqueue()`](main.c#L1296)
+  - zero-copy pooled-buffer path: [`tx_try_enqueue_pkt_buf()`](main.c#L1326)
+- In-place reflect MAC rewrite: [`rewrite_reflect_l2()`](main.c#L1481)
+- Runtime modes:
+  - listen: [`run_rx_listen()`](main.c#L1490)
+  - reflect: [`run_rx_reflect()`](main.c#L1566)
+  - single-shot Tx: [`run_tx_send()`](main.c#L1768)
+  - Tx benchmark: [`run_tx_bench()`](main.c#L1928)
+- Shutdown: [`cleanup()`](main.c#L2132)
+
+## High-Level Architecture
 
 The driver has three layers:
 
 1. VFIO and DMA setup
    - Opens the VFIO container/group/device.
    - Maps BAR0.
-   - Allocates DMA-visible memory for AdminQ, Rx rings, Tx rings, and packet buffers.
+   - Maps one large DMA-visible memory block for AdminQ, Rx, Tx, and the reflect mempool.
 
 2. Control plane through AdminQ
    - Queries firmware version.
-   - Reads the port MAC address.
-   - Discovers the default VSI and physical logical port (`lport`).
-   - Discovers the queue scheduler parent TEID needed to create Tx queues.
-   - Installs or removes a simple Rx MAC switch rule.
+   - Reads the NIC MAC address.
+   - Discovers the default VSI and logical port.
+   - Discovers the scheduler parent TEID needed for Tx queue creation.
+   - Installs and removes an Rx MAC switch rule.
 
 3. Data plane through direct register and descriptor programming
-   - Rx path writes queue context into `QRX_CONTEXT`.
-   - Tx path creates Tx queue contexts and submits them through `ADD_TXQS`.
-   - Packet movement happens through descriptor rings in DMA memory plus doorbells/tails in BAR0.
+   - Rx queue contexts are written through `QRX_CONTEXT`.
+   - Tx queue contexts are created through `ADD_TXQS`.
+   - Rx and Tx datapaths use DMA descriptor rings plus MMIO tails/doorbells.
+   - The reflect mode uses an ixy-style memory pool and passes the same DMA buffer from Rx to Tx without copying payload bytes.
 
-## Main runtime flow
+## Main Runtime Flow
 
-The top-level flow in `main()` is:
+The top-level flow is implemented in [`main()`](main.c#L2224).
 
-1. Parse CLI arguments and choose a mode:
+1. Parse CLI arguments and choose one mode:
    - `--rx-listen`
    - `--rx-reflect`
    - `--tx-send`
    - `--tx-bench`
 
-2. Allocate software queue metadata:
-   - `d.txqs`
+2. Allocate software-side state:
+   - `d.txqs` in [`main()`](main.c#L2440)
+   - Rx slot ownership array, Tx completion ownership arrays, and mempool free-stack metadata in [`alloc_queue_sw_state()`](main.c#L314)
 
-3. Initialize VFIO:
-   - discover IOMMU group
-   - open `/dev/vfio/vfio`
-   - open `/dev/vfio/<group>`
-   - attach group to container
-   - enable `VFIO_TYPE1_IOMMU`
-   - obtain the PCI device FD
-   - map BAR0
+3. Initialize VFIO and BAR0 in [`vfio_init()`](main.c#L475).
 
-4. Size and allocate DMA memory:
-   - AdminQ descriptor rings
-   - AdminQ buffers
-   - Tx descriptors and Tx packet buffers
-   - Rx descriptors and Rx packet buffers
+4. Compute the DMA size in [`main()`](main.c#L2455), then map it in [`dma_map()`](main.c#L533).
 
-5. Lay out that DMA block into sub-regions and record both:
-   - virtual addresses for CPU access
-   - IOVAs for device access
+5. Partition that DMA block into sub-regions in [`layout_dma()`](main.c#L561).
 
-6. Initialize the hardware AdminQ rings in BAR0.
+6. Initialize the reflect mempool entries in [`pkt_pool_init()`](main.c#L337).
 
-7. Run basic control-plane discovery:
-   - `GET_VER`
-   - `MANAGE_MAC_READ`
+7. Program AdminQ hardware state in [`adminq_hw_init()`](main.c#L623).
 
-8. Enter the selected mode:
-   - Rx setup + polling
-   - Rx setup + reflect loop
-   - Tx queue creation + one-shot send
-   - Tx queue creation + threaded benchmark
+8. Run basic firmware discovery:
+   - [`aq_get_fw_ver()`](main.c#L744)
+   - [`aq_manage_mac_read()`](main.c#L763)
 
-9. Cleanup:
-   - unmap DMA from IOMMU
-   - unmap BAR0
-   - close VFIO FDs
-   - remove temporary hugepage backing file if used
+9. Enter the selected mode:
+   - [`run_rx_listen()`](main.c#L1490)
+   - [`run_rx_reflect()`](main.c#L1566)
+   - [`run_tx_send()`](main.c#L1768)
+   - [`run_tx_bench()`](main.c#L1928)
 
-## Core software state
+10. Tear down mappings and free software metadata in [`cleanup()`](main.c#L2132).
 
-The program keeps almost all runtime state in `struct dev_ctx`.
+## Core Software State
+
+Almost all runtime state lives under [`struct dev_ctx`](main.c#L120).
 
 ### `struct dev_ctx`
 
@@ -111,45 +140,79 @@ This is the top-level device object. It owns:
   - `dma.vaddr`
   - `dma.iova`
   - `dma.size`
+- queue bookkeeping:
+  - `txq_count`
+  - `txq_alloc_count`
+  - `tx_desc_count`
+  - `txqs`
 - AdminQ state:
   - `atq`
   - `arq`
 - datapath state:
   - `io`
-  - `txqs`
+- reflect mempool state:
+  - `reflect_pool`
 
-### `struct aq_ring_ctx`
+### `struct pkt_buf`
 
-Represents one AdminQ ring:
+The pooled packet object for zero-copy reflection lives in [`struct pkt_buf`](main.c#L55).
 
-- `desc`: descriptor ring
-- `desc_iova`: device-visible descriptor base
-- `buf`: data buffer area, one chunk per descriptor
-- `buf_iova`: device-visible buffer base
-- `count`: ring size
-- `next_to_use`: software producer index
+Each entry carries:
 
-Two instances exist:
+- `buf_addr_iova`: the exact DMA address programmed into hardware descriptors
+- `mempool`: a back-pointer to the owning pool
+- `mempool_idx`: the stable slot number in that pool
+- `size`: current packet length
+- `data[]`: packet bytes, aligned so the payload starts on a cache-line boundary
 
-- `atq`: Admin Transmit Queue, used to submit firmware commands
-- `arq`: Admin Receive Queue, used by firmware to post async/events and indirect data
+This is the core ixy-style idea: the packet object is self-describing, so completion code can recycle a buffer without guessing where it came from.
+
+### `struct pkt_mempool`
+
+The pool metadata lives in [`struct pkt_mempool`](main.c#L64).
+
+Important fields:
+
+- `base`, `base_iova`: start of the DMA-backed pool region
+- `entry_size`: fixed stride between packet objects
+- `num_entries`: total number of packet buffers
+- `free_stack_top` and `free_stack[]`: a simple LIFO free-stack allocator
+
+The pool size formula is implemented in [`reflect_pool_entry_count()`](main.c#L299):
+
+- `ICE_RX_DESC_COUNT`
+- `+ tx_desc_count`
+- `+ TX_BURST_SIZE` extra slack
 
 ### `struct io_ring_ctx`
 
-Holds shared datapath identity and Rx state:
+Shared datapath identity and Rx state lives in [`struct io_ring_ctx`](main.c#L91).
 
-- `mac`: LAN MAC address discovered from firmware
-- `lport`: physical logical port number
-- `vsi_num`: default VSI for the PF
-- `rxq_id`: chosen Rx queue from `PFLAN_RX_QALLOC`
-- `qparent_teid`: scheduler parent used for Tx queue creation
-- `rx_desc`, `rx_desc_iova`
-- `rx_bufs`, `rx_bufs_iova`
-- `rx_ntc`: next Rx descriptor to check/rearm
+Important fields:
+
+- identity:
+  - `mac`
+  - `lport`
+  - `vsi_num`
+  - `rxq_id`
+  - `qparent_teid`
+- Rx ring memory:
+  - `rx_desc`, `rx_desc_iova`
+  - `rx_bufs`, `rx_bufs_iova`
+- pooled Rx ownership:
+  - `rx_pkt_bufs`
+- ring progress:
+  - `rx_ntc`
+
+`rx_bufs` is used by the simple listen path.
+
+`rx_pkt_bufs` is the critical zero-copy side array for reflect mode: descriptor slot `i` maps to the current pooled `pkt_buf*` owned by that Rx descriptor.
 
 ### `struct txq_ctx`
 
-Per-Tx-queue software state:
+Per-Tx-queue state lives in [`struct txq_ctx`](main.c#L106).
+
+Important fields:
 
 - queue identity:
   - `txq_id`
@@ -157,836 +220,490 @@ Per-Tx-queue software state:
 - ring memory:
   - `tx_desc`, `tx_desc_iova`
   - `tx_pkt_bufs`, `tx_pkt_iova`
-- ring indices:
+- software indices:
   - `tx_next_to_use`
   - `tx_next_to_clean`
   - `tx_free`
   - `tx_pkts_since_rs`
+- Tx ownership side array:
+  - `tx_pkt_buf_refs`
 
-## VFIO and DMA initialization
+`tx_pkt_bufs` is used by `--tx-send`, `--tx-bench`, and the legacy queue-owned path in [`tx_try_enqueue()`](main.c#L1296).
 
-## 1. Discover the IOMMU group
+`tx_pkt_buf_refs` is what makes zero-copy reflection safe: when Tx borrows an Rx buffer, software remembers which `pkt_buf*` was queued in each descriptor slot, and [`tx_update_free()`](main.c#L1196) returns it to the pool only after hardware has completed that descriptor.
 
-`get_iommu_group_id()` reads:
+## VFIO, DMA, and Pool Initialization
 
-- `/sys/bus/pci/devices/<BDF>/iommu_group`
+### Discover and open VFIO
 
-This matters because VFIO access is granted per IOMMU group, not just per function.
+[`vfio_init()`](main.c#L475) performs:
 
-## 2. Open VFIO and validate capabilities
+- IOMMU group discovery
+- container and group opens
+- `VFIO_TYPE1_IOMMU` enablement
+- BAR0 region discovery and `mmap()`
+- PCI command register update to enable:
+  - memory decoding
+  - bus mastering
 
-`vfio_init()` performs:
-
-- open `/dev/vfio/vfio`
-- verify `VFIO_GET_API_VERSION`
-- verify `VFIO_CHECK_EXTENSION(VFIO_TYPE1_IOMMU)`
-- open `/dev/vfio/<group_id>`
-- verify `VFIO_GROUP_FLAGS_VIABLE`
-- attach group to container
-- set IOMMU type to `VFIO_TYPE1_IOMMU`
-- obtain the device FD with `VFIO_GROUP_GET_DEVICE_FD`
-
-## 3. Enable PCI memory and bus mastering
-
-Still inside `vfio_init()`, the code reads and updates PCI config space:
-
-- offset `PCI_COMMAND_OFF = 0x04`
-
-It sets:
-
-- `PCI_COMMAND_MEM`
-- `PCI_COMMAND_MASTER`
-
-This is essential because:
-
-- BAR memory accesses require memory space enabled
-- DMA requires bus mastering enabled
-
-## 4. Map BAR0
-
-The driver queries:
-
-- VFIO PCI BAR0 region
-
-Then mmaps it as:
-
-- `d->bar0`
-
-All later MMIO register access happens through:
+All direct register access after that goes through:
 
 - `reg_read32()`
 - `reg_write32()`
 
-## 5. Allocate and map DMA memory
+### Map DMA memory
 
-`dma_map()` allocates one large DMA block, either:
+[`dma_map()`](main.c#L533) allocates one large memory block, either from:
 
-- from anonymous memory
-- or from a hugetlbfs-backed file if `--hugepages` is used
+- anonymous memory
+- or hugetlbfs if `--hugepages` is enabled
 
-Important design choice:
+The key design choice is:
 
-- the IOVA is set equal to the userspace virtual address
+- `d->dma.iova = (uint64_t)(uintptr_t)d->dma.vaddr`
 
-```c
-d->dma.iova = (uint64_t)(uintptr_t)d->dma.vaddr;
-```
+That works because VFIO explicitly maps that virtual range into the IOMMU with `VFIO_IOMMU_MAP_DMA`.
 
-That only works because VFIO explicitly maps that virtual range into the IOMMU with `VFIO_IOMMU_MAP_DMA`.
+### Partition the DMA block
 
-## DMA layout
-
-`layout_dma()` partitions the big DMA block in this order:
+[`layout_dma()`](main.c#L561) partitions the single DMA mapping in this order:
 
 1. ATQ descriptors
 2. ARQ descriptors
 3. ATQ buffers
 4. ARQ buffers
-5. Tx descriptors for all requested Tx queues
-6. Tx packet buffers for all requested Tx queues
+5. Tx descriptors for all allocated Tx queues
+6. Tx packet buffers for all allocated Tx queues
 7. Rx descriptors
-8. Rx packet buffers
+8. flat Rx packet buffers for listen mode
+9. pooled packet buffer region for zero-copy reflect mode
 
-Alignment rules:
+The reflect mempool DMA region is placed at:
 
-- descriptors generally aligned to 128 bytes
-- AdminQ buffers aligned to 4096 bytes
+- [`layout_dma()` line 593](main.c#L593)
 
-This function computes both CPU pointers and device IOVAs for every region.
+### Allocate software ownership metadata
 
-## AdminQ control plane
+[`alloc_queue_sw_state()`](main.c#L314) creates:
 
-The Admin Queue is the driver’s firmware mailbox. The code uses it for all higher-level resource discovery and some policy operations.
+- `d->io.rx_pkt_bufs`
+- `q->tx_pkt_buf_refs` for every allocated Tx queue
+- `d->reflect_pool.free_stack`
 
-## AdminQ rings and BAR0 registers
+These arrays are normal heap allocations. They are not DMA-visible. They exist purely so software can map descriptor slots back to `pkt_buf*`.
 
-AdminQ BAR0 register families from `ice_min.h`:
+### Initialize the reflect mempool
 
-- ATQ registers
-  - `PF_FW_ATQBAL = 0x00080000`
-  - `PF_FW_ATQBAH = 0x00080100`
-  - `PF_FW_ATQLEN = 0x00080200`
-  - `PF_FW_ATQH   = 0x00080300`
-  - `PF_FW_ATQT   = 0x00080400`
+[`pkt_pool_init()`](main.c#L337) walks the DMA pool region and initializes each packet object:
 
-- ARQ registers
-  - `PF_FW_ARQBAL = 0x00080080`
-  - `PF_FW_ARQBAH = 0x00080180`
-  - `PF_FW_ARQLEN = 0x00080280`
-  - `PF_FW_ARQH   = 0x00080380`
-  - `PF_FW_ARQT   = 0x00080480`
+- computes the per-entry DMA address that points at `pkt_buf.data`
+- stores `mempool` and `mempool_idx`
+- zeroes `size`
+- populates the free stack
 
-Ring sizes:
+Allocation and free are intentionally simple:
 
-- `ICE_AQ_NUM_DESC = 64`
-- `ICE_AQ_MAX_BUF_LEN = 4096`
+- allocate: [`pkt_buf_alloc()`](main.c#L356)
+- free: [`pkt_buf_free()`](main.c#L371)
 
-## AdminQ hardware init
+There is no refcounting. Ownership is single-owner at every step.
 
-`adminq_hw_init()` does four things:
+### How the mempool allocator actually works
 
-1. Clears all AdminQ descriptors and buffers.
-2. Prepares every ARQ descriptor with a receive buffer address.
-3. Programs ATQ base/length/head/tail registers.
-4. Programs ARQ base/length/head/tail registers, then posts all ARQ entries by writing:
-   - `PF_FW_ARQT = ICE_AQ_NUM_DESC - 1`
+The allocator is intentionally tiny and ixy-like.
 
-This means:
+Allocation path:
 
-- ATQ starts empty and software pushes commands into it
-- ARQ starts full of posted receive buffers for firmware responses/events
+- [`pkt_buf_alloc()`](main.c#L356) decrements `free_stack_top`
+- it reads one stable slot index from `free_stack[]`
+- it converts that index into a `pkt_buf*` with [`pkt_pool_get_entry()`](main.c#L309)
+- it resets `buf->size = 0`
 
-## Command submission model
+Free path:
 
-`aq_send_cmd()` implements synchronous command submission:
+- [`pkt_buf_free()`](main.c#L371) looks at `buf->mempool`
+- it pushes `buf->mempool_idx` back onto that pool’s `free_stack[]`
+- it increments `free_stack_top`
 
-1. Check that ATQ is not full by comparing software `next_to_use` to hardware `PF_FW_ATQH`.
-2. Copy the command descriptor into the ATQ ring.
-3. If a data buffer is provided:
-   - copy the payload into the corresponding ATQ buffer slot
-   - set `ICE_AQ_FLAG_BUF`
-   - set `ICE_AQ_FLAG_LB` if buffer is larger than `ICE_AQ_LG_BUF`
-   - fill DMA address fields in the descriptor
-4. Advance software tail.
-5. Ring the queue by writing `PF_FW_ATQT`.
-6. Poll until hardware head catches up.
-7. Copy the completion descriptor and any returned buffer contents back to caller memory.
-8. Check `retval`.
+Why this design matters:
 
-This is a very simple polling control plane:
+- the buffer always knows which pool it came from
+- the Tx completion path does not need to guess where to return it
+- the recycle logic works even though the buffer was received on Rx and freed later from Tx completion
 
-- no interrupts
-- no separate ARQ event-consumption loop
-- synchronous timeout-based completion
+## AdminQ Control Plane
 
-## AdminQ commands used by this driver
+AdminQ hardware setup is done in [`adminq_hw_init()`](main.c#L623).
 
-### `GET_VER` (`0x0001`)
+The main commands this driver uses are:
 
-Purpose:
+- [`aq_get_fw_ver()`](main.c#L744)
+  - firmware and API version discovery
+- [`aq_manage_mac_read()`](main.c#L763)
+  - MAC address discovery
+- [`aq_get_default_vsi_and_lport()`](main.c#L804)
+  - default VSI and logical port discovery
+- [`aq_get_qparent_teid()`](main.c#L863)
+  - Tx scheduler parent discovery
+- [`aq_add_rx_mac_rule()`](main.c#L922)
+  - installs an Rx MAC steering rule to forward frames for the port MAC into the default VSI
+- [`add_tx_queues()`](main.c#L1007)
+  - creates Tx queues in firmware/scheduler space
 
-- retrieve firmware and API versioning
+This split is important:
 
-Used by:
+- AdminQ is the control plane
+- descriptor rings and MMIO tails/doorbells are the data plane
 
-- `aq_get_fw_ver()`
+## Rx Queue Model
 
-### `MANAGE_MAC_READ` (`0x0107`)
+There are two Rx queue setup paths:
 
-Purpose:
+- flat-buffer Rx for listen mode: [`setup_and_enable_rxq()`](main.c#L1145)
+- pool-backed Rx for reflect mode: [`setup_and_enable_rxq_pool()`](main.c#L1161)
 
-- retrieve MAC addresses known to firmware
+Both paths share the same hardware queue enable sequence through [`enable_rxq()`](main.c#L1092):
 
-Used by:
+- program `QRXFLXP_CNTXT`
+- pack and write `QRX_CONTEXT`
+- request queue enable with `QRX_CTRL`
+- post the ring with `QRX_TAIL = ICE_RX_DESC_COUNT - 1`
 
-- `aq_manage_mac_read()`
+### Listen mode Rx
 
-What the driver extracts:
+The listen path keeps the older simple model:
 
-- LAN MAC address into `d->io.mac`
-- LAN logical port number into `d->io.lport`
+- each descriptor points to one fixed `rx_bufs` slice
+- [`poll_one_rx_packet()`](main.c#L1383) copies bytes out to a stack buffer
+- [`rearm_rx_desc()`](main.c#L1363) reposts the same Rx DMA buffer
 
-### `GET_SW_CFG` (`0x0200`)
+### Reflect mode Rx
 
-Purpose:
+The reflect path uses the ixy-style pool-backed model:
 
-- walk switch configuration elements exposed by firmware
+- each Rx descriptor is armed with a pooled `pkt_buf`
+- `rx_pkt_bufs[idx]` tracks which pooled buffer belongs to slot `idx`
+- on completion, software allocates a replacement buffer before giving the completed one to Tx
 
-Used by:
+The descriptor completion scan itself is still done by [`poll_one_rx_desc()`](main.c#L1224):
 
-- `aq_get_default_vsi_and_lport()`
+- `DD` must be set
+- `EOF` must be set
+- `RXE` must be clear
+- `pkt_len` must be non-zero
 
-What the driver extracts:
+## Tx Queue Model
 
-- default PF VSI number
-- physical logical port
+Tx queue creation is done through [`add_tx_queues()`](main.c#L1007), and software ring state is reset in [`tx_ring_init()`](main.c#L1181).
 
-The code loops until firmware returns `element == 0`, treating the response as a paginated switch configuration walk.
+There are two Tx enqueue paths:
 
-### `GET_DFLT_TOPO` (`0x0400`)
+- queue-owned Tx buffers: [`tx_try_enqueue()`](main.c#L1296)
+- zero-copy pooled buffers: [`tx_try_enqueue_pkt_buf()`](main.c#L1326)
 
-Purpose:
+Both enqueue styles share the same descriptor construction logic through:
 
-- get default Tx scheduler topology for a port
+- [`tx_try_reserve_slot()`](main.c#L1256)
+- [`tx_prepare_desc()`](main.c#L1276)
+- [`tx_commit_slot()`](main.c#L1268)
+- [`tx_ring_doorbell()`](main.c#L1343)
 
-Used by:
+Tx completion and recycle happens in [`tx_update_free()`](main.c#L1196):
 
-- `aq_get_qparent_teid()`
+- read `QTX_COMM_HEAD(q)`
+- walk every completed slot from `tx_next_to_clean` to hardware head
+- if that slot carried a pooled `pkt_buf*`, return it to the mempool with [`pkt_buf_free()`](main.c#L371)
+- recompute `tx_free`
 
-Why it matters:
+That is the key lifetime rule:
 
-- `ADD_TXQS` needs a parent TEID under which new Tx queues will be attached
+- a pooled buffer is not reusable when Tx accepts it
+- it becomes reusable only when Tx completion advances past its descriptor slot
 
-Selection logic:
+## Zero-Copy Reflect Memory Lifecycle
 
-- if the last topology element is a leaf, the code uses the previous node as `qparent_teid`
-- otherwise it uses the last node directly
+This section is the end-to-end ownership model for the current `--rx-reflect` implementation.
 
-Optional debug:
+### 1. Pool metadata is allocated
 
-- `--dump-topo` dumps both parsed topology and raw bytes
-- `--qparent-teid <hex>` bypasses discovery and forces a chosen TEID
+Software metadata arrays are created in:
 
-### `ADD_SW_RULES` (`0x02A0`)
+- [`alloc_queue_sw_state()`](main.c#L314)
 
-Purpose:
+The DMA pool region itself is reserved in:
 
-- install a switch rule that forwards traffic matching the port MAC to the default VSI
+- [`layout_dma()`](main.c#L593)
 
-Used by:
+### 2. Pool entries are initialized
 
-- `aq_add_rx_mac_rule()`
+Each pooled packet object is initialized in:
 
-Rule style:
+- [`pkt_pool_init()`](main.c#L337)
 
-- lookup type: Rx
-- recipe: MAC
-- source: `lport`
-- action: forward to `vsi_num`
+At this point every buffer is:
 
-This is important for the Rx demo because the queue itself is not enough; the switch path must also direct the packet into the right VSI.
+- free
+- self-describing
+- known by stable index
 
-### `REMOVE_SW_RULES` (`0x02A2`)
+### 3. RX ring ownership begins
 
-Purpose:
+Reflect mode arms the Rx ring with pooled buffers in:
 
-- remove the temporary Rx rule installed for the listen demo
+- [`setup_and_enable_rxq_pool()`](main.c#L1161)
 
-Used by:
+For each descriptor slot:
 
-- `aq_remove_sw_rule_best_effort()`
+- allocate one `pkt_buf`
+- store it in `rx_pkt_bufs[idx]`
+- write `read.pkt_addr = buf->buf_addr_iova`
 
-### `ADD_TXQS` (`0x0C30`)
+Ownership after this step:
 
-Purpose:
+- the pool no longer owns those buffers
+- the Rx ring owns them on behalf of the NIC
 
-- create Tx queues in firmware/scheduler context
+### 4. Hardware receives into a pooled Rx buffer
 
-Used by:
+When a packet arrives, hardware DMA-writes directly into the `pkt_buf.data` region for that descriptor.
 
-- `add_tx_queues()`
+Software detects completion in:
 
-This is the bridge between:
+- [`poll_one_rx_desc()`](main.c#L1224)
 
-- direct userspace ring memory
-- firmware-managed Tx scheduling tree
+No packet payload copy occurs here.
 
-## Context encoding model
+### 5. Software swaps in a fresh Rx buffer before handing off the old one
 
-The hardware queue contexts are not stored in C layout order. They are packed bitfields expected by hardware/firmware.
+This is the most important zero-copy handoff step, implemented in:
 
-The code handles that with:
+- [`run_rx_reflect()`](main.c#L1691)
+- [`run_rx_reflect()`](main.c#L1702)
+- [`rearm_rx_desc()`](main.c#L1363)
 
-- `struct ice_ctx_ele`
-- `ICE_CTX_STORE(...)`
-- `set_ctx_bits()`
+The sequence is:
 
-Two lookup tables describe how software structs map into hardware bit positions:
+1. allocate a replacement buffer from the pool
+2. remember the completed buffer in `rx_buf`
+3. install the replacement into `rx_pkt_bufs[rx_idx]`
+4. repost that replacement back to hardware with `rearm_rx_desc()`
 
-- `rlan_ctx_info[]` for Rx queue context
-- `tlan_ctx_info[]` for Tx queue context
+After that repost:
 
-This is one of the most important design points in the driver:
+- the completed `rx_buf` is no longer attached to the Rx ring
+- the NIC can keep receiving with the replacement buffer
+- software is free to edit and transmit `rx_buf`
 
-- software builds normal C structs (`struct ice_rlan_ctx`, `struct ice_tlan_ctx`)
-- `set_ctx_bits()` repacks them into the exact hardware format
+### 6. The completed buffer is modified in place
 
-## Data plane register families and offsets
+The reflect logic rewrites only L2 addresses in:
 
-These are the key BAR0 offsets used by the datapath.
+- [`rewrite_reflect_l2()`](main.c#L1481)
 
-### Queue allocation discovery
+The payload stays in the same DMA buffer.
 
-- `PFLAN_RX_QALLOC = 0x001D2500`
-- `PFLAN_TX_QALLOC = 0x001D2580`
+The exact MAC updates happen at:
 
-Purpose:
+- [`main.c:1485`](main.c#L1485)
+  - copy the original source MAC into a temporary stack buffer
+- [`main.c:1486`](main.c#L1486)
+  - write the reflected destination MAC from that original source MAC
+- [`main.c:1487`](main.c#L1487)
+  - write the reflected source MAC from the local NIC MAC
 
-- discover which Rx/Tx queues belong to this PF
+At the reflect call site, the rewrite happens here:
 
-The code checks the corresponding `VALID` bits and extracts:
+- [`run_rx_reflect()` call at `main.c:1706`](main.c#L1706)
 
-- first queue index
-- last queue index
+### 7. The same buffer is queued directly to Tx
 
-### Rx queue programming
+The completed Rx buffer is submitted to Tx in:
 
-- `QRX_CONTEXT(i, q) = 0x00280000 + i*8192 + q*4`
-- `QRX_CTRL(q)       = 0x00120000 + q*4`
-- `QRX_TAIL(q)       = 0x00290000 + q*4`
-- `QRXFLXP_CNTXT(q)  = 0x00480000 + q*4`
+- [`tx_try_enqueue_pkt_buf()`](main.c#L1326)
+- [`run_rx_reflect()`](main.c#L1710)
 
-Purpose:
+The Tx descriptor gets:
 
-- choose Rx descriptor format
-- write Rx queue context dwords
-- request queue enable
-- post receive descriptors
+- `buf_addr = buf->buf_addr_iova`
 
-### Tx queue programming and runtime
+and the software side array gets:
 
-- `QTX_COMM_DBELL(q) = 0x002C0000 + q*4`
-- `QTX_COMM_HEAD(q)  = 0x000E0000 + q*4`
+- `tx_pkt_buf_refs[idx] = buf`
 
-Purpose:
+This is the actual zero-copy handoff.
 
-- doorbell hardware after software enqueues Tx descriptors
-- read back hardware head to reclaim descriptors
+The exact Tx handoff happens immediately after the MAC rewrite:
 
-### Per-VSI counters
+- MAC rewrite call: [`main.c:1706`](main.c#L1706)
+- zero-copy Tx handoff call: [`main.c:1710`](main.c#L1710)
 
-- Tx bytes:
-  - `GLV_GOTCL(vsi)`
-  - `GLV_GOTCH(vsi)`
-- Rx bytes:
-  - `GLV_GORCL(vsi)`
-  - `GLV_GORCH(vsi)`
+Inside [`tx_try_enqueue_pkt_buf()`](main.c#L1326), the transfer into the Tx ring is:
 
-Purpose:
+- [`main.c:1338`](main.c#L1338)
+  - program the Tx descriptor with `buf->buf_addr_iova`
+- [`main.c:1339`](main.c#L1339)
+  - store the same `pkt_buf*` in `tx_pkt_buf_refs[idx]` so completion can recycle it later
 
-- sanity-check whether Tx/Rx traffic actually moved through the VSI
+So the hot-path order is:
 
-### MDD / error reporting
+1. receive into pooled Rx buffer
+2. allocate replacement Rx buffer
+3. repost replacement to Rx
+4. rewrite MACs in the completed buffer at [`main.c:1706`](main.c#L1706)
+5. hand the same buffer to Tx at [`main.c:1710`](main.c#L1710)
+6. later recycle that same buffer from Tx completion in [`tx_update_free()`](main.c#L1196)
 
-- `GL_MDET_TX_TCLAN`
-- `GL_MDET_TX_PQM`
-- `GL_MDET_RX`
-- `PF_MDET_TX_TCLAN`
-- `PF_MDET_TX_PQM`
-- `PF_MDET_RX`
+### 8. Hardware transmits from that same DMA buffer
 
-Purpose:
+Once [`tx_ring_doorbell()`](main.c#L1343) rings the queue, the NIC DMA-reads from the exact same memory region that Rx originally filled.
 
-- dump misbehavior detection registers if Rx fails or descriptors look wrong
+No payload copy happens between Rx and Tx.
 
-## Rx path in detail
+### 9. TX completion returns the buffer to the pool
 
-The Rx demo is implemented by `run_rx_listen()`.
+On later progress, [`tx_update_free()`](main.c#L1196) walks completed Tx slots and frees pooled buffers with:
 
-## Rx initialization sequence
+- [`pkt_buf_free()`](main.c#L371)
 
-1. Read `PFLAN_RX_QALLOC`.
-2. Extract the PF’s first Rx queue and store it in `d->io.rxq_id`.
-3. Discover `vsi_num` and `lport` through `GET_SW_CFG`.
-4. Program the Rx queue using `setup_and_enable_rxq()`.
-5. Install an Rx MAC switch rule forwarding traffic for the NIC MAC into that VSI.
-6. Poll descriptors until a packet arrives or timeout expires.
-7. Remove the switch rule on exit.
+Ownership path for a reflected frame is therefore:
 
-## How Rx descriptors are prepared
+- free in pool
+- armed on Rx
+- filled by hardware
+- detached from Rx after replacement install
+- queued on Tx
+- reclaimed on Tx completion
+- free in pool again
 
-For each of `ICE_RX_DESC_COUNT = 128` descriptors:
+### 10. What is still not zero-copy
 
-- `read.pkt_addr` points to one `ICE_RX_BUF_SIZE = 2048` packet buffer
-- `read.hdr_addr = 0`
+The queue-owned Tx helper is still used by:
 
-This uses the 32-byte flexible descriptor format:
+- `--tx-send`
+- `--tx-bench`
 
-- `union ice_32b_rx_flex_desc`
+That path lives in [`tx_try_enqueue()`](main.c#L1296) and still transmits from `q->tx_pkt_bufs`.
 
-## Rx descriptor format selection
+So the zero-copy guarantee currently applies to:
 
-The code programs `QRXFLXP_CNTXT(q)`:
+- `--rx-reflect`
 
-- `RXDID = ICE_RXDID_FLEX_NIC`
-- priority field set to `0x03`
+not to the generic Tx generators.
 
-That tells hardware which completion layout to write into each descriptor.
+## Operational Modes
 
-## Rx queue context fields used
+### `--rx-listen`
 
-The driver populates `struct ice_rlan_ctx` with:
+Implementation:
 
-- `base = rx_desc_iova >> 7`
-- `qlen = 128`
-- `dbuf = 2048 >> 7`
-- `dsize = 1`
-- `crcstrip = 1`
-- `l2tsel = 1`
-- `dtype = ICE_RX_DTYPE_NO_SPLIT`
-- `showiv = 1`
-- `rxmax = 2048`
-- `lrxqthresh = 1`
-- `prefena = 1`
-
-Interpretation:
-
-- ring base is supplied in 128-byte units
-- buffers are single-buffer, no header split
-- L2 selection and stripping are enabled for a simple Ethernet receive path
-- prefetching and low threshold are enabled
-
-After packing this context, the driver writes 8 dwords into:
-
-- `QRX_CONTEXT(0..7, q)`
-
-## Rx queue enable handshake
-
-`wait_rxq_ready()` polls `QRX_CTRL(q)` until:
-
-- `QENA_REQ` and `QENA_STAT` match
-
-Then `setup_and_enable_rxq()` sets `QENA_REQ` if needed and waits again until the queue reports enabled.
-
-Finally it posts receive work by writing:
-
-- `QRX_TAIL(q) = ICE_RX_DESC_COUNT - 1`
-
-## Rx polling loop
-
-`poll_one_rx_packet()` scans descriptors starting at `rx_ntc`.
-
-Completion checks:
-
-- `DD` bit must be set
-- `EOF` bit must be set
-- `RXE` bit must not be set
-- packet length must be non-zero
-
-If valid:
-
-- packet bytes are copied from the per-descriptor Rx buffer
-- descriptor is re-armed with the same buffer address
-- `QRX_TAIL` is advanced for that descriptor index
-
-If invalid:
-
-- the descriptor is rearmed
-- the function returns error
-- caller prints MDD registers
-
-## Tx path in detail
-
-The Tx datapath appears in two modes:
-
-- `run_tx_send()` for a simple packet generator
-- `run_tx_bench()` for sustained throughput testing
-
-## Tx initialization sequence
-
-1. Read `PFLAN_TX_QALLOC`.
-2. Extract first and last PF-owned Tx queue indices.
-3. Clamp requested `--tx-queues` to available queue count.
-4. Assign `txq_id`s sequentially from `first_q`.
-5. Discover `vsi_num` and `lport` via `GET_SW_CFG`.
-6. Discover `qparent_teid` via `GET_DFLT_TOPO` unless overridden.
-7. Submit `ADD_TXQS` to instantiate the queue contexts.
-8. Initialize software Tx ring bookkeeping with `tx_ring_init()`.
-
-## Tx queue context fields used
-
-For each queue, `add_tx_queues()` builds `struct ice_tlan_ctx` with:
-
-- `port_num = lport`
-- `qlen = tx_desc_count`
-- `base = tx_desc_iova >> 7`
-- `pf_num = 0`
-- `vmvf_type = PF`
-- `src_vsi = vsi_num`
-- `tso_ena = 1`
-- `internal_usage_flag = 1`
-- `tso_qnum = txq_id`
-- `legacy_int = 1`
-
-Then it packs the context through `tlan_ctx_info[]` into the `ADD_TXQS` payload.
-
-Scheduler metadata attached per queue:
-
-- valid sections: generic + CIR + EIR
-- CIR/EIR profile = default profile ID
-- CIR/EIR bandwidth allocation = default weight
-
-Result:
-
-- firmware creates queue objects under the chosen scheduler parent
-- the returned `q_teid` values are logged
-
-## Tx descriptor format
-
-The Tx descriptor is:
-
-```c
-struct ice_tx_desc {
-    uint64_t buf_addr;
-    uint64_t cmd_type_offset_bsz;
-};
-```
-
-This driver uses a very small subset of fields:
-
-- `buf_addr`: DMA address of the packet buffer
-- `cmd_type_offset_bsz`:
-  - descriptor type = data
-  - command bits:
-    - `EOP`
-    - `RS` periodically
-  - transmit buffer size = packet length
-
-No offloads are really exercised even though some Tx queue context flags are enabled.
-
-## Tx ring bookkeeping
-
-### `tx_ring_init()`
-
-Initializes each queue:
-
-- clear descriptors
-- `tx_next_to_use = 0`
-- `tx_next_to_clean = 0`
-- `tx_free = desc_count - 1`
-
-One slot is intentionally left unused to distinguish full from empty.
-
-### `tx_update_free()`
-
-Reads hardware consumption from:
-
-- `QTX_COMM_HEAD(q)`
-
-Then computes:
-
-- how many descriptors are still in flight
-- how many are free for new work
-
-### `tx_try_enqueue()`
-
-This is the core Tx datapath primitive.
-
-Steps:
-
-1. Check packet length against `ICE_TX_PKT_BUF_SIZE`.
-2. Reclaim descriptors if software thinks ring is full.
-3. Pick current `tx_next_to_use`.
-4. Optionally copy packet bytes into the queue’s packet buffer array.
-5. Build descriptor:
-   - `buf_addr = tx_pkt_iova + idx * ICE_TX_PKT_BUF_SIZE`
-   - type = data
-   - command always includes `EOP`
-   - every `TX_RS_THRESH = 32` packets, also set `RS`
-6. Issue a full memory barrier.
-7. Advance software producer index.
-
-The `RS` cadence is important because it helps hardware update head/progress often enough for software reclaim.
-
-### `tx_ring_doorbell()`
-
-Writes:
-
-- `QTX_COMM_DBELL(q) = tx_next_to_use`
-
-This makes hardware consume newly prepared descriptors.
-
-### `tx_wait_drain()`
-
-Polls hardware head until:
-
-- `tx_next_to_clean == tx_next_to_use`
-
-This is used after send loops to let outstanding work finish.
-
-## Operational modes
-
-## `--rx-listen`
+- [`run_rx_listen()`](main.c#L1490)
 
 Behavior:
 
 - creates and enables one Rx queue
 - installs an Rx MAC forwarding rule
-- polls for the first packet
-- prints L2 header info and payload dump
+- waits for the first packet
+- copies the packet into a local buffer and dumps the payload
 
 Use this mode when:
 
-- you want to validate that packets can reach a userspace-programmed Rx queue
+- you want to validate that packets reach a userspace-programmed Rx queue
 
-## `--rx-reflect`
+### `--rx-reflect`
+
+Implementation:
+
+- [`run_rx_reflect()`](main.c#L1566)
 
 Behavior:
 
-- creates and enables one Rx queue
+- creates and enables one pooled Rx queue
 - installs an Rx MAC forwarding rule
 - creates one Tx queue
 - polls for completed Rx descriptors
-- copies each packet from Rx DMA to a queue-owned Tx DMA buffer
-- rewrites Ethernet MAC addresses:
-  - destination MAC = original source MAC
-  - source MAC = NIC LAN MAC
-- sends the reflected frames back out in small Tx doorbell batches
+- swaps in a fresh Rx pool buffer
+- rewrites only Ethernet source and destination MACs in place
+- queues the same DMA buffer directly to Tx
+- reclaims buffers only after Tx completion
 
-Use this mode when:
+This is now a zero-copy reflect path.
 
-- you want a realistic Rx -> CPU touch -> Tx workload
-- you want packets sent back to the original sender with only the MAC addresses changed
-- you want a simple baseline before exploring zero-copy buffer loaning
+### Interpreting a tcpdump capture
 
-### `--rx-reflect` code map
+If you see a trace like this:
 
-The key implementation points in `main.c` are:
+- inbound:
+  - `40:a6:b7:c3:41:20 > 40:a6:b7:c2:d4:88`
+  - length `24`
+  - payload prefix `mai_aur_tu`
+- outbound:
+  - `40:a6:b7:c2:d4:88 > 40:a6:b7:c3:41:20`
+  - length `60`
+  - same payload prefix `mai_aur_tu`
 
-- `poll_one_rx_desc()`
-  - finds a completed Rx descriptor and returns the Rx buffer index and packet length
-- `tx_try_enqueue()`
-  - copies packet bytes into the queue-owned Tx DMA buffer with:
-    - `memcpy(buf, pkt, len)`
-  - rewrites only the Ethernet MAC addresses with:
-    - `memcpy(buf, dst_mac, ETHER_ADDR_LEN)`
-    - `memcpy(buf + ETHER_ADDR_LEN, src_mac, ETHER_ADDR_LEN)`
-- `run_rx_reflect()`
-  - calls `tx_try_enqueue(d, q, rxpkt, rx_len, true, rxpkt + ETHER_ADDR_LEN, d->io.mac)`
-  - this means:
-    - copy from the Rx DMA buffer pointed to by `rxpkt`
-    - destination MAC becomes the original source MAC
-    - source MAC becomes the local NIC MAC
+then the reflector is behaving correctly.
 
-Important clarification:
+What that means:
 
-- the packet payload is not modified
-- only the first 12 bytes of the Ethernet header are rewritten
+- destination and source MACs were swapped as expected
+- EtherType stayed the same
+- the payload prefix survived reflection
+- the transmitted frame was padded to the Ethernet minimum frame size
 
-### When the copy happens
+The `24 -> 60` jump is normal for short Ethernet frames:
 
-The copy to Tx DMA happens per packet, immediately after `run_rx_reflect()` sees a completed Rx descriptor and before the Rx descriptor is rearmed.
+- the logical payload is still the short packet you sent
+- hardware pads transmit frames shorter than 60 bytes without FCS
+- tcpdump on the receiving side shows the padded frame length
 
-So the sequence is:
+In other words, that capture is a success, not a bug.
 
-1. `poll_one_rx_desc()` finds a completed Rx packet
-2. `tx_try_enqueue()` copies that packet from Rx DMA to a Tx DMA buffer
-3. `tx_try_enqueue()` rewrites the MAC addresses in the copied Tx buffer
-4. `rearm_rx_desc()` returns the Rx buffer to the Rx ring
+### `--tx-send`
 
-### Reflect batch size
+Implementation:
 
-The reflect path uses:
-
-- `const uint16_t reflect_batch = 32;`
-
-inside `run_rx_reflect()`.
-
-That value controls how many packets are copied/enqueued in one inner loop before the code rings the Tx doorbell once.
-
-So for `--rx-reflect`:
-
-- copy/enqueue work is done one packet at a time
-- up to 32 packets are accumulated in one batch
-- then `tx_ring_doorbell()` is called once for that batch
-
-Yes, in the reflect path the same `reflect_batch` threshold is used for both:
-
-- how many packets are copied into Tx DMA in the inner loop
-- how many enqueued packets are allowed before ringing the doorbell
-
-This is separate from `TX_BURST_SIZE = 64`, which is used by `--tx-bench`, not by `--rx-reflect`.
-
-## `--tx-send`
+- [`run_tx_send()`](main.c#L1768)
 
 Behavior:
 
-- creates Tx queues
-- uses queue 0
-- builds a single Ethernet frame template
+- creates Tx queue(s)
+- builds one Ethernet frame template
 - sends it `count` times with optional interval
 
-Frame format:
+This path uses queue-owned Tx packet buffers through [`tx_try_enqueue()`](main.c#L1296).
 
-- destination MAC = CLI argument
-- source MAC = NIC LAN MAC
-- EtherType = `0x88B5`
-- payload = CLI string or default `"my_ice-userspace-tx"`
-- padded to at least 60 bytes
+### `--tx-bench`
 
-It also reads the per-VSI Tx byte counter before and after.
+Implementation:
 
-## `--tx-bench`
+- [`run_tx_bench()`](main.c#L1928)
 
 Behavior:
 
 - creates one or more Tx queues
-- pre-populates each queue’s packet buffers with the benchmark frame
-- spawns one thread per Tx queue
-- each thread repeatedly tries to submit bursts of `TX_BURST_SIZE = 64`
-- optional CPU pinning with `--pin-cpus`
-- prints instantaneous and average Gbps from the VSI byte counter
+- pre-populates each queue’s Tx packet buffers
+- spawns one worker thread per active Tx queue
+- repeatedly submits bursts of `TX_BURST_SIZE = 64`
+- optionally pins threads with `--pin-cpus`
 
-This is the best mode for stressing the direct userspace Tx path.
+This is the best mode for stressing the direct userspace Tx datapath.
 
-## Hugepage support
+## Build and Run Checklist
 
-The driver can run without hugepages because VFIO can map normal anonymous memory.
-
-However, `--hugepages` is supported for more DPDK-like behavior:
-
-- backing file created under a hugetlbfs mount
-- default directory: `/mnt/huge`
-
-Flow:
-
-1. `prepare_hugepage_file()` checks the filesystem type is `HUGETLBFS_MAGIC`.
-2. It sizes the file to a hugepage multiple.
-3. `dma_map()` mmaps that file and registers it with VFIO.
-
-This is mostly useful for:
-
-- stable physically-backed memory behavior
-- alignment with common packet-processing deployment practices
-
-## Control plane versus data plane
-
-This split is the key to understanding the driver.
-
-## Control plane
-
-Control-plane operations go through firmware/AdminQ and establish resources or policy:
-
-- firmware/API identity
-- MAC discovery
-- switch configuration discovery
-- scheduler topology discovery
-- Tx queue creation
-- switch rule add/remove
-
-These are all relatively infrequent and synchronous.
-
-## Data plane
-
-Data-plane operations avoid firmware round trips and touch rings/registers directly:
-
-- Rx descriptors in DMA memory
-- Tx descriptors in DMA memory
-- Rx queue MMIO context registers
-- Tx doorbells and head polling
-- Rx tail posting and descriptor polling
-
-This is the high-rate packet path.
-
-## Important offsets and encodings to remember
-
-### IOVA encoding
-
-The hardware context fields store ring bases shifted right by 7:
-
-- Rx: `rlan.base = rx_desc_iova >> 7`
-- Tx: `tlan.base = tx_desc_iova >> 7`
-
-That means queue base addresses are encoded in 128-byte units.
-
-### Rx buffer size encoding
-
-`rlan.dbuf` is programmed as:
-
-- `ICE_RX_BUF_SIZE >> ICE_RLAN_CTX_DBUF_S`
-- with `ICE_RLAN_CTX_DBUF_S = 7`
-
-So the descriptor buffer size is also encoded in 128-byte units.
-
-### Ring sizes used by default
-
-- AdminQ descriptors: 64
-- Rx descriptors: 128
-- Tx descriptors: 128 per queue
-- Rx buffers: 2048 bytes
-- Tx packet buffers: 2048 bytes
-
-These defaults are demo-friendly rather than heavily tuned.
-
-## Limitations and simplifying assumptions
-
-This driver is intentionally minimal. A few important limitations:
-
-- no interrupt handling
-- no ARQ event-processing loop
-- no robust reset/recovery path
-- no advanced Rx steering beyond one MAC rule
-- no cleanup for created Tx queue resources through a matching delete flow
-- no link-state management
-- no VLAN, checksum, RSS, or timestamp feature programming
-- no multi-segment packets
-- Tx sends from preallocated per-descriptor packet buffers only
-- Rx path receives only a single queue and single-buffer packets
-
-The result is a teaching and experimentation driver, not a production PMD.
-
-## How to use the userspace driver
-
-## 1. Build it
-
-The project uses a very small `Makefile`:
+### 1. Build
 
 ```bash
 make
 ```
 
-That compiles:
+### 2. Prepare the system
 
-- `main.c` into `./my_ice`
+You need:
 
-## 2. Prepare the system
-
-Required prerequisites:
-
-- IOMMU enabled in the kernel
-- NIC bound to `vfio-pci`
-- hugepages mounted if you want `--hugepages`
-- root privileges for VFIO access unless your environment grants them otherwise
+- IOMMU enabled
+- the NIC bound to `vfio-pci`
+- root privileges or equivalent VFIO access
+- a hugetlbfs mount only if you want `--hugepages`
 
 Typical boot args:
 
@@ -1001,53 +718,30 @@ sudo mkdir -p /mnt/huge
 sudo mount -t hugetlbfs nodev /mnt/huge
 ```
 
-## 3. Bind the NIC to `vfio-pci`
-
-Example:
+### 3. Bind the NIC to `vfio-pci`
 
 ```bash
 sudo dpdk-devbind.py -b vfio-pci 0000:17:00.0
 ```
 
-If the interface is still active in Linux, bring it down first and make sure it is not carrying your management session.
-
-## 4. Run receive mode
-
-Listen for one packet for up to 30 seconds:
-
-```bash
-sudo ./my_ice 0000:17:00.0 --rx-listen
-```
-
-Listen for up to 60 seconds:
+### 4. Run listen mode
 
 ```bash
 sudo ./my_ice 0000:17:00.0 --rx-listen 60
 ```
 
-Expected behavior:
+### 5. Run reflect mode
 
-- prints firmware and API versions
-- prints discovered MAC
-- sets up Rx queue and MAC steering rule
-- prints first received Ethernet frame and payload
-
-## 5. Run reflect mode
-
-Run the reflector on `node_0_new`:
+On the DUT:
 
 ```bash
 sudo ./my_ice <BDF> --rx-reflect 60
 ```
 
-This mode receives packets sent to the DUT MAC, copies them from Rx DMA to Tx DMA, rewrites only the Ethernet source/destination MACs, and sends them back out.
-
-### What to run on `node_1_new`
-
-For a correctness test, send raw L2 frames with source MAC `40:a6:b7:c3:41:20`:
+On the traffic source:
 
 ```bash
-sudo python3 /users/manvik12/my_ice/send_l2.py \
+sudo python3 ./send_l2.py \
   -i <node-1-iface> \
   -d <node-0-my_ice-mac> \
   -s 40:a6:b7:c3:41:20 \
@@ -1056,130 +750,37 @@ sudo python3 /users/manvik12/my_ice/send_l2.py \
   -t 0.1
 ```
 
-The reflected frames should come back to `node_1_new` with:
-
-- destination MAC = `40:a6:b7:c3:41:20`
-- source MAC = `<node-0-my_ice-mac>`
-- unchanged payload
-
-To watch the reflected traffic on `node_1_new`:
+To watch the reflected traffic:
 
 ```bash
-sudo tcpdump -enn -i <node-1-iface> ether dst 40:a6:b7:c3:41:20
+sudo tcpdump -enn -i <node-1-iface> ether proto 0x88b5
 ```
 
-For higher-rate testing, use your preferred traffic generator on `node_1_new` and send to `<node-0-my_ice-mac>`. If you want the reflected frames to come back to `40:a6:b7:c3:41:20`, make sure the sender uses that source MAC.
-
-## 6. Run simple transmit mode
-
-Send one frame:
-
-```bash
-sudo ./my_ice <BDF> --tx-send <dst-mac>
-```
-
-Send 20 frames every 100 ms with custom payload:
+### 6. Run simple transmit mode
 
 ```bash
 sudo ./my_ice <BDF> --tx-send <dst-mac> 20 100 hello
 ```
 
-Expected behavior:
-
-- discovers VSI and scheduler topology
-- creates Tx queue(s)
-- sends raw Ethernet frames with EtherType `0x88B5`
-- prints byte counter delta from the VSI
-
-## 7. Run throughput mode
-
-Single-queue benchmark:
-
-```bash
-sudo ./my_ice <BDF> --tx-bench 10 <dst-mac> 46
-```
-
-Multi-queue benchmark with hugepages and CPU pinning:
+### 7. Run throughput mode
 
 ```bash
 sudo ./my_ice <BDF> --tx-bench 15 <dst-mac> 1472 --tx-queues 4 --pin-cpus --hugepages --hugepage-dir /mnt/huge
 ```
 
-Expected behavior:
+## Mental Model to Keep in Your Head
 
-- one worker thread per Tx queue
-- 1-second interval Gbps reports
-- final average Gbps summary
+The easiest way to reason about this driver is:
 
-## 8. Useful debug options
+- AdminQ discovers and creates things.
+- BAR0 registers enable and ring things.
+- Descriptor rings tell hardware where buffers live.
+- Side arrays tell software which packet object each descriptor slot owns.
+- In `--rx-reflect`, the same pooled packet buffer moves through:
+  - pool
+  - Rx ring
+  - reflect logic
+  - Tx ring
+  - pool again
 
-Dump the scheduler topology returned by firmware:
-
-```bash
-sudo ./my_ice <BDF> --tx-send <dst-mac> --dump-topo
-```
-
-Force a known queue parent TEID:
-
-```bash
-sudo ./my_ice <BDF> --tx-send <dst-mac> --qparent-teid 0x12345678
-```
-
-This is handy if topology discovery works inconsistently on a given firmware revision.
-
-## How to reason about packet flow end to end
-
-For Rx:
-
-1. External packet arrives on the physical port.
-2. Switch logic matches the temporary MAC rule.
-3. Packet is forwarded into the PF’s VSI.
-4. Enabled Rx queue writes a completion into the DMA descriptor ring.
-5. Userspace polls the descriptor, copies packet bytes, and rearms the slot.
-
-For Rx reflect:
-
-1. External packet arrives on the physical port.
-2. Switch logic matches the temporary MAC rule.
-3. Packet is forwarded into the PF's VSI and written into an Rx DMA buffer.
-4. Userspace polls the completed Rx descriptor.
-5. Userspace copies the packet bytes into a queue-owned Tx DMA buffer.
-6. Userspace rewrites:
-   - destination MAC = original source MAC
-   - source MAC = local NIC MAC
-7. Userspace rearms the Rx descriptor.
-8. Userspace rings the Tx doorbell after a small batch.
-9. Hardware fetches the Tx descriptor and transmits the reflected frame.
-
-For Tx:
-
-1. Userspace copies a frame into a queue-owned DMA buffer.
-2. Userspace writes a Tx descriptor pointing to that buffer.
-3. Userspace rings the Tx doorbell.
-4. Hardware fetches the descriptor and frame over DMA.
-5. Scheduler and VSI context route it to the selected port.
-6. Userspace later reads hardware head to reclaim descriptors.
-
-## If you want to extend this driver
-
-The most natural next steps are:
-
-- add explicit Tx queue teardown if firmware supports it in your flow
-- add RSS or multiple Rx queues
-- add a proper ARQ event processing loop
-- add loopback commands using the already-defined `SET_MAC_LB` / `SET_PHY_LB` opcodes
-- add link and port status reporting
-- split control-plane and dataplane code into separate files
-- add a packet buffer abstraction instead of raw fixed arrays
-
-## Summary
-
-The shortest mental model is:
-
-- VFIO gives the process safe ownership of the PCI function.
-- DMA memory holds AdminQ, Rx rings, Tx rings, and packet buffers.
-- AdminQ discovers MAC/VSI/topology and creates Tx queues.
-- BAR0 queue registers enable Rx and drive Tx.
-- The Rx and Tx fast paths are simple polling loops over DMA descriptors.
-
-That is the core workflow of this userspace ICE prototype.
+If you keep that ownership chain in mind while reading the code, the rest of the datapath becomes much easier to follow.
