@@ -94,6 +94,6 @@ DB=$((B1 - B0))
 DP=$((P1 - P0))
 
 awk -v b="$DB" -v p="$DP" -v t="$DURATION" 'BEGIN {
-  printf("pktgen: Mbps=%.3f Mpps=%.3f PPS=%.0f bytes=%d pkts=%d\n",
-         (b*8)/(t*1e6), (p/t)/1e6, p/t, b, p)
+  printf("pktgen: Gbps=%.3f Mbps=%.3f Mpps=%.3f PPS=%.0f bytes=%d pkts=%d\n",
+         (b*8)/(t*1e9), (b*8)/(t*1e6), (p/t)/1e6, p/t, b, p)
 }'
