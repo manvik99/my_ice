@@ -965,13 +965,13 @@ static int aq_update_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs)
     struct ice_aqc_vsi_props props;
     struct ice_aq_desc desc;
 
-    /* Read current VSI config first */
-    if (aq_get_vsi(d, &props) < 0) {
-        fprintf(stderr, "[my_ice] GET_VSI failed before UPDATE_VSI\n");
-        return -1;
-    }
+    /*
+     * UPDATE_VSI only touches sections flagged in valid_sections.
+     * Zero the whole struct so unflagged sections are safely ignored.
+     */
+    memset(&props, 0, sizeof(props));
 
-    /* Set queue mapping section */
+    /* Mark only the queue-mapping and queueing-option sections */
     props.valid_sections = htole16(ICE_AQ_VSI_PROP_RXQ_MAP_VALID |
                                    ICE_AQ_VSI_PROP_Q_OPT_VALID);
     props.mapping_flags = htole16(ICE_AQ_VSI_Q_MAP_CONTIG);
