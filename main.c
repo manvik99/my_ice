@@ -944,7 +944,6 @@ static int aq_get_vsi(struct dev_ctx *d, struct ice_aqc_vsi_props *props)
     memset(&buf, 0, sizeof(buf));
     memset(&desc, 0, sizeof(desc));
     desc.opcode = htole16(ICE_AQC_OPC_GET_VSI);
-    desc.flags = htole16(ICE_AQ_FLAG_SI | ICE_AQ_FLAG_RD);
     desc.params.vsi_cmd.vsi_num = htole16(d->io.vsi_num | ICE_AQ_VSI_IS_VALID);
 
     if (aq_send_cmd(d, &desc, &buf, sizeof(buf)) < 0)
@@ -994,7 +993,7 @@ static int aq_update_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs)
 
     memset(&desc, 0, sizeof(desc));
     desc.opcode = htole16(ICE_AQC_OPC_UPDATE_VSI);
-    desc.flags = htole16(ICE_AQ_FLAG_SI | ICE_AQ_FLAG_RD);
+    desc.flags = htole16(ICE_AQ_FLAG_RD);
     desc.params.vsi_cmd.vsi_num = htole16(d->io.vsi_num | ICE_AQ_VSI_IS_VALID);
 
     if (aq_send_cmd(d, &desc, &props, sizeof(props)) < 0) {
@@ -1027,7 +1026,7 @@ static int aq_set_rss_key(struct dev_ctx *d)
 
     memset(&desc, 0, sizeof(desc));
     desc.opcode = htole16(ICE_AQC_OPC_SET_RSS_KEY);
-    desc.flags = htole16(ICE_AQ_FLAG_SI | ICE_AQ_FLAG_RD);
+    desc.flags = htole16(ICE_AQ_FLAG_RD);
     desc.params.get_set_rss_key.vsi_id =
         htole16(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID);
 
@@ -1051,7 +1050,7 @@ static int aq_set_rss_lut(struct dev_ctx *d, uint16_t num_rxqs)
 
     memset(&desc, 0, sizeof(desc));
     desc.opcode = htole16(ICE_AQC_OPC_SET_RSS_LUT);
-    desc.flags = htole16(ICE_AQ_FLAG_SI | ICE_AQ_FLAG_RD);
+    desc.flags = htole16(ICE_AQ_FLAG_RD);
     desc.params.get_set_rss_lut.vsi_id =
         htole16(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID);
     desc.params.get_set_rss_lut.flags =
