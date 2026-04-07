@@ -936,23 +936,6 @@ static int aq_get_qparent_teid(struct dev_ctx *d)
 
 /* ---- RSS AQ helper functions ---- */
 
-static int aq_get_vsi(struct dev_ctx *d, struct ice_aqc_vsi_props *props)
-{
-    struct ice_aq_desc desc;
-    struct ice_aqc_vsi_props buf;
-
-    memset(&buf, 0, sizeof(buf));
-    memset(&desc, 0, sizeof(desc));
-    desc.opcode = htole16(ICE_AQC_OPC_GET_VSI);
-    desc.params.vsi_cmd.vsi_num = htole16(d->io.vsi_num | ICE_AQ_VSI_IS_VALID);
-
-    if (aq_send_cmd(d, &desc, &buf, sizeof(buf)) < 0)
-        return -1;
-
-    memcpy(props, &buf, sizeof(*props));
-    return 0;
-}
-
 static uint8_t ilog2_u16(uint16_t v)
 {
     uint8_t r = 0;
@@ -960,28 +943,28 @@ static uint8_t ilog2_u16(uint16_t v)
     return r;
 }
 
-static int aq_update_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs)
+static int aq_update_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
+                             uint16_t first_hw_q)
 {
     struct ice_aqc_vsi_props props;
     struct ice_aq_desc desc;
 
     /*
-     * UPDATE_VSI only touches sections flagged in valid_sections.
-     * Zero the whole struct so unflagged sections are safely ignored.
+     * UPDATE_VSI only applies sections flagged in valid_sections.
+     *
+     * q_mapping[0] in contiguous mode = absolute hardware base queue number.
+     * tc_mapping[0] encodes (VSI-relative queue offset << 0) |
+     *                        (log2(num_queues) << 11) for TC0.
      */
     memset(&props, 0, sizeof(props));
-
-    /* Mark only the queue-mapping and queueing-option sections */
     props.valid_sections = htole16(ICE_AQ_VSI_PROP_RXQ_MAP_VALID |
                                    ICE_AQ_VSI_PROP_Q_OPT_VALID);
     props.mapping_flags = htole16(ICE_AQ_VSI_Q_MAP_CONTIG);
 
-    /* q_mapping[0] = TC0: offset=0, count=log2(num_rxqs) */
-    props.q_mapping[0] = htole16(
-        (0 << ICE_AQ_VSI_TC_Q_OFFSET_S) |
-        ((uint16_t)ilog2_u16(num_rxqs) << ICE_AQ_VSI_TC_Q_NUM_S));
+    /* absolute starting hardware queue — NOT the tc-encoded log2 value */
+    props.q_mapping[0] = htole16(first_hw_q);
 
-    /* tc_mapping[0] = TC0: offset=0, count=log2(num_rxqs) */
+    /* TC0: VSI-relative offset=0, log2(num_rxqs) queues */
     props.tc_mapping[0] = htole16(
         (0 << ICE_AQ_VSI_TC_Q_OFFSET_S) |
         ((uint16_t)ilog2_u16(num_rxqs) << ICE_AQ_VSI_TC_Q_NUM_S));
@@ -991,18 +974,19 @@ static int aq_update_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs)
         (ICE_AQ_VSI_Q_OPT_RSS_LUT_VSI << ICE_AQ_VSI_Q_OPT_RSS_LUT_S) |
         (ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ << ICE_AQ_VSI_Q_OPT_RSS_HASH_S));
 
-    memset(&desc, 0, sizeof(desc));
-    desc.opcode = htole16(ICE_AQC_OPC_UPDATE_VSI);
-    desc.flags = htole16(ICE_AQ_FLAG_RD);
+    /* kernel uses fill_dflt_direct_cmd_desc (SI) + RD for this command */
+    fill_dflt_direct_desc(&desc, ICE_AQC_OPC_UPDATE_VSI);
+    desc.flags = htole16(le16toh(desc.flags) | ICE_AQ_FLAG_RD);
     desc.params.vsi_cmd.vsi_num = htole16(d->io.vsi_num | ICE_AQ_VSI_IS_VALID);
 
     if (aq_send_cmd(d, &desc, &props, sizeof(props)) < 0) {
-        fprintf(stderr, "[my_ice] UPDATE_VSI failed\n");
+        fprintf(stderr,
+                "[my_ice] UPDATE_VSI failed (non-fatal) — RSS key/LUT will still be programmed\n");
         return -1;
     }
 
-    fprintf(stderr, "[my_ice] UPDATE_VSI ok: num_rxqs=%u log2=%u\n",
-            num_rxqs, ilog2_u16(num_rxqs));
+    fprintf(stderr, "[my_ice] UPDATE_VSI ok: first_hw_q=%u num_rxqs=%u log2=%u\n",
+            first_hw_q, num_rxqs, ilog2_u16(num_rxqs));
     return 0;
 }
 
@@ -1386,8 +1370,9 @@ static int setup_all_rxqs(struct dev_ctx *d, bool use_pool)
 
     /* Configure RSS when multiple queues are active */
     if (d->rxq_count > 1) {
-        if (aq_update_vsi_rss(d, d->rxq_count) < 0)
-            return -1;
+        /* Non-fatal: firmware may reject UPDATE_VSI on the default boot
+         * VSI; the RSS key and LUT are still worth programming. */
+        aq_update_vsi_rss(d, d->rxq_count, first_q);
         if (aq_set_rss_key(d) < 0)
             return -1;
         if (aq_set_rss_lut(d, d->rxq_count) < 0)
