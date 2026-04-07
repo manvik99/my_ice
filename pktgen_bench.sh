@@ -8,6 +8,9 @@ PKT_SIZE="${4:-1014}"    # 14-byte Ethernet header + payload
 THREAD_SPEC="${5:-0}"    # kpktgend threads: "0" or "0,1,2,3" or "all"
 QUEUE_BASE="${6:-0}"     # first TX queue index to use
 BURST="${7:-32}"         # packets per scheduling round; helps for small packets
+SRC_IP_MIN="${8:-10.0.0.1}"
+SRC_IP_MAX="${9:-10.0.0.254}"
+DST_IP="${10:-10.0.0.255}"
 START_PID=""
 THREADS=()
 DEVICES=()
@@ -38,7 +41,7 @@ cleanup() {
 }
 
 usage() {
-  echo "Run as root: sudo $0 <iface> <dst-mac> <seconds> <pkt-size> [thread|thread-list|all] [queue-base] [burst]"
+  echo "Run as root: sudo $0 <iface> <dst-mac> <seconds> <pkt-size> [thread|thread-list|all] [queue-base] [burst] [src-ip-min] [src-ip-max] [dst-ip]"
 }
 
 expand_threads() {
@@ -138,7 +141,7 @@ done
 B0=$(stat tx_bytes)
 P0=$(stat tx_packets)
 
-echo "[pktgen] configuring iface=$IFACE dst=$DST_MAC size=$PKT_SIZE duration=${DURATION}s threads=${THREADS[*]} queue_base=$QUEUE_BASE queue_count=${#THREADS[@]} burst=$BURST"
+echo "[pktgen] configuring iface=$IFACE dst=$DST_MAC size=$PKT_SIZE duration=${DURATION}s threads=${THREADS[*]} queue_base=$QUEUE_BASE queue_count=${#THREADS[@]} burst=$BURST src_ip=${SRC_IP_MIN}-${SRC_IP_MAX} dst_ip=$DST_IP"
 for idx in "${!THREADS[@]}"; do
   thread="${THREADS[$idx]}"
   queue=$((QUEUE_BASE + idx))
@@ -164,6 +167,18 @@ for idx in "${!THREADS[@]}"; do
   pgset "$dev" "burst $BURST"
   pgset "$dev" "queue_map_min $queue"
   pgset "$dev" "queue_map_max $queue"
+
+  # IP/UDP headers so the Toeplitz RSS hash has fields to work with
+  pgset "$dev" "flag IPDST_RND"
+  pgset "$dev" "flag UDPSRC_RND"
+  pgset "$dev" "flag UDPDST_RND"
+  pgset "$dev" "dst $DST_IP"
+  pgset "$dev" "src_min $SRC_IP_MIN"
+  pgset "$dev" "src_max $SRC_IP_MAX"
+  pgset "$dev" "udp_src_min 1024"
+  pgset "$dev" "udp_src_max 65535"
+  pgset "$dev" "udp_dst_min 1024"
+  pgset "$dev" "udp_dst_max 65535"
 done
 
 echo "[pktgen] start"

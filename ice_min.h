@@ -99,6 +99,10 @@
 #define ICE_AQC_OPC_GET_DFLT_TOPO   0x0400
 #define ICE_AQC_OPC_SET_MAC_LB      0x0620
 #define ICE_AQC_OPC_SET_PHY_LB      0x0619
+#define ICE_AQC_OPC_GET_VSI         0x0212
+#define ICE_AQC_OPC_UPDATE_VSI      0x0211
+#define ICE_AQC_OPC_SET_RSS_KEY     0x0B02
+#define ICE_AQC_OPC_SET_RSS_LUT     0x0B03
 #define ICE_AQC_OPC_ADD_TXQS        0x0C30
 
 /* Manage MAC read */
@@ -306,6 +310,35 @@ struct ice_aqc_add_tx_qgrp {
     struct ice_aqc_add_txqs_perq txqs[STRUCT_HACK_VAR_LEN];
 } __attribute__((packed));
 
+/* Add/Get/Update/Free VSI (0x0210/0x0212/0x0211/0x0213) */
+struct ice_aqc_vsi_cmd {
+    uint16_t vsi_num;
+#define ICE_AQ_VSI_IS_VALID             BIT(15)
+    uint16_t cmd_flags;
+    uint8_t vf_id;
+    uint8_t reserved;
+    uint16_t vsi_flags;
+    uint32_t addr_high;
+    uint32_t addr_low;
+};
+
+/* Get/Set RSS key (indirect 0x0B04/0x0B02) */
+struct ice_aqc_get_set_rss_key_cmd {
+    uint16_t vsi_id;
+    uint8_t reserved2[6];
+    uint32_t addr_high;
+    uint32_t addr_low;
+};
+
+/* Get/Set RSS LUT (indirect 0x0B05/0x0B03) */
+struct ice_aqc_get_set_rss_lut_cmd {
+    uint16_t vsi_id;
+    uint16_t flags;
+    uint32_t reserved2;
+    uint32_t addr_high;
+    uint32_t addr_low;
+};
+
 struct ice_aq_desc {
     uint16_t flags;
     uint16_t opcode;
@@ -324,6 +357,9 @@ struct ice_aq_desc {
         struct ice_aqc_set_phy_lb set_phy_lb;
         struct ice_aqc_set_mac_lb set_mac_lb;
         struct ice_aqc_add_txqs add_txqs;
+        struct ice_aqc_vsi_cmd vsi_cmd;
+        struct ice_aqc_get_set_rss_key_cmd get_set_rss_key;
+        struct ice_aqc_get_set_rss_lut_cmd get_set_rss_lut;
     } params;
 };
 
@@ -433,5 +469,86 @@ struct ice_ctx_ele {
     .width = (_width), \
     .lsb = (_lsb), \
 }
+
+/* ---- RSS / VSI Update ---- */
+
+/* VSI context valid_sections bits */
+#define ICE_AQ_VSI_PROP_RXQ_MAP_VALID   BIT(6)
+#define ICE_AQ_VSI_PROP_Q_OPT_VALID     BIT(7)
+
+/* Queue mapping flags */
+#define ICE_AQ_VSI_Q_MAP_CONTIG         0x0000
+
+/* tc_mapping encoding */
+#define ICE_AQ_VSI_TC_Q_OFFSET_S        0
+#define ICE_AQ_VSI_TC_Q_NUM_S           11
+
+/* q_opt_rss encoding */
+#define ICE_AQ_VSI_Q_OPT_RSS_LUT_S     0
+#define ICE_AQ_VSI_Q_OPT_RSS_LUT_M     (0x3U << ICE_AQ_VSI_Q_OPT_RSS_LUT_S)
+#define ICE_AQ_VSI_Q_OPT_RSS_LUT_VSI   0x0U
+#define ICE_AQ_VSI_Q_OPT_RSS_HASH_S    6
+#define ICE_AQ_VSI_Q_OPT_RSS_HASH_M    (0x3U << ICE_AQ_VSI_Q_OPT_RSS_HASH_S)
+#define ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ 0x0U
+
+/* RSS AQ descriptor flags */
+#define ICE_AQC_RSS_VSI_VALID           BIT(15)
+
+/* RSS key sizes */
+#define ICE_AQC_RSS_KEY_DATA_SIZE       0x28
+#define ICE_AQC_RSS_KEY_EXT_SIZE        0x0C
+#define ICE_AQC_RSS_KEY_TOTAL_SIZE      (ICE_AQC_RSS_KEY_DATA_SIZE + ICE_AQC_RSS_KEY_EXT_SIZE)
+
+/* RSS LUT sizes */
+#define ICE_AQC_LUT_VSI_SIZE            64
+#define ICE_AQC_LUT_FLAG_VSI_SIZE       0x0000
+
+/* ---- VSI properties (indirect buffer for GET_VSI / UPDATE_VSI) ---- */
+
+/*
+ * Minimal VSI properties — we only use the queue-mapping and RSS sections.
+ * The full struct is 192 bytes; we zero-fill unused fields.
+ */
+#define ICE_AQC_VSI_PROPS_SIZE          192
+struct ice_aqc_vsi_props {
+    uint16_t valid_sections;
+    /* switch section (bytes 2..7) */
+    uint8_t sw_id;
+    uint8_t sw_flags;
+    uint8_t sw_flags2;
+    uint8_t veb_stat_id;
+    /* security section (bytes 8..9) */
+    uint8_t sec_flags;
+    uint8_t sec_reserved;
+    /* VLAN section (bytes 10..17) */
+    uint16_t port_based_inner_vlan;
+    uint8_t inner_vlan_reserved[2];
+    uint8_t inner_vlan_flags;
+    uint8_t inner_vlan_reserved2[3];
+    /* ingress/egress up (bytes 18..25) */
+    uint32_t ingress_table;
+    uint32_t egress_table;
+    /* outer tags (bytes 26..29) */
+    uint16_t port_based_outer_vlan;
+    uint8_t outer_vlan_flags;
+    uint8_t outer_vlan_reserved;
+    /* queue mapping (bytes 30..77) */
+    uint16_t mapping_flags;
+    uint16_t q_mapping[16];
+    uint16_t tc_mapping[8];
+    /* queueing option (bytes 78..83) */
+    uint8_t q_opt_rss;
+    uint8_t q_opt_tc;
+    uint8_t q_opt_flags;
+    uint8_t q_opt_reserved[3];
+    /* outer_up + sect10 + fd section + PASID + reserved to fill to 192 */
+    uint8_t tail_pad[ICE_AQC_VSI_PROPS_SIZE - 84];
+} __attribute__((packed));
+
+/* RSS key data (indirect buffer for SET_RSS_KEY / GET_RSS_KEY) */
+struct ice_aqc_rss_key_data {
+    uint8_t standard_rss_key[ICE_AQC_RSS_KEY_DATA_SIZE];
+    uint8_t extended_hash_key[ICE_AQC_RSS_KEY_EXT_SIZE];
+};
 
 #endif

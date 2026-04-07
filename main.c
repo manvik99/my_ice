@@ -88,19 +88,22 @@ struct aq_ring_ctx {
     uint16_t next_to_use;
 };
 
-struct io_ring_ctx {
-    uint8_t mac[ETHER_ADDR_LEN];
-    uint8_t lport;
-    uint16_t vsi_num;
+struct rxq_ctx {
     uint16_t rxq_id;
-    uint32_t qparent_teid;
-
+    uint16_t desc_count;
     union ice_32b_rx_flex_desc *rx_desc;
     uint64_t rx_desc_iova;
     uint8_t *rx_bufs;
     uint64_t rx_bufs_iova;
     struct pkt_buf **rx_pkt_bufs;
     uint16_t rx_ntc;
+};
+
+struct io_ring_ctx {
+    uint8_t mac[ETHER_ADDR_LEN];
+    uint8_t lport;
+    uint16_t vsi_num;
+    uint32_t qparent_teid;
 };
 
 struct txq_ctx {
@@ -126,6 +129,9 @@ struct dev_ctx {
     char huge_path[PATH_MAX];
     uint8_t *bar0;
     size_t bar0_size;
+    uint16_t rxq_count;
+    uint16_t rxq_alloc_count;
+    struct rxq_ctx *rxqs;
     uint16_t txq_count;
     uint16_t txq_alloc_count;
     uint16_t tx_desc_count;
@@ -138,7 +144,7 @@ struct dev_ctx {
     struct pkt_mempool reflect_pool;
 };
 
-static void rearm_rx_desc(struct dev_ctx *d, uint16_t idx);
+static void rearm_rx_desc(struct dev_ctx *d, struct rxq_ctx *rq, uint16_t idx);
 
 static const struct ice_ctx_ele rlan_ctx_info[] = {
     ICE_CTX_STORE(ice_rlan_ctx, head,        13, 0),
@@ -298,7 +304,7 @@ static void pin_thread_to_cpu(int cpu)
 
 static uint32_t reflect_pool_entry_count(const struct dev_ctx *d)
 {
-    return (uint32_t)ICE_RX_DESC_COUNT + (uint32_t)d->tx_desc_count + ICE_REFLECT_POOL_EXTRA;
+    return (uint32_t)d->rxq_alloc_count * ICE_RX_DESC_COUNT + (uint32_t)d->tx_desc_count + ICE_REFLECT_POOL_EXTRA;
 }
 
 static size_t reflect_pool_dma_bytes(const struct dev_ctx *d)
@@ -315,9 +321,12 @@ static void alloc_queue_sw_state(struct dev_ctx *d)
 {
     uint16_t i;
 
-    d->io.rx_pkt_bufs = calloc(ICE_RX_DESC_COUNT, sizeof(*d->io.rx_pkt_bufs));
-    if (!d->io.rx_pkt_bufs)
-        die_errno("calloc rx pkt buf slots");
+    for (i = 0; i < d->rxq_alloc_count; i++) {
+        d->rxqs[i].rx_pkt_bufs = calloc(ICE_RX_DESC_COUNT, sizeof(*d->rxqs[i].rx_pkt_bufs));
+        if (!d->rxqs[i].rx_pkt_bufs)
+            die_errno("calloc rx pkt buf slots");
+        d->rxqs[i].desc_count = ICE_RX_DESC_COUNT;
+    }
 
     for (i = 0; i < d->txq_alloc_count; i++) {
         d->txqs[i].tx_pkt_buf_refs =
@@ -566,6 +575,10 @@ static void layout_dma(struct dev_ctx *d)
     uint64_t tx_desc_iova = 0;
     uint8_t *tx_buf_base = NULL;
     uint64_t tx_buf_iova = 0;
+    union ice_32b_rx_flex_desc *rx_desc_base = NULL;
+    uint64_t rx_desc_iova = 0;
+    uint8_t *rx_buf_base = NULL;
+    uint64_t rx_buf_iova = 0;
     uint16_t i;
 
 #define PLACE(ptr, iova_out, sz, align) \
@@ -588,8 +601,10 @@ static void layout_dma(struct dev_ctx *d)
           (size_t)d->txq_alloc_count * d->tx_desc_count * sizeof(struct ice_tx_desc), 128);
     PLACE(tx_buf_base, tx_buf_iova,
           (size_t)d->txq_alloc_count * d->tx_desc_count * ICE_TX_PKT_BUF_SIZE, 128);
-    PLACE(d->io.rx_desc, d->io.rx_desc_iova, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc), 128);
-    PLACE(d->io.rx_bufs, d->io.rx_bufs_iova, ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE, 128);
+    PLACE(rx_desc_base, rx_desc_iova,
+          (size_t)d->rxq_alloc_count * ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc), 128);
+    PLACE(rx_buf_base, rx_buf_iova,
+          (size_t)d->rxq_alloc_count * ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE, 128);
     PLACE(d->reflect_pool.base, d->reflect_pool.base_iova, reflect_pool_dma_bytes(d), 4096);
 
 #undef PLACE
@@ -607,6 +622,19 @@ static void layout_dma(struct dev_ctx *d)
         q->tx_next_to_use = 0;
         q->tx_next_to_clean = 0;
         q->tx_pkts_since_rs = 0;
+    }
+
+    for (i = 0; i < d->rxq_alloc_count; i++) {
+        struct rxq_ctx *rq = &d->rxqs[i];
+        size_t desc_off = (size_t)i * ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc);
+        size_t buf_off = (size_t)i * ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE;
+
+        rq->desc_count = ICE_RX_DESC_COUNT;
+        rq->rx_desc = (union ice_32b_rx_flex_desc *)((uint8_t *)rx_desc_base + desc_off);
+        rq->rx_desc_iova = rx_desc_iova + desc_off;
+        rq->rx_bufs = rx_buf_base + buf_off;
+        rq->rx_bufs_iova = rx_buf_iova + buf_off;
+        rq->rx_ntc = 0;
     }
 
     if (off > d->dma.size)
@@ -906,6 +934,139 @@ static int aq_get_qparent_teid(struct dev_ctx *d)
     return 0;
 }
 
+/* ---- RSS AQ helper functions ---- */
+
+static int aq_get_vsi(struct dev_ctx *d, struct ice_aqc_vsi_props *props)
+{
+    struct ice_aq_desc desc;
+    struct ice_aqc_vsi_props buf;
+
+    memset(&buf, 0, sizeof(buf));
+    memset(&desc, 0, sizeof(desc));
+    desc.opcode = htole16(ICE_AQC_OPC_GET_VSI);
+    desc.flags = htole16(ICE_AQ_FLAG_SI | ICE_AQ_FLAG_RD);
+    desc.params.vsi_cmd.vsi_num = htole16(d->io.vsi_num | ICE_AQ_VSI_IS_VALID);
+
+    if (aq_send_cmd(d, &desc, &buf, sizeof(buf)) < 0)
+        return -1;
+
+    memcpy(props, &buf, sizeof(*props));
+    return 0;
+}
+
+static uint8_t ilog2_u16(uint16_t v)
+{
+    uint8_t r = 0;
+    while (v > 1) { v >>= 1; r++; }
+    return r;
+}
+
+static int aq_update_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs)
+{
+    struct ice_aqc_vsi_props props;
+    struct ice_aq_desc desc;
+
+    /* Read current VSI config first */
+    if (aq_get_vsi(d, &props) < 0) {
+        fprintf(stderr, "[my_ice] GET_VSI failed before UPDATE_VSI\n");
+        return -1;
+    }
+
+    /* Set queue mapping section */
+    props.valid_sections = htole16(ICE_AQ_VSI_PROP_RXQ_MAP_VALID |
+                                   ICE_AQ_VSI_PROP_Q_OPT_VALID);
+    props.mapping_flags = htole16(ICE_AQ_VSI_Q_MAP_CONTIG);
+
+    /* q_mapping[0] = TC0: offset=0, count=log2(num_rxqs) */
+    props.q_mapping[0] = htole16(
+        (0 << ICE_AQ_VSI_TC_Q_OFFSET_S) |
+        ((uint16_t)ilog2_u16(num_rxqs) << ICE_AQ_VSI_TC_Q_NUM_S));
+
+    /* tc_mapping[0] = TC0: offset=0, count=log2(num_rxqs) */
+    props.tc_mapping[0] = htole16(
+        (0 << ICE_AQ_VSI_TC_Q_OFFSET_S) |
+        ((uint16_t)ilog2_u16(num_rxqs) << ICE_AQ_VSI_TC_Q_NUM_S));
+
+    /* RSS options: VSI LUT, Toeplitz hash */
+    props.q_opt_rss = (uint8_t)(
+        (ICE_AQ_VSI_Q_OPT_RSS_LUT_VSI << ICE_AQ_VSI_Q_OPT_RSS_LUT_S) |
+        (ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ << ICE_AQ_VSI_Q_OPT_RSS_HASH_S));
+
+    memset(&desc, 0, sizeof(desc));
+    desc.opcode = htole16(ICE_AQC_OPC_UPDATE_VSI);
+    desc.flags = htole16(ICE_AQ_FLAG_SI | ICE_AQ_FLAG_RD);
+    desc.params.vsi_cmd.vsi_num = htole16(d->io.vsi_num | ICE_AQ_VSI_IS_VALID);
+
+    if (aq_send_cmd(d, &desc, &props, sizeof(props)) < 0) {
+        fprintf(stderr, "[my_ice] UPDATE_VSI failed\n");
+        return -1;
+    }
+
+    fprintf(stderr, "[my_ice] UPDATE_VSI ok: num_rxqs=%u log2=%u\n",
+            num_rxqs, ilog2_u16(num_rxqs));
+    return 0;
+}
+
+static int aq_set_rss_key(struct dev_ctx *d)
+{
+    /* Microsoft/kernel default Toeplitz hash key */
+    static const uint8_t default_rss_key[ICE_AQC_RSS_KEY_TOTAL_SIZE] = {
+        0x6d, 0x5a, 0x56, 0xda, 0x25, 0x5b, 0x0e, 0xc2,
+        0x41, 0x67, 0x25, 0x3d, 0x43, 0xa3, 0x8f, 0xb0,
+        0xd0, 0xca, 0x2b, 0xcb, 0xae, 0x7b, 0x30, 0xb4,
+        0x77, 0xcb, 0x2d, 0xa3, 0x80, 0x30, 0xf2, 0x0c,
+        0x6a, 0x42, 0xb7, 0x3b, 0xbe, 0xac, 0x01, 0xfa,
+        /* extended hash key (12 bytes) */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00,
+    };
+    struct ice_aqc_rss_key_data key_data;
+    struct ice_aq_desc desc;
+
+    memcpy(&key_data, default_rss_key, sizeof(key_data));
+
+    memset(&desc, 0, sizeof(desc));
+    desc.opcode = htole16(ICE_AQC_OPC_SET_RSS_KEY);
+    desc.flags = htole16(ICE_AQ_FLAG_SI | ICE_AQ_FLAG_RD);
+    desc.params.get_set_rss_key.vsi_id =
+        htole16(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID);
+
+    if (aq_send_cmd(d, &desc, &key_data, sizeof(key_data)) < 0) {
+        fprintf(stderr, "[my_ice] SET_RSS_KEY failed\n");
+        return -1;
+    }
+
+    fprintf(stderr, "[my_ice] SET_RSS_KEY ok\n");
+    return 0;
+}
+
+static int aq_set_rss_lut(struct dev_ctx *d, uint16_t num_rxqs)
+{
+    uint8_t lut[ICE_AQC_LUT_VSI_SIZE];
+    struct ice_aq_desc desc;
+    uint16_t i;
+
+    for (i = 0; i < ICE_AQC_LUT_VSI_SIZE; i++)
+        lut[i] = (uint8_t)(i % num_rxqs);
+
+    memset(&desc, 0, sizeof(desc));
+    desc.opcode = htole16(ICE_AQC_OPC_SET_RSS_LUT);
+    desc.flags = htole16(ICE_AQ_FLAG_SI | ICE_AQ_FLAG_RD);
+    desc.params.get_set_rss_lut.vsi_id =
+        htole16(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID);
+    desc.params.get_set_rss_lut.flags =
+        htole16(ICE_AQC_LUT_FLAG_VSI_SIZE);
+
+    if (aq_send_cmd(d, &desc, lut, sizeof(lut)) < 0) {
+        fprintf(stderr, "[my_ice] SET_RSS_LUT failed\n");
+        return -1;
+    }
+
+    fprintf(stderr, "[my_ice] SET_RSS_LUT ok: %u entries, %u queues\n",
+            ICE_AQC_LUT_VSI_SIZE, num_rxqs);
+    return 0;
+}
+
 struct my_sw_rule_lkup_rx_tx {
     struct {
         uint16_t type;
@@ -1089,15 +1250,15 @@ static int wait_rxq_ready(struct dev_ctx *d, uint16_t rxq, uint32_t *reg)
     return -1;
 }
 
-static int enable_rxq(struct dev_ctx *d)
+static int enable_rxq(struct dev_ctx *d, struct rxq_ctx *rq)
 {
     struct ice_rlan_ctx rlan = {0};
     uint8_t ctx_buf[ICE_RXQ_CTX_SZ] = {0};
-    uint16_t q = d->io.rxq_id;
+    uint16_t q = rq->rxq_id;
     uint32_t reg;
     int i;
 
-    rlan.base = d->io.rx_desc_iova >> 7;
+    rlan.base = rq->rx_desc_iova >> 7;
     rlan.qlen = ICE_RX_DESC_COUNT;
     rlan.dbuf = ICE_RX_BUF_SIZE >> ICE_RLAN_CTX_DBUF_S;
     rlan.dsize = 1;
@@ -1137,45 +1298,104 @@ static int enable_rxq(struct dev_ctx *d)
             return -1;
     }
 
-    d->io.rx_ntc = 0;
+    rq->rx_ntc = 0;
     reg_write32(d, QRX_TAIL(q), ICE_RX_DESC_COUNT - 1);
     return 0;
 }
 
-static int setup_and_enable_rxq(struct dev_ctx *d)
+static int setup_and_enable_rxq(struct dev_ctx *d, struct rxq_ctx *rq)
 {
     int i;
 
-    memset(d->io.rx_desc, 0, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc));
-    memset(d->io.rx_bufs, 0, ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE);
+    memset(rq->rx_desc, 0, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc));
+    memset(rq->rx_bufs, 0, ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE);
 
     for (i = 0; i < ICE_RX_DESC_COUNT; i++) {
-        uint64_t biova = d->io.rx_bufs_iova + (uint64_t)i * ICE_RX_BUF_SIZE;
-        d->io.rx_desc[i].read.pkt_addr = htole64(biova);
-        d->io.rx_desc[i].read.hdr_addr = 0;
+        uint64_t biova = rq->rx_bufs_iova + (uint64_t)i * ICE_RX_BUF_SIZE;
+        rq->rx_desc[i].read.pkt_addr = htole64(biova);
+        rq->rx_desc[i].read.hdr_addr = 0;
     }
 
-    return enable_rxq(d);
+    return enable_rxq(d, rq);
 }
 
-static int setup_and_enable_rxq_pool(struct dev_ctx *d)
+static int setup_and_enable_rxq_pool(struct dev_ctx *d, struct rxq_ctx *rq)
 {
     int i;
 
-    memset(d->io.rx_desc, 0, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc));
-    memset(d->io.rx_pkt_bufs, 0, ICE_RX_DESC_COUNT * sizeof(*d->io.rx_pkt_bufs));
+    memset(rq->rx_desc, 0, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc));
+    memset(rq->rx_pkt_bufs, 0, ICE_RX_DESC_COUNT * sizeof(*rq->rx_pkt_bufs));
 
     for (i = 0; i < ICE_RX_DESC_COUNT; i++) {
         struct pkt_buf *buf = pkt_buf_alloc(&d->reflect_pool);
 
         if (!buf)
             return -1;
-        d->io.rx_pkt_bufs[i] = buf;
-        d->io.rx_desc[i].read.pkt_addr = htole64(buf->buf_addr_iova);
-        d->io.rx_desc[i].read.hdr_addr = 0;
+        rq->rx_pkt_bufs[i] = buf;
+        rq->rx_desc[i].read.pkt_addr = htole64(buf->buf_addr_iova);
+        rq->rx_desc[i].read.hdr_addr = 0;
     }
 
-    return enable_rxq(d);
+    return enable_rxq(d, rq);
+}
+
+/*
+ * setup_all_rxqs: read HW queue allocation, assign rxq_ids, enable all RX
+ * queues, and configure RSS if num_rxqs > 1.
+ * If use_pool is true, uses pkt_buf pool; otherwise uses flat DMA buffers.
+ */
+static int setup_all_rxqs(struct dev_ctx *d, bool use_pool)
+{
+    uint32_t rx_alloc;
+    uint16_t first_q, last_q, avail_q;
+    uint16_t i;
+
+    rx_alloc = reg_read32(d, PFLAN_RX_QALLOC);
+    if (!(rx_alloc & PFLAN_RX_QALLOC_VALID_M)) {
+        fprintf(stderr, "queue alloc not valid (RX=0x%08x)\n", rx_alloc);
+        return -1;
+    }
+
+    first_q = (uint16_t)(rx_alloc & PFLAN_RX_QALLOC_FIRSTQ_M);
+    last_q = (uint16_t)((rx_alloc & PFLAN_RX_QALLOC_LASTQ_M) >> PFLAN_RX_QALLOC_LASTQ_S);
+    avail_q = (uint16_t)(last_q - first_q + 1);
+
+    if (d->rxq_count > avail_q) {
+        fprintf(stderr, "[my_ice] requested %u rx queues, clamping to %u available\n",
+                d->rxq_count, avail_q);
+        d->rxq_count = avail_q;
+    }
+
+    for (i = 0; i < d->rxq_count; i++)
+        d->rxqs[i].rxq_id = (uint16_t)(first_q + i);
+
+    for (i = 0; i < d->rxq_count; i++) {
+        int rc;
+        if (use_pool)
+            rc = setup_and_enable_rxq_pool(d, &d->rxqs[i]);
+        else
+            rc = setup_and_enable_rxq(d, &d->rxqs[i]);
+        if (rc < 0) {
+            fprintf(stderr, "[my_ice] setup/enable rxq[%u] (hw_q=%u) failed\n",
+                    i, d->rxqs[i].rxq_id);
+            return -1;
+        }
+    }
+
+    fprintf(stderr, "[my_ice] enabled %u RX queues (first_hw_q=%u)\n",
+            d->rxq_count, first_q);
+
+    /* Configure RSS when multiple queues are active */
+    if (d->rxq_count > 1) {
+        if (aq_update_vsi_rss(d, d->rxq_count) < 0)
+            return -1;
+        if (aq_set_rss_key(d) < 0)
+            return -1;
+        if (aq_set_rss_lut(d, d->rxq_count) < 0)
+            return -1;
+    }
+
+    return 0;
 }
 
 static void tx_ring_init(struct dev_ctx *d)
@@ -1221,13 +1441,14 @@ static void tx_update_free(struct dev_ctx *d, struct txq_ctx *q)
     q->tx_free = (uint16_t)(q->desc_count - used - 1);
 }
 
-static int poll_one_rx_desc(struct dev_ctx *d, uint16_t *out_idx, uint16_t *out_len)
+static int poll_one_rx_desc(struct dev_ctx *d, struct rxq_ctx *rq,
+                           uint16_t *out_idx, uint16_t *out_len)
 {
     uint16_t n;
 
     for (n = 0; n < ICE_RX_DESC_COUNT; n++) {
-        uint16_t idx = (uint16_t)((d->io.rx_ntc + n) % ICE_RX_DESC_COUNT);
-        union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
+        uint16_t idx = (uint16_t)((rq->rx_ntc + n) % ICE_RX_DESC_COUNT);
+        union ice_32b_rx_flex_desc *rxd = &rq->rx_desc[idx];
         uint16_t status0 = le16toh(rxd->wb.status_error0);
         uint16_t pkt_len;
 
@@ -1241,7 +1462,7 @@ static int poll_one_rx_desc(struct dev_ctx *d, uint16_t *out_idx, uint16_t *out_
             fprintf(stderr,
                     "[my_ice] rx descriptor error idx=%u status0=0x%04x pkt_len=%u\n",
                     idx, status0, pkt_len);
-            rearm_rx_desc(d, idx);
+            rearm_rx_desc(d, rq, idx);
             return -1;
         }
 
@@ -1360,30 +1581,31 @@ static int tx_wait_drain(struct dev_ctx *d, struct txq_ctx *q, int timeout_ms)
     return -1;
 }
 
-static void rearm_rx_desc(struct dev_ctx *d, uint16_t idx)
+static void rearm_rx_desc(struct dev_ctx *d, struct rxq_ctx *rq, uint16_t idx)
 {
     uint64_t buf_iova;
 
-    if (d->io.rx_pkt_bufs && d->io.rx_pkt_bufs[idx]) {
-        d->io.rx_pkt_bufs[idx]->size = 0;
-        buf_iova = d->io.rx_pkt_bufs[idx]->buf_addr_iova;
+    if (rq->rx_pkt_bufs && rq->rx_pkt_bufs[idx]) {
+        rq->rx_pkt_bufs[idx]->size = 0;
+        buf_iova = rq->rx_pkt_bufs[idx]->buf_addr_iova;
     } else {
-        buf_iova = d->io.rx_bufs_iova + (uint64_t)idx * ICE_RX_BUF_SIZE;
+        buf_iova = rq->rx_bufs_iova + (uint64_t)idx * ICE_RX_BUF_SIZE;
     }
 
-    d->io.rx_desc[idx].read.pkt_addr = htole64(buf_iova);
-    d->io.rx_desc[idx].read.hdr_addr = 0;
-    d->io.rx_desc[idx].read.rsvd1 = 0;
-    d->io.rx_desc[idx].read.rsvd2 = 0;
+    rq->rx_desc[idx].read.pkt_addr = htole64(buf_iova);
+    rq->rx_desc[idx].read.hdr_addr = 0;
+    rq->rx_desc[idx].read.rsvd1 = 0;
+    rq->rx_desc[idx].read.rsvd2 = 0;
 
-    reg_write32(d, QRX_TAIL(d->io.rxq_id), idx);
-    d->io.rx_ntc = (uint16_t)((idx + 1) % ICE_RX_DESC_COUNT);
+    reg_write32(d, QRX_TAIL(rq->rxq_id), idx);
+    rq->rx_ntc = (uint16_t)((idx + 1) % ICE_RX_DESC_COUNT);
 }
 
-static int poll_one_rx_packet(struct dev_ctx *d, uint8_t *out, uint16_t out_sz, uint16_t *out_len)
+static int poll_one_rx_packet(struct dev_ctx *d, struct rxq_ctx *rq,
+                             uint8_t *out, uint16_t out_sz, uint16_t *out_len)
 {
     uint16_t idx;
-    int got = poll_one_rx_desc(d, &idx, out_len);
+    int got = poll_one_rx_desc(d, rq, &idx, out_len);
 
     if (got <= 0)
         return got;
@@ -1391,8 +1613,8 @@ static int poll_one_rx_packet(struct dev_ctx *d, uint8_t *out, uint16_t out_sz, 
     if (*out_len > out_sz)
         *out_len = out_sz;
 
-    memcpy(out, d->io.rx_bufs + ((size_t)idx * ICE_RX_BUF_SIZE), *out_len);
-    rearm_rx_desc(d, idx);
+    memcpy(out, rq->rx_bufs + ((size_t)idx * ICE_RX_BUF_SIZE), *out_len);
+    rearm_rx_desc(d, rq, idx);
     return 1;
 }
 
@@ -1419,13 +1641,14 @@ static void dump_mdet_regs(struct dev_ctx *d)
         fprintf(stderr, "[my_ice] PF_MDET_RX=0x%08x\n", pf_rx);
 }
 
-static void dump_rx_desc_snapshot(struct dev_ctx *d)
+static void dump_rx_desc_snapshot(struct dev_ctx *d, struct rxq_ctx *rq)
 {
     uint16_t i;
+    (void)d;
 
     for (i = 0; i < 8; i++) {
-        uint16_t idx = (uint16_t)((d->io.rx_ntc + i) % ICE_RX_DESC_COUNT);
-        union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
+        uint16_t idx = (uint16_t)((rq->rx_ntc + i) % ICE_RX_DESC_COUNT);
+        union ice_32b_rx_flex_desc *rxd = &rq->rx_desc[idx];
         uint16_t status0 = le16toh(rxd->wb.status_error0);
         uint16_t pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
         fprintf(stderr,
@@ -1489,34 +1712,26 @@ static void rewrite_reflect_l2(struct pkt_buf *buf, const uint8_t *local_mac)
 
 static int run_rx_listen(struct dev_ctx *d, int timeout_ms)
 {
-    uint32_t rx_alloc;
     uint8_t rxpkt[2048];
     uint16_t rxlen = 0;
     uint16_t rx_mac_rule_idx = UINT16_MAX;
     uint64_t gorc_before, gorc_after;
     int rc = -1;
     int i;
-
-    rx_alloc = reg_read32(d, PFLAN_RX_QALLOC);
-    if (!(rx_alloc & PFLAN_RX_QALLOC_VALID_M)) {
-        fprintf(stderr, "queue alloc not valid (RX=0x%08x)\n", rx_alloc);
-        goto out;
-    }
-
-    d->io.rxq_id = (uint16_t)(rx_alloc & PFLAN_RX_QALLOC_FIRSTQ_M);
+    uint16_t rr = 0; /* round-robin queue index */
 
     if (aq_get_default_vsi_and_lport(d) < 0) {
         fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
         goto out;
     }
 
-    fprintf(stderr, "[my_ice] rx-listen on vsi=%u lport=%u rxq=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-            d->io.vsi_num, d->io.lport, d->io.rxq_id,
+    fprintf(stderr, "[my_ice] rx-listen on vsi=%u lport=%u rxq_count=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+            d->io.vsi_num, d->io.lport, d->rxq_count,
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
             d->io.mac[3], d->io.mac[4], d->io.mac[5]);
 
-    if (setup_and_enable_rxq(d) < 0) {
-        fprintf(stderr, "[my_ice] setup/enable rx queue failed\n");
+    if (setup_all_rxqs(d, false) < 0) {
+        fprintf(stderr, "[my_ice] setup_all_rxqs failed\n");
         goto out;
     }
 
@@ -1529,33 +1744,42 @@ static int run_rx_listen(struct dev_ctx *d, int timeout_ms)
                                      GLV_GORCH(d->io.vsi_num));
 
     for (i = 0; i < timeout_ms; i++) {
-        int got = poll_one_rx_packet(d, rxpkt, sizeof(rxpkt), &rxlen);
-        if (got < 0) {
-            dump_mdet_regs(d);
-            goto out;
-        }
-        if (got > 0) {
-            if (rxlen >= 14) {
-                printf("RXLISTEN: received %u bytes, dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x ethertype=0x%02x%02x\n",
-                       rxlen,
-                       rxpkt[0], rxpkt[1], rxpkt[2], rxpkt[3], rxpkt[4], rxpkt[5],
-                       rxpkt[6], rxpkt[7], rxpkt[8], rxpkt[9], rxpkt[10], rxpkt[11],
-                       rxpkt[12], rxpkt[13]);
-            } else {
-                printf("RXLISTEN: received %u bytes\n", rxlen);
+        uint16_t qi;
+        bool got_any = false;
+
+        for (qi = 0; qi < d->rxq_count; qi++) {
+            uint16_t q_idx = (uint16_t)((rr + qi) % d->rxq_count);
+            int got = poll_one_rx_packet(d, &d->rxqs[q_idx], rxpkt, sizeof(rxpkt), &rxlen);
+            if (got < 0) {
+                dump_mdet_regs(d);
+                goto out;
             }
-            print_payload_dump(rxpkt, rxlen);
-            rc = 0;
-            goto out;
+            if (got > 0) {
+                got_any = true;
+                if (rxlen >= 14) {
+                    printf("RXLISTEN: q[%u] received %u bytes, dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x ethertype=0x%02x%02x\n",
+                           q_idx, rxlen,
+                           rxpkt[0], rxpkt[1], rxpkt[2], rxpkt[3], rxpkt[4], rxpkt[5],
+                           rxpkt[6], rxpkt[7], rxpkt[8], rxpkt[9], rxpkt[10], rxpkt[11],
+                           rxpkt[12], rxpkt[13]);
+                } else {
+                    printf("RXLISTEN: q[%u] received %u bytes\n", q_idx, rxlen);
+                }
+                print_payload_dump(rxpkt, rxlen);
+                rc = 0;
+                goto out;
+            }
         }
-        usleep(1000);
+        rr = (uint16_t)((rr + 1) % d->rxq_count);
+        if (!got_any)
+            usleep(1000);
     }
 
     gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
                                     GLV_GORCH(d->io.vsi_num));
     fprintf(stderr, "[my_ice] rx-listen timeout, VSI%u GORC +%" PRIu64 " bytes\n",
             d->io.vsi_num, gorc_after - gorc_before);
-    dump_rx_desc_snapshot(d);
+    dump_rx_desc_snapshot(d, &d->rxqs[0]);
     dump_mdet_regs(d);
 
 out:
@@ -1566,7 +1790,6 @@ out:
 static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
 {
     const uint16_t reflect_batch = 64;
-    uint32_t rx_alloc;
     uint32_t tx_alloc;
     uint16_t first_q, last_q, avail_q;
     uint16_t rx_mac_rule_idx = UINT16_MAX;
@@ -1576,22 +1799,18 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
     uint64_t tx_ring_full = 0, pool_empty = 0;
     uint64_t rx_short = 0, rx_errors = 0;
     uint64_t doorbells = 0;
+    uint64_t *per_q_rx_pkts = NULL;
+    uint64_t *per_q_rx_bytes = NULL;
     uint64_t gorc_before, gorc_after, gotc_before, gotc_after;
     uint64_t start_ns, now_ns;
     struct txq_ctx *q;
+    uint16_t rr = 0; /* round-robin queue index */
     int rc = -1;
 
     if (d->txq_count != 1) {
         fprintf(stderr, "[my_ice] rx-reflect uses one TX queue, using txq[0] only (configured=%u)\n",
                 d->txq_count);
     }
-
-    rx_alloc = reg_read32(d, PFLAN_RX_QALLOC);
-    if (!(rx_alloc & PFLAN_RX_QALLOC_VALID_M)) {
-        fprintf(stderr, "queue alloc not valid (RX=0x%08x)\n", rx_alloc);
-        goto out;
-    }
-    d->io.rxq_id = (uint16_t)(rx_alloc & PFLAN_RX_QALLOC_FIRSTQ_M);
 
     tx_alloc = reg_read32(d, PFLAN_TX_QALLOC);
     if (!(tx_alloc & PFLAN_TX_QALLOC_VALID_M)) {
@@ -1616,8 +1835,8 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
         fprintf(stderr, "[my_ice] failed to get parent TEID\n");
         goto out;
     }
-    if (setup_and_enable_rxq_pool(d) < 0) {
-        fprintf(stderr, "[my_ice] setup/enable rx queue failed\n");
+    if (setup_all_rxqs(d, true) < 0) {
+        fprintf(stderr, "[my_ice] setup_all_rxqs failed\n");
         goto out;
     }
     if (aq_add_rx_mac_rule(d, &rx_mac_rule_idx) < 0) {
@@ -1632,9 +1851,16 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
     tx_ring_init(d);
     q = &d->txqs[0];
 
+    per_q_rx_pkts = calloc(d->rxq_count, sizeof(*per_q_rx_pkts));
+    per_q_rx_bytes = calloc(d->rxq_count, sizeof(*per_q_rx_bytes));
+    if (!per_q_rx_pkts || !per_q_rx_bytes) {
+        fprintf(stderr, "[my_ice] failed to allocate per-queue counters\n");
+        goto out;
+    }
+
     fprintf(stderr,
-            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d\n",
-            d->io.vsi_num, d->io.lport, d->io.rxq_id, q->txq_id,
+            "[my_ice] rx-reflect on vsi=%u lport=%u rxq_count=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d\n",
+            d->io.vsi_num, d->io.lport, d->rxq_count, q->txq_id,
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
             d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms);
 
@@ -1652,6 +1878,7 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
         while (enqueued < reflect_batch) {
             struct pkt_buf *replacement;
             struct pkt_buf *rx_buf;
+            struct rxq_ctx *rq;
             uint16_t rx_idx, rx_len;
             int got;
             int enq;
@@ -1665,7 +1892,20 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
                 }
             }
 
-            got = poll_one_rx_desc(d, &rx_idx, &rx_len);
+            /* Round-robin poll across all RX queues */
+            got = 0;
+            {
+                uint16_t qi;
+                for (qi = 0; qi < d->rxq_count; qi++) {
+                    uint16_t q_idx = (uint16_t)((rr + qi) % d->rxq_count);
+                    rq = &d->rxqs[q_idx];
+                    got = poll_one_rx_desc(d, rq, &rx_idx, &rx_len);
+                    if (got != 0) {
+                        rr = (uint16_t)((q_idx + 1) % d->rxq_count);
+                        break;
+                    }
+                }
+            }
             if (got < 0) {
                 rx_errors++;
                 dump_mdet_regs(d);
@@ -1675,7 +1915,7 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
                 break;
 
             rx_seen = true;
-            rx_buf = d->io.rx_pkt_bufs[rx_idx];
+            rx_buf = rq->rx_pkt_bufs[rx_idx];
             if (!rx_buf) {
                 fprintf(stderr, "[my_ice] missing rx pool buffer for descriptor %u\n", rx_idx);
                 rx_errors++;
@@ -1684,7 +1924,7 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
 
             if (rx_len < 14) {
                 rx_short++;
-                rearm_rx_desc(d, rx_idx);
+                rearm_rx_desc(d, rq, rx_idx);
                 continue;
             }
 
@@ -1700,10 +1940,15 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
             }
 
             rx_buf->size = rx_len;
-            d->io.rx_pkt_bufs[rx_idx] = replacement;
-            rearm_rx_desc(d, rx_idx);
+            rq->rx_pkt_bufs[rx_idx] = replacement;
+            rearm_rx_desc(d, rq, rx_idx);
 
             rewrite_reflect_l2(rx_buf, d->io.mac);
+            {
+                uint16_t qi = (uint16_t)((rq - d->rxqs));
+                per_q_rx_pkts[qi]++;
+                per_q_rx_bytes[qi] += rx_len;
+            }
             rx_pkts++;
             rx_bytes += rx_len;
 
@@ -1758,9 +2003,22 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
             rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
             tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
             gorc_after - gorc_before, gotc_after - gotc_before);
+
+    if (d->rxq_count > 1) {
+        uint16_t qi;
+        fprintf(stderr, "[my_ice] per-queue RX stats:\n");
+        for (qi = 0; qi < d->rxq_count; qi++) {
+            fprintf(stderr,
+                    "  rxq[%u] (hw_q=%u): pkts=%" PRIu64 " bytes=%" PRIu64 "\n",
+                    qi, d->rxqs[qi].rxq_id,
+                    per_q_rx_pkts[qi], per_q_rx_bytes[qi]);
+        }
+    }
     rc = 0;
 
 out:
+    free(per_q_rx_pkts);
+    free(per_q_rx_bytes);
     aq_remove_sw_rule_best_effort(d, ICE_AQC_SW_RULES_T_LKUP_RX, rx_mac_rule_idx);
     return rc;
 }
@@ -2156,7 +2414,9 @@ static void cleanup(struct dev_ctx *d)
         close(d->huge_fd);
     if (d->huge_path[0] != '\0')
         unlink(d->huge_path);
-    free(d->io.rx_pkt_bufs);
+    for (i = 0; i < d->rxq_alloc_count; i++)
+        free(d->rxqs[i].rx_pkt_bufs);
+    free(d->rxqs);
     free(d->reflect_pool.free_stack);
     for (i = 0; i < d->txq_alloc_count; i++)
         free(d->txqs[i].tx_pkt_buf_refs);
@@ -2237,6 +2497,7 @@ int main(int argc, char **argv)
     bool run_tx_bench_mode = false;
     bool use_hugepages = false;
     const char *huge_dir = "/mnt/huge";
+    uint16_t rxq_count = 1;
     uint16_t txq_count = 1;
     uint16_t tx_desc_count = ICE_TX_DESC_COUNT;
     bool pin_cpus = false;
@@ -2257,7 +2518,7 @@ int main(int argc, char **argv)
     int rc = EXIT_FAILURE;
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--tx-queues <n>] [--tx-desc-count <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--rx-queues <n>] [--tx-queues <n>] [--tx-desc-count <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen 60\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60\n", argv[0]);
@@ -2382,6 +2643,19 @@ int main(int argc, char **argv)
                 }
                 huge_dir = argv[i + 1];
                 i += 2;
+            } else if (strcmp(argv[i], "--rx-queues") == 0) {
+                int v;
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--rx-queues requires <n>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_int_range(argv[i + 1], 1, 64, &v) < 0) {
+                    fprintf(stderr, "invalid --rx-queues '%s' (expected 1..64)\n",
+                            argv[i + 1]);
+                    return EXIT_FAILURE;
+                }
+                rxq_count = (uint16_t)v;
+                i += 2;
             } else if (strcmp(argv[i], "--tx-queues") == 0) {
                 int v;
                 if (i + 1 >= argc) {
@@ -2437,6 +2711,11 @@ int main(int argc, char **argv)
         }
     }
 
+    d.rxq_count = rxq_count;
+    d.rxq_alloc_count = rxq_count;
+    d.rxqs = calloc(d.rxq_count, sizeof(*d.rxqs));
+    if (!d.rxqs)
+        die_errno("calloc rxqs");
     d.txq_count = txq_count;
     d.txq_alloc_count = txq_count;
     d.tx_desc_count = tx_desc_count;
@@ -2459,8 +2738,8 @@ int main(int argc, char **argv)
         ICE_AQ_NUM_DESC * ICE_AQ_MAX_BUF_LEN +
         (size_t)d.txq_alloc_count * d.tx_desc_count * sizeof(struct ice_tx_desc) +
         (size_t)d.txq_alloc_count * d.tx_desc_count * ICE_TX_PKT_BUF_SIZE +
-        ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc) +
-        ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE +
+        (size_t)d.rxq_alloc_count * ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc) +
+        (size_t)d.rxq_alloc_count * ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE +
         reflect_pool_dma_bytes(&d) +
         8192;
 
