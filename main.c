@@ -2810,6 +2810,22 @@ int main(int argc, char **argv)
     if (aq_manage_mac_read(&d) < 0)
         goto out;
 
+    /*
+     * CLEAR_PXE_MODE (0x0110): transitions firmware from pre-boot/PXE
+     * ownership to PF-driver mode.  Without this, VSI management commands
+     * (ADD_VSI 0x0210, UPDATE_VSI 0x0211) return ENOTTY (0x000e).
+     * The kernel ice driver sends this immediately after MANAGE_MAC_READ.
+     */
+    {
+        struct ice_aq_desc cpxe_desc;
+        fill_dflt_direct_desc(&cpxe_desc, ICE_AQC_OPC_CLEAR_PXE_MODE);
+        cpxe_desc.params.raw[0] = 0x02; /* ICE_AQC_CLEAR_PXE_RX_CNT */
+        if (aq_send_cmd(&d, &cpxe_desc, NULL, 0) < 0)
+            fprintf(stderr, "[my_ice] CLEAR_PXE_MODE failed (non-fatal, may already be clear)\n");
+        else
+            fprintf(stderr, "[my_ice] CLEAR_PXE_MODE ok\n");
+    }
+
     if (run_rx_listen_mode) {
         fprintf(stderr, "[my_ice] running rx listen path\n");
         if (run_rx_listen(&d, rx_listen_timeout_s * 1000) < 0)

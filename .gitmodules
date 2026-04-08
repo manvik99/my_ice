@@ -1,0 +1,3 @@
+[submodule "docs/knowledge"]
+	path = docs/knowledge
+	url = https://github.com/sohambagchi/knowledge-ice-driver
