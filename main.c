@@ -983,11 +983,12 @@ static int aq_add_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
         (ICE_AQ_VSI_Q_OPT_RSS_LUT_PF << ICE_AQ_VSI_Q_OPT_RSS_LUT_S) |
         (ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ << ICE_AQ_VSI_Q_OPT_RSS_HASH_S));
 
-    memset(&desc, 0, sizeof(desc));
-    desc.opcode = htole16(ICE_AQC_OPC_ADD_VSI);
-    desc.flags = htole16(ICE_AQ_FLAG_RD);
-    /* vsi_num = 0 | IS_VALID: firmware assigns the new VSI number */
-    desc.params.vsi_cmd.vsi_num = htole16(ICE_AQ_VSI_IS_VALID);
+    fill_dflt_direct_desc(&desc, ICE_AQC_OPC_ADD_VSI);
+    desc.flags = htole16(le16toh(desc.flags) | ICE_AQ_FLAG_RD);
+    /* vsi_num = 0: allocate from pool (IS_VALID=0 means firmware picks the number) */
+    desc.params.vsi_cmd.vsi_num = 0;
+    /* vsi_flags bits[1:0] = VSI type: 0x2 = PF */
+    desc.params.vsi_cmd.vsi_flags = htole16(ICE_AQ_VSI_TYPE_PF);
 
     if (aq_send_cmd(d, &desc, &props, sizeof(props)) < 0) {
         fprintf(stderr, "[my_ice] ADD_VSI failed\n");
