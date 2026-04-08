@@ -319,7 +319,7 @@ struct ice_aqc_vsi_cmd {
     uint8_t vf_id;
     uint8_t reserved;
     uint16_t vsi_flags;
-#define ICE_AQ_VSI_TYPE_S               0
+#define ICE_AQ_VSI_TYPE_S               4
 #define ICE_AQ_VSI_TYPE_M               (0x3U << ICE_AQ_VSI_TYPE_S)
 #define ICE_AQ_VSI_TYPE_VF              0x0U
 #define ICE_AQ_VSI_TYPE_PF              0x2U

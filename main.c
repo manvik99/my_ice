@@ -890,6 +890,8 @@ static int aq_get_default_vsi_and_lport(struct dev_ctx *d)
 
     /* rss_vsi_num defaults to the boot VSI; multi-queue ADD_VSI will update it */
     d->io.rss_vsi_num = d->io.vsi_num;
+    fprintf(stderr, "[my_ice] GET_SW_CFG: vsi_num=%u sw_id=%u lport=%u\n",
+            d->io.vsi_num, d->io.sw_id, d->io.lport);
     return 0;
 }
 
@@ -987,11 +989,38 @@ static int aq_add_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
     desc.flags = htole16(le16toh(desc.flags) | ICE_AQ_FLAG_RD);
     /* vsi_num = 0: allocate from pool (IS_VALID=0 means firmware picks the number) */
     desc.params.vsi_cmd.vsi_num = 0;
-    /* vsi_flags bits[1:0] = VSI type: 0x2 = PF */
-    desc.params.vsi_cmd.vsi_flags = htole16(ICE_AQ_VSI_TYPE_PF);
+    /* vsi_flags bits[5:4] = VSI type: ICE_AQ_VSI_TYPE_PF=2 shifted to [5:4] = 0x20 */
+    desc.params.vsi_cmd.vsi_flags = htole16((uint16_t)(ICE_AQ_VSI_TYPE_PF << ICE_AQ_VSI_TYPE_S));
+
+    fprintf(stderr,
+            "[my_ice] ADD_VSI sending: desc_flags=0x%04x opcode=0x%04x vsi_num=0x%04x cmd_flags=0x%04x vf_id=0x%02x vsi_flags=0x%04x\n",
+            le16toh(desc.flags), le16toh(desc.opcode),
+            le16toh(desc.params.vsi_cmd.vsi_num),
+            le16toh(desc.params.vsi_cmd.cmd_flags),
+            desc.params.vsi_cmd.vf_id,
+            le16toh(desc.params.vsi_cmd.vsi_flags));
+    fprintf(stderr,
+            "[my_ice] ADD_VSI props: valid_sections=0x%04x sw_id=%u mapping_flags=0x%04x"
+            " q_mapping[0]=%u tc_mapping[0]=0x%04x q_opt_rss=0x%02x\n",
+            le16toh(props.valid_sections), props.sw_id,
+            le16toh(props.mapping_flags), le16toh(props.q_mapping[0]),
+            le16toh(props.tc_mapping[0]), props.q_opt_rss);
 
     if (aq_send_cmd(d, &desc, &props, sizeof(props)) < 0) {
-        fprintf(stderr, "[my_ice] ADD_VSI failed\n");
+        /* dump the completion descriptor for diagnosis */
+        const uint8_t *rp = (const uint8_t *)&desc.params;
+        fprintf(stderr,
+                "[my_ice] ADD_VSI failed: resp_flags=0x%04x retval=0x%04x"
+                " resp_vsi_num=0x%04x resp_vsi_flags=0x%04x\n",
+                le16toh(desc.flags), le16toh(desc.retval),
+                le16toh(desc.params.vsi_cmd.vsi_num),
+                le16toh(desc.params.vsi_cmd.vsi_flags));
+        fprintf(stderr,
+                "[my_ice] ADD_VSI resp params raw: "
+                "%02x %02x %02x %02x %02x %02x %02x %02x "
+                "%02x %02x %02x %02x %02x %02x %02x %02x\n",
+                rp[0], rp[1], rp[2], rp[3], rp[4], rp[5], rp[6], rp[7],
+                rp[8], rp[9], rp[10], rp[11], rp[12], rp[13], rp[14], rp[15]);
         return -1;
     }
 
