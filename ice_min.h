@@ -99,7 +99,9 @@
 #define ICE_AQC_OPC_GET_DFLT_TOPO   0x0400
 #define ICE_AQC_OPC_SET_MAC_LB      0x0620
 #define ICE_AQC_OPC_SET_PHY_LB      0x0619
+#define ICE_AQC_OPC_ADD_VSI         0x0210
 #define ICE_AQC_OPC_UPDATE_VSI      0x0211
+#define ICE_AQC_OPC_FREE_VSI        0x0213
 #define ICE_AQC_OPC_SET_RSS_KEY     0x0B02
 #define ICE_AQC_OPC_SET_RSS_LUT     0x0B03
 #define ICE_AQC_OPC_ADD_TXQS        0x0C30
@@ -472,6 +474,7 @@ struct ice_ctx_ele {
 /* ---- RSS / VSI Update ---- */
 
 /* VSI context valid_sections bits */
+#define ICE_AQ_VSI_PROP_SW_VALID        BIT(0)
 #define ICE_AQ_VSI_PROP_RXQ_MAP_VALID   BIT(6)
 #define ICE_AQ_VSI_PROP_Q_OPT_VALID     BIT(7)
 

@@ -102,7 +102,9 @@ struct rxq_ctx {
 struct io_ring_ctx {
     uint8_t mac[ETHER_ADDR_LEN];
     uint8_t lport;
-    uint16_t vsi_num;
+    uint8_t sw_id;
+    uint16_t vsi_num;      /* default boot VSI from GET_SW_CFG */
+    uint16_t rss_vsi_num;  /* VSI used for RSS/switch rules (may differ from vsi_num) */
     uint32_t qparent_teid;
 };
 
@@ -871,6 +873,7 @@ static int aq_get_default_vsi_and_lport(struct dev_ctx *d)
 
             if (type == ICE_AQC_GET_SW_CONF_RESP_VSI && !got_vsi) {
                 d->io.vsi_num = num;
+                d->io.sw_id = (uint8_t)(le16toh(buf[i].swid) & 0xff);
                 got_vsi = true;
             }
         }
@@ -885,6 +888,8 @@ static int aq_get_default_vsi_and_lport(struct dev_ctx *d)
         return -1;
     }
 
+    /* rss_vsi_num defaults to the boot VSI; multi-queue ADD_VSI will update it */
+    d->io.rss_vsi_num = d->io.vsi_num;
     return 0;
 }
 
@@ -943,51 +948,71 @@ static uint8_t ilog2_u16(uint16_t v)
     return r;
 }
 
-static int aq_update_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
-                             uint16_t first_hw_q)
+/*
+ * aq_add_vsi_rss — create a NEW VSI (ADD_VSI 0x0210) with multi-queue mapping.
+ *
+ * The default boot PF VSI rejects UPDATE_VSI (0x0211) with ENOTTY because it
+ * was created by firmware at init and its VSI type doesn't allow remapping.
+ * The kernel always creates a fresh VSI via ADD_VSI instead.  We do the same:
+ * the new VSI gets the correct q_mapping + tc_mapping so the firmware can
+ * resolve RSS LUT entries {0,1,...,N-1} to their actual hardware queue IDs.
+ */
+static int aq_add_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
+                           uint16_t first_hw_q, uint16_t *out_vsi_num)
 {
     struct ice_aqc_vsi_props props;
     struct ice_aq_desc desc;
 
-    /*
-     * UPDATE_VSI only applies sections flagged in valid_sections.
-     *
-     * q_mapping[0] in contiguous mode = absolute hardware base queue number.
-     * tc_mapping[0] encodes (VSI-relative queue offset << 0) |
-     *                        (log2(num_queues) << 11) for TC0.
-     */
     memset(&props, 0, sizeof(props));
-    props.valid_sections = htole16(ICE_AQ_VSI_PROP_RXQ_MAP_VALID |
+    props.valid_sections = htole16(ICE_AQ_VSI_PROP_SW_VALID |
+                                   ICE_AQ_VSI_PROP_RXQ_MAP_VALID |
                                    ICE_AQ_VSI_PROP_Q_OPT_VALID);
+
+    /* switch section: connect to the same switch domain as the boot VSI */
+    props.sw_id = d->io.sw_id;
+
+    /* queue mapping section */
     props.mapping_flags = htole16(ICE_AQ_VSI_Q_MAP_CONTIG);
-
-    /* absolute starting hardware queue — NOT the tc-encoded log2 value */
     props.q_mapping[0] = htole16(first_hw_q);
-
-    /* TC0: VSI-relative offset=0, log2(num_rxqs) queues */
     props.tc_mapping[0] = htole16(
         (0 << ICE_AQ_VSI_TC_Q_OFFSET_S) |
         ((uint16_t)ilog2_u16(num_rxqs) << ICE_AQ_VSI_TC_Q_NUM_S));
 
-    /* RSS options: PF LUT (PF VSI uses PF-level LUT), Toeplitz hash */
+    /* RSS opts: PF LUT, Toeplitz hash */
     props.q_opt_rss = (uint8_t)(
         (ICE_AQ_VSI_Q_OPT_RSS_LUT_PF << ICE_AQ_VSI_Q_OPT_RSS_LUT_S) |
         (ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ << ICE_AQ_VSI_Q_OPT_RSS_HASH_S));
 
-    /* kernel uses fill_dflt_direct_cmd_desc (SI) + RD for this command */
-    fill_dflt_direct_desc(&desc, ICE_AQC_OPC_UPDATE_VSI);
-    desc.flags = htole16(le16toh(desc.flags) | ICE_AQ_FLAG_RD);
-    desc.params.vsi_cmd.vsi_num = htole16(d->io.vsi_num | ICE_AQ_VSI_IS_VALID);
+    memset(&desc, 0, sizeof(desc));
+    desc.opcode = htole16(ICE_AQC_OPC_ADD_VSI);
+    desc.flags = htole16(ICE_AQ_FLAG_RD);
+    /* vsi_num = 0 | IS_VALID: firmware assigns the new VSI number */
+    desc.params.vsi_cmd.vsi_num = htole16(ICE_AQ_VSI_IS_VALID);
 
     if (aq_send_cmd(d, &desc, &props, sizeof(props)) < 0) {
-        fprintf(stderr,
-                "[my_ice] UPDATE_VSI failed (non-fatal) — RSS key/LUT will still be programmed\n");
+        fprintf(stderr, "[my_ice] ADD_VSI failed\n");
         return -1;
     }
 
-    fprintf(stderr, "[my_ice] UPDATE_VSI ok: first_hw_q=%u num_rxqs=%u log2=%u\n",
-            first_hw_q, num_rxqs, ilog2_u16(num_rxqs));
+    /* firmware returns the assigned VSI number with IS_VALID set */
+    *out_vsi_num = le16toh(desc.params.vsi_cmd.vsi_num) & (uint16_t)~ICE_AQ_VSI_IS_VALID;
+    fprintf(stderr, "[my_ice] ADD_VSI ok: new_vsi=%u (boot_vsi=%u) sw_id=%u first_hw_q=%u num_rxqs=%u\n",
+            *out_vsi_num, d->io.vsi_num, d->io.sw_id, first_hw_q, num_rxqs);
     return 0;
+}
+
+static void aq_free_vsi(struct dev_ctx *d, uint16_t vsi_num)
+{
+    struct ice_aq_desc desc;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.opcode = htole16(ICE_AQC_OPC_FREE_VSI);
+    desc.params.vsi_cmd.vsi_num = htole16(vsi_num | ICE_AQ_VSI_IS_VALID);
+
+    if (aq_send_cmd(d, &desc, NULL, 0) < 0)
+        fprintf(stderr, "[my_ice] FREE_VSI failed for vsi=%u (non-fatal)\n", vsi_num);
+    else
+        fprintf(stderr, "[my_ice] FREE_VSI ok: vsi=%u\n", vsi_num);
 }
 
 static int aq_set_rss_key(struct dev_ctx *d)
@@ -1012,7 +1037,7 @@ static int aq_set_rss_key(struct dev_ctx *d)
     desc.opcode = htole16(ICE_AQC_OPC_SET_RSS_KEY);
     desc.flags = htole16(ICE_AQ_FLAG_RD);
     desc.params.get_set_rss_key.vsi_id =
-        htole16(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID);
+        htole16(d->io.rss_vsi_num | ICE_AQC_RSS_VSI_VALID);
 
     if (aq_send_cmd(d, &desc, &key_data, sizeof(key_data)) < 0) {
         fprintf(stderr, "[my_ice] SET_RSS_KEY failed\n");
@@ -1041,7 +1066,7 @@ static int aq_set_rss_lut(struct dev_ctx *d, uint16_t num_rxqs)
     desc.opcode = htole16(ICE_AQC_OPC_SET_RSS_LUT);
     desc.flags = htole16(ICE_AQ_FLAG_RD);
     desc.params.get_set_rss_lut.vsi_id =
-        htole16(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID);
+        htole16(d->io.rss_vsi_num | ICE_AQC_RSS_VSI_VALID);
     desc.params.get_set_rss_lut.flags =
         htole16(ICE_AQC_LUT_FLAG_PF);
 
@@ -1082,7 +1107,7 @@ static int aq_add_rx_mac_rule(struct dev_ctx *d, uint16_t *rule_idx)
     rule.hdr.type = htole16(ICE_AQC_SW_RULES_T_LKUP_RX);
     rule.recipe_id = htole16(ICE_SW_LKUP_MAC);
     rule.src = htole16(d->io.lport);
-    act |= ((uint32_t)d->io.vsi_num << ICE_SINGLE_ACT_VSI_ID_S) &
+    act |= ((uint32_t)d->io.rss_vsi_num << ICE_SINGLE_ACT_VSI_ID_S) &
            ICE_SINGLE_ACT_VSI_ID_M;
     act |= ICE_SINGLE_ACT_VSI_FORWARDING | ICE_SINGLE_ACT_VALID_BIT;
     rule.act = htole32(act);
@@ -1375,9 +1400,9 @@ static int setup_all_rxqs(struct dev_ctx *d, bool use_pool)
 
     /* Configure RSS when multiple queues are active */
     if (d->rxq_count > 1) {
-        /* Non-fatal: firmware may reject UPDATE_VSI on the default boot
-         * VSI; the RSS key and LUT are still worth programming. */
-        aq_update_vsi_rss(d, d->rxq_count, first_q);
+        uint16_t new_vsi = 0;
+        if (aq_add_vsi_rss(d, d->rxq_count, first_q, &new_vsi) == 0)
+            d->io.rss_vsi_num = new_vsi;
         if (aq_set_rss_key(d) < 0)
             return -1;
         if (aq_set_rss_lut(d, d->rxq_count) < 0)
@@ -1729,8 +1754,8 @@ static int run_rx_listen(struct dev_ctx *d, int timeout_ms)
         goto out;
     }
 
-    gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                     GLV_GORCH(d->io.vsi_num));
+    gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.rss_vsi_num),
+                                     GLV_GORCH(d->io.rss_vsi_num));
 
     for (i = 0; i < timeout_ms; i++) {
         uint16_t qi;
@@ -1764,15 +1789,17 @@ static int run_rx_listen(struct dev_ctx *d, int timeout_ms)
             usleep(1000);
     }
 
-    gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                    GLV_GORCH(d->io.vsi_num));
+    gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.rss_vsi_num),
+                                    GLV_GORCH(d->io.rss_vsi_num));
     fprintf(stderr, "[my_ice] rx-listen timeout, VSI%u GORC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, gorc_after - gorc_before);
+            d->io.rss_vsi_num, gorc_after - gorc_before);
     dump_rx_desc_snapshot(d, &d->rxqs[0]);
     dump_mdet_regs(d);
 
 out:
     aq_remove_sw_rule_best_effort(d, ICE_AQC_SW_RULES_T_LKUP_RX, rx_mac_rule_idx);
+    if (d->io.rss_vsi_num != d->io.vsi_num)
+        aq_free_vsi(d, d->io.rss_vsi_num);
     return rc;
 }
 
@@ -1853,10 +1880,10 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
             d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms);
 
-    gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                     GLV_GORCH(d->io.vsi_num));
-    gotc_before = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                     GLV_GOTCH(d->io.vsi_num));
+    gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.rss_vsi_num),
+                                     GLV_GORCH(d->io.rss_vsi_num));
+    gotc_before = read_glv_counter64(d, GLV_GOTCL(d->io.rss_vsi_num),
+                                     GLV_GOTCH(d->io.rss_vsi_num));
     start_ns = monotonic_ns();
 
     while (monotonic_ns() - start_ns < (uint64_t)timeout_ms * 1000000ULL) {
@@ -1977,10 +2004,10 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
 
     (void)tx_wait_drain(d, q, 1000);
     now_ns = monotonic_ns();
-    gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                    GLV_GORCH(d->io.vsi_num));
-    gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                    GLV_GOTCH(d->io.vsi_num));
+    gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.rss_vsi_num),
+                                    GLV_GORCH(d->io.rss_vsi_num));
+    gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.rss_vsi_num),
+                                    GLV_GOTCH(d->io.rss_vsi_num));
     fprintf(stderr,
             "[my_ice] rx-reflect done: seconds=%.3f rx_pkts=%" PRIu64 " rx_bytes=%" PRIu64
             " tx_pkts=%" PRIu64 " tx_bytes=%" PRIu64
@@ -1990,7 +2017,7 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
             " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
             (double)(now_ns - start_ns) / 1e9,
             rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
-            tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
+            tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.rss_vsi_num,
             gorc_after - gorc_before, gotc_after - gotc_before);
 
     if (d->rxq_count > 1) {
@@ -2009,6 +2036,8 @@ out:
     free(per_q_rx_pkts);
     free(per_q_rx_bytes);
     aq_remove_sw_rule_best_effort(d, ICE_AQC_SW_RULES_T_LKUP_RX, rx_mac_rule_idx);
+    if (d->io.rss_vsi_num != d->io.vsi_num)
+        aq_free_vsi(d, d->io.rss_vsi_num);
     return rc;
 }
 
