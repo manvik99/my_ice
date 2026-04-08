@@ -969,9 +969,9 @@ static int aq_update_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
         (0 << ICE_AQ_VSI_TC_Q_OFFSET_S) |
         ((uint16_t)ilog2_u16(num_rxqs) << ICE_AQ_VSI_TC_Q_NUM_S));
 
-    /* RSS options: VSI LUT, Toeplitz hash */
+    /* RSS options: PF LUT (PF VSI uses PF-level LUT), Toeplitz hash */
     props.q_opt_rss = (uint8_t)(
-        (ICE_AQ_VSI_Q_OPT_RSS_LUT_VSI << ICE_AQ_VSI_Q_OPT_RSS_LUT_S) |
+        (ICE_AQ_VSI_Q_OPT_RSS_LUT_PF << ICE_AQ_VSI_Q_OPT_RSS_LUT_S) |
         (ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ << ICE_AQ_VSI_Q_OPT_RSS_HASH_S));
 
     /* kernel uses fill_dflt_direct_cmd_desc (SI) + RD for this command */
@@ -1025,11 +1025,16 @@ static int aq_set_rss_key(struct dev_ctx *d)
 
 static int aq_set_rss_lut(struct dev_ctx *d, uint16_t num_rxqs)
 {
-    uint8_t lut[ICE_AQC_LUT_VSI_SIZE];
+    /*
+     * PF VSI uses the PF-level LUT (512 entries, type=1 in AQ flags).
+     * Writing to the VSI LUT (type=0) has no effect because the firmware
+     * routes RSS hash lookups through the PF LUT for PF VSIs.
+     */
+    uint8_t lut[ICE_AQC_LUT_PF_SIZE];
     struct ice_aq_desc desc;
     uint16_t i;
 
-    for (i = 0; i < ICE_AQC_LUT_VSI_SIZE; i++)
+    for (i = 0; i < ICE_AQC_LUT_PF_SIZE; i++)
         lut[i] = (uint8_t)(i % num_rxqs);
 
     memset(&desc, 0, sizeof(desc));
@@ -1038,15 +1043,15 @@ static int aq_set_rss_lut(struct dev_ctx *d, uint16_t num_rxqs)
     desc.params.get_set_rss_lut.vsi_id =
         htole16(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID);
     desc.params.get_set_rss_lut.flags =
-        htole16(ICE_AQC_LUT_FLAG_VSI_SIZE);
+        htole16(ICE_AQC_LUT_FLAG_PF);
 
     if (aq_send_cmd(d, &desc, lut, sizeof(lut)) < 0) {
         fprintf(stderr, "[my_ice] SET_RSS_LUT failed\n");
         return -1;
     }
 
-    fprintf(stderr, "[my_ice] SET_RSS_LUT ok: %u entries, %u queues\n",
-            ICE_AQC_LUT_VSI_SIZE, num_rxqs);
+    fprintf(stderr, "[my_ice] SET_RSS_LUT ok: %u entries (PF LUT), %u queues\n",
+            ICE_AQC_LUT_PF_SIZE, num_rxqs);
     return 0;
 }
 

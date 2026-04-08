@@ -486,6 +486,7 @@ struct ice_ctx_ele {
 #define ICE_AQ_VSI_Q_OPT_RSS_LUT_S     0
 #define ICE_AQ_VSI_Q_OPT_RSS_LUT_M     (0x3U << ICE_AQ_VSI_Q_OPT_RSS_LUT_S)
 #define ICE_AQ_VSI_Q_OPT_RSS_LUT_VSI   0x0U
+#define ICE_AQ_VSI_Q_OPT_RSS_LUT_PF    0x1U
 #define ICE_AQ_VSI_Q_OPT_RSS_HASH_S    6
 #define ICE_AQ_VSI_Q_OPT_RSS_HASH_M    (0x3U << ICE_AQ_VSI_Q_OPT_RSS_HASH_S)
 #define ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ 0x0U
@@ -501,6 +502,9 @@ struct ice_ctx_ele {
 /* RSS LUT sizes */
 #define ICE_AQC_LUT_VSI_SIZE            64
 #define ICE_AQC_LUT_FLAG_VSI_SIZE       0x0000
+#define ICE_AQC_LUT_PF_SIZE             512
+/* PF LUT flags: type=1 (bits[1:0]), size_code=1=512 (bits[3:2]) */
+#define ICE_AQC_LUT_FLAG_PF             0x0005
 
 /* ---- VSI properties (indirect buffer for GET_VSI / UPDATE_VSI) ---- */
 
