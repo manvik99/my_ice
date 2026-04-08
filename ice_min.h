@@ -312,21 +312,34 @@ struct ice_aqc_add_tx_qgrp {
     struct ice_aqc_add_txqs_perq txqs[STRUCT_HACK_VAR_LEN];
 } __attribute__((packed));
 
-/* Add/Get/Update/Free VSI (0x0210/0x0212/0x0211/0x0213) */
+/* Add/Get/Update/Free VSI (0x0210/0x0212/0x0211/0x0213)
+ *
+ * Kernel struct: ice_aqc_add_get_update_free_vsi (ice_adminq_cmd.h:134)
+ *   offset 0  (2B): vsi_num       — bits[9:0]=VSI#, bit[15]=IS_VALID
+ *   offset 2  (1B): cmd_flags
+ *   offset 3  (1B): vf_id
+ *   offset 4  (2B): vsi_flags     — bits[5:4] = VSI type (0=VF, 2=PF)
+ *   offset 6  (2B): act_q_pairs
+ *   offset 8  (4B): addr_high     — DMA buffer addr (ice_aqc_vsi_props)
+ *   offset 12 (4B): addr_low
+ *
+ * Previously cmd_flags was uint16_t (2B), which shifted vsi_flags to
+ * offset 6 instead of 4. Firmware read vsi_flags=0 (type=VF) → EINVAL.
+ */
 struct ice_aqc_vsi_cmd {
     uint16_t vsi_num;
 #define ICE_AQ_VSI_IS_VALID             BIT(15)
-    uint16_t cmd_flags;
-    uint8_t vf_id;
-    uint8_t reserved;
+    uint8_t  cmd_flags;
+    uint8_t  vf_id;
     uint16_t vsi_flags;
 #define ICE_AQ_VSI_TYPE_S               4
 #define ICE_AQ_VSI_TYPE_M               (0x3U << ICE_AQ_VSI_TYPE_S)
 #define ICE_AQ_VSI_TYPE_VF              0x0U
 #define ICE_AQ_VSI_TYPE_PF              0x2U
+    uint16_t act_q_pairs;
     uint32_t addr_high;
     uint32_t addr_low;
-};
+} __attribute__((packed));
 
 /* Get/Set RSS key (indirect 0x0B04/0x0B02) */
 struct ice_aqc_get_set_rss_key_cmd {

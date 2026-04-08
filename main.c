@@ -993,12 +993,13 @@ static int aq_add_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
     desc.params.vsi_cmd.vsi_flags = htole16((uint16_t)(ICE_AQ_VSI_TYPE_PF << ICE_AQ_VSI_TYPE_S));
 
     fprintf(stderr,
-            "[my_ice] ADD_VSI sending: desc_flags=0x%04x opcode=0x%04x vsi_num=0x%04x cmd_flags=0x%04x vf_id=0x%02x vsi_flags=0x%04x\n",
+            "[my_ice] ADD_VSI sending: desc_flags=0x%04x opcode=0x%04x vsi_num=0x%04x cmd_flags=0x%02x vf_id=0x%02x vsi_flags=0x%04x act_q_pairs=%u\n",
             le16toh(desc.flags), le16toh(desc.opcode),
             le16toh(desc.params.vsi_cmd.vsi_num),
-            le16toh(desc.params.vsi_cmd.cmd_flags),
+            desc.params.vsi_cmd.cmd_flags,
             desc.params.vsi_cmd.vf_id,
-            le16toh(desc.params.vsi_cmd.vsi_flags));
+            le16toh(desc.params.vsi_cmd.vsi_flags),
+            le16toh(desc.params.vsi_cmd.act_q_pairs));
     fprintf(stderr,
             "[my_ice] ADD_VSI props: valid_sections=0x%04x sw_id=%u mapping_flags=0x%04x"
             " q_mapping[0]=%u tc_mapping[0]=0x%04x q_opt_rss=0x%02x\n",
@@ -1010,9 +1011,8 @@ static int aq_add_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
         /* dump the completion descriptor for diagnosis */
         const uint8_t *rp = (const uint8_t *)&desc.params;
         fprintf(stderr,
-                "[my_ice] ADD_VSI failed: resp_flags=0x%04x retval=0x%04x"
-                " resp_vsi_num=0x%04x resp_vsi_flags=0x%04x\n",
-                le16toh(desc.flags), le16toh(desc.retval),
+                "[my_ice] ADD_VSI failed (retval=0x%04x = EINVAL): resp_vsi_num=0x%04x resp_vsi_flags=0x%04x\n",
+                le16toh(desc.retval),
                 le16toh(desc.params.vsi_cmd.vsi_num),
                 le16toh(desc.params.vsi_cmd.vsi_flags));
         fprintf(stderr,
