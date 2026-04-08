@@ -650,6 +650,36 @@ static void fill_dflt_direct_desc(struct ice_aq_desc *desc, uint16_t opcode)
     desc->flags = htole16(ICE_AQ_FLAG_SI);
 }
 
+static int do_pf_reset(struct dev_ctx *d)
+{
+    uint32_t reg;
+    int i;
+
+    fprintf(stderr, "[my_ice] triggering PF reset...\n");
+
+    reg = reg_read32(d, PFGEN_CTRL);
+    reg_write32(d, PFGEN_CTRL, reg | PFGEN_CTRL_PFSWR_M);
+
+    for (i = 0; i < 2000; i++) {
+        usleep(1000);
+        reg = reg_read32(d, PFGEN_CTRL);
+        if (!(reg & PFGEN_CTRL_PFSWR_M)) {
+            fprintf(stderr, "[my_ice] PF reset complete after %d ms\n", i + 1);
+            reg = reg_read32(d, GLGEN_RSTAT);
+            if ((reg & GLGEN_RSTAT_DEVSTATE_M) != 0)
+                fprintf(stderr, "[my_ice] warning: GLGEN_RSTAT devstate=%u (expected 0)\n",
+                        reg & GLGEN_RSTAT_DEVSTATE_M);
+            return 0;
+        }
+    }
+
+    fprintf(stderr, "[my_ice] PF reset timeout\n");
+    return -1;
+}
+
+/* forward declaration — aq_clear_pf_cfg is defined after aq_send_cmd */
+static int aq_clear_pf_cfg(struct dev_ctx *d);
+
 static void adminq_hw_init(struct dev_ctx *d)
 {
     uint32_t i;
@@ -768,6 +798,19 @@ static int aq_send_cmd(struct dev_ctx *d, struct ice_aq_desc *desc, void *buf, u
         return -1;
     }
 
+    return 0;
+}
+
+static int aq_clear_pf_cfg(struct dev_ctx *d)
+{
+    struct ice_aq_desc desc;
+
+    fill_dflt_direct_desc(&desc, ICE_AQC_OPC_CLEAR_PF_CFG);
+    if (aq_send_cmd(d, &desc, NULL, 0) < 0) {
+        fprintf(stderr, "[my_ice] CLEAR_PF_CFG failed\n");
+        return -1;
+    }
+    fprintf(stderr, "[my_ice] CLEAR_PF_CFG ok\n");
     return 0;
 }
 
@@ -967,11 +1010,13 @@ static int aq_add_vsi_rss(struct dev_ctx *d, uint16_t num_rxqs,
 
     memset(&props, 0, sizeof(props));
     props.valid_sections = htole16(ICE_AQ_VSI_PROP_SW_VALID |
+                                   ICE_AQ_VSI_PROP_SEC_VALID |
                                    ICE_AQ_VSI_PROP_RXQ_MAP_VALID |
                                    ICE_AQ_VSI_PROP_Q_OPT_VALID);
 
     /* switch section: connect to the same switch domain as the boot VSI */
     props.sw_id = d->io.sw_id;
+    props.sw_flags2 = ICE_AQ_VSI_SW_FLAG_LAN_ENA;
 
     /* queue mapping section */
     props.mapping_flags = htole16(ICE_AQ_VSI_Q_MAP_CONTIG);
@@ -2800,6 +2845,15 @@ int main(int argc, char **argv)
     dma_map(&d, dma_map_bytes);
     layout_dma(&d);
     pkt_pool_init(&d);
+
+    /*
+     * PF Reset: puts the NIC's PF in a known state, clearing stale
+     * firmware config (VSIs, switch rules, queue mappings).
+     * After reset the AQ registers are wiped, so we re-init them.
+     */
+    if (do_pf_reset(&d) < 0)
+        goto out;
+
     adminq_hw_init(&d);
 
     fprintf(stderr, "[my_ice] adminq initialized, sending GET_VER\n");
@@ -2811,10 +2865,17 @@ int main(int argc, char **argv)
         goto out;
 
     /*
+     * CLEAR_PF_CFG (0x02A4): tells firmware to wipe all PF-level
+     * configuration (VSIs, switch rules, etc.) so we can start fresh.
+     * The kernel ice driver sends this right after MAC read, before
+     * CLEAR_PXE_MODE.
+     */
+    if (aq_clear_pf_cfg(&d) < 0)
+        goto out;
+
+    /*
      * CLEAR_PXE_MODE (0x0110): transitions firmware from pre-boot/PXE
-     * ownership to PF-driver mode.  Without this, VSI management commands
-     * (ADD_VSI 0x0210, UPDATE_VSI 0x0211) return ENOTTY (0x000e).
-     * The kernel ice driver sends this immediately after MANAGE_MAC_READ.
+     * ownership to PF-driver mode.
      */
     {
         struct ice_aq_desc cpxe_desc;

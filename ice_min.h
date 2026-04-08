@@ -78,6 +78,12 @@
 #define PF_MDET_RX                  0x00294280
 #define PF_MDET_RX_VALID_M          BIT(0)
 
+/* PF reset & status registers */
+#define PFGEN_CTRL                  0x00091000
+#define PFGEN_CTRL_PFSWR_M         BIT(0)
+#define GLGEN_RSTAT                 0x000B8188
+#define GLGEN_RSTAT_DEVSTATE_M      0x3U
+
 /* Per-VSI traffic counters */
 #define GLV_GOTCL(vsi)              (0x00300000 + ((vsi) * 8U))
 #define GLV_GOTCH(vsi)              (0x00300004 + ((vsi) * 8U))
@@ -100,6 +106,7 @@
 #define ICE_AQC_OPC_GET_DFLT_TOPO   0x0400
 #define ICE_AQC_OPC_SET_MAC_LB      0x0620
 #define ICE_AQC_OPC_SET_PHY_LB      0x0619
+#define ICE_AQC_OPC_CLEAR_PF_CFG    0x02A4
 #define ICE_AQC_OPC_ADD_VSI         0x0210
 #define ICE_AQC_OPC_UPDATE_VSI      0x0211
 #define ICE_AQC_OPC_FREE_VSI        0x0213
@@ -493,8 +500,12 @@ struct ice_ctx_ele {
 
 /* VSI context valid_sections bits */
 #define ICE_AQ_VSI_PROP_SW_VALID        BIT(0)
+#define ICE_AQ_VSI_PROP_SEC_VALID       BIT(1)
 #define ICE_AQ_VSI_PROP_RXQ_MAP_VALID   BIT(6)
 #define ICE_AQ_VSI_PROP_Q_OPT_VALID     BIT(7)
+
+/* Switch section sw_flags2 */
+#define ICE_AQ_VSI_SW_FLAG_LAN_ENA      BIT(4)
 
 /* Queue mapping flags */
 #define ICE_AQ_VSI_Q_MAP_CONTIG         0x0000
