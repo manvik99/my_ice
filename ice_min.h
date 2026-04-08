@@ -16,10 +16,10 @@
 #define ICE_AQ_NUM_DESC 64
 
 /* Datapath demo sizing */
-#define ICE_TX_DESC_COUNT 128
-#define ICE_RX_DESC_COUNT 128
-#define ICE_RX_BUF_SIZE 2048
-#define ICE_TX_PKT_BUF_SIZE 2048
+#define ICE_TX_DESC_COUNT 2048
+#define ICE_RX_DESC_COUNT 2048
+#define ICE_RX_BUF_SIZE 128
+#define ICE_TX_PKT_BUF_SIZE 128
 
 /* PF FW AdminQ registers (BAR0 offsets) */
 #define PF_FW_ATQBAL                0x00080000

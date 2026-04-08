@@ -22,6 +22,8 @@ The most important files are:
 - [`ice_min.h`](ice_min.h)
 - [`ixy-memory-model.md`](ixy-memory-model.md)
 - [`RX_TX_REFLECTOR_DESIGN.md`](RX_TX_REFLECTOR_DESIGN.md)
+- [`RX_REFLECT_BATCHING_DEEP_DIVE.md`](RX_REFLECT_BATCHING_DEEP_DIVE.md)
+- [`PKT_BUF_ALLOCATOR_ARCHITECTURE.md`](PKT_BUF_ALLOCATOR_ARCHITECTURE.md)
 
 The current reflector implementation follows the zero-copy ownership model from `ixy-memory-model.md`, not the older copy-first phase described in `RX_TX_REFLECTOR_DESIGN.md`.
 
@@ -44,21 +46,21 @@ These links are repo-relative so local Markdown viewers can open them. If your v
   - [`aq_add_rx_mac_rule()`](main.c#L922)
 - Tx queue creation: [`add_tx_queues()`](main.c#L1007)
 - Rx queue setup:
-  - flat Rx buffer mode: [`setup_and_enable_rxq()`](main.c#L1145)
-  - pool-backed Rx mode: [`setup_and_enable_rxq_pool()`](main.c#L1161)
+  - flat Rx buffer mode: [`setup_and_enable_rxq()`](main.c#L1216)
+  - pool-backed Rx mode: [`setup_and_enable_rxq_pool()`](main.c#L1232)
 - Tx ring lifecycle:
-  - init: [`tx_ring_init()`](main.c#L1181)
-  - completion/recycle: [`tx_update_free()`](main.c#L1196)
+  - init: [`tx_ring_init()`](main.c#L1252)
+  - completion/recycle: [`tx_update_free()`](main.c#L1267)
 - Rx polling and rearm:
-  - descriptor completion scan: [`poll_one_rx_desc()`](main.c#L1224)
-  - repost buffer to hardware: [`rearm_rx_desc()`](main.c#L1363)
+  - burst descriptor completion scan: [`poll_rx_batch()`](main.c#L1295)
+  - repost buffers to hardware: [`rearm_rx_desc_batch()`](main.c#L1443)
 - Tx enqueue helpers:
-  - queue-owned copy/static-buffer path: [`tx_try_enqueue()`](main.c#L1296)
-  - zero-copy pooled-buffer path: [`tx_try_enqueue_pkt_buf()`](main.c#L1326)
-- In-place reflect MAC rewrite: [`rewrite_reflect_l2()`](main.c#L1481)
+  - queue-owned copy/static-buffer path: [`tx_try_enqueue()`](main.c#L1387)
+  - zero-copy pooled-buffer burst path: [`tx_try_enqueue_pkt_buf_batch()`](main.c#L1417)
+- In-place reflect MAC rewrite: [`rewrite_reflect_l2()`](main.c#L1596)
 - Runtime modes:
-  - listen: [`run_rx_listen()`](main.c#L1490)
-  - reflect: [`run_rx_reflect()`](main.c#L1566)
+  - listen: [`run_rx_listen()`](main.c#L1605)
+  - reflect: [`run_rx_reflect()`](main.c#L1681)
   - single-shot Tx: [`run_tx_send()`](main.c#L1768)
   - Tx benchmark: [`run_tx_bench()`](main.c#L1928)
 - Shutdown: [`cleanup()`](main.c#L2132)
@@ -176,7 +178,10 @@ Important fields:
 - `base`, `base_iova`: start of the DMA-backed pool region
 - `entry_size`: fixed stride between packet objects
 - `num_entries`: total number of packet buffers
-- `free_stack_top` and `free_stack[]`: a simple LIFO free-stack allocator
+- `free_head`: next free entry index to hand out
+- `free_tail`: next slot where a returned entry index is appended
+- `free_count`: number of currently free entries
+- `free_ring[]`: a fixed-size circular queue of stable mempool indices
 
 The pool size formula is implemented in [`reflect_pool_entry_count()`](main.c#L299):
 
@@ -288,7 +293,7 @@ The reflect mempool DMA region is placed at:
 
 - `d->io.rx_pkt_bufs`
 - `q->tx_pkt_buf_refs` for every allocated Tx queue
-- `d->reflect_pool.free_stack`
+- `d->reflect_pool.free_ring`
 
 These arrays are normal heap allocations. They are not DMA-visible. They exist purely so software can map descriptor slots back to `pkt_buf*`.
 
@@ -299,7 +304,7 @@ These arrays are normal heap allocations. They are not DMA-visible. They exist p
 - computes the per-entry DMA address that points at `pkt_buf.data`
 - stores `mempool` and `mempool_idx`
 - zeroes `size`
-- populates the free stack
+- populates the circular free queue with every stable pool index
 
 Allocation and free are intentionally simple:
 
@@ -310,25 +315,32 @@ There is no refcounting. Ownership is single-owner at every step.
 
 ### How the mempool allocator actually works
 
-The allocator is intentionally tiny and ixy-like.
+The allocator is intentionally tiny and still ixy-like, but it now uses a
+single-producer/single-consumer style circular queue of free indices instead of
+a LIFO stack.
 
 Allocation path:
 
-- [`pkt_buf_alloc()`](main.c#L356) decrements `free_stack_top`
-- it reads one stable slot index from `free_stack[]`
+- [`pkt_buf_alloc()`](main.c#L356) reads the stable slot index at `free_head`
+- it advances `free_head` with wrap-around
+- it decrements `free_count`
 - it converts that index into a `pkt_buf*` with [`pkt_pool_get_entry()`](main.c#L309)
 - it resets `buf->size = 0`
 
 Free path:
 
 - [`pkt_buf_free()`](main.c#L371) looks at `buf->mempool`
-- it pushes `buf->mempool_idx` back onto that pool’s `free_stack[]`
-- it increments `free_stack_top`
+- it writes `buf->mempool_idx` into `free_ring[free_tail]`
+- it advances `free_tail` with wrap-around
+- it increments `free_count`
 
 Why this design matters:
 
 - the buffer always knows which pool it came from
 - the Tx completion path does not need to guess where to return it
+- allocation and recycle stay O(1) with one indexed load or store each
+- Rx replacement allocation always consumes from the queue head, while Tx
+  completion returns buffers at the tail
 - the recycle logic works even though the buffer was received on Rx and freed later from Tx completion
 
 ## AdminQ Control Plane
@@ -359,10 +371,10 @@ This split is important:
 
 There are two Rx queue setup paths:
 
-- flat-buffer Rx for listen mode: [`setup_and_enable_rxq()`](main.c#L1145)
-- pool-backed Rx for reflect mode: [`setup_and_enable_rxq_pool()`](main.c#L1161)
+- flat-buffer Rx for listen mode: [`setup_and_enable_rxq()`](main.c#L1216)
+- pool-backed Rx for reflect mode: [`setup_and_enable_rxq_pool()`](main.c#L1232)
 
-Both paths share the same hardware queue enable sequence through [`enable_rxq()`](main.c#L1092):
+Both paths share the same hardware queue enable sequence through [`enable_rxq()`](main.c#L1163):
 
 - program `QRXFLXP_CNTXT`
 - pack and write `QRX_CONTEXT`
@@ -374,8 +386,8 @@ Both paths share the same hardware queue enable sequence through [`enable_rxq()`
 The listen path keeps the older simple model:
 
 - each descriptor points to one fixed `rx_bufs` slice
-- [`poll_one_rx_packet()`](main.c#L1383) copies bytes out to a stack buffer
-- [`rearm_rx_desc()`](main.c#L1363) reposts the same Rx DMA buffer
+- [`poll_one_rx_packet()`](main.c#L1478) copies bytes out to a stack buffer
+- [`rearm_rx_desc()`](main.c#L1471) reposts the same Rx DMA buffer
 
 ### Reflect mode Rx
 
@@ -385,7 +397,8 @@ The reflect path uses the ixy-style pool-backed model:
 - `rx_pkt_bufs[idx]` tracks which pooled buffer belongs to slot `idx`
 - on completion, software allocates a replacement buffer before giving the completed one to Tx
 
-The descriptor completion scan itself is still done by [`poll_one_rx_desc()`](main.c#L1224):
+The descriptor completion scan is done by [`poll_rx_batch()`](main.c#L1295), and
+`poll_one_rx_desc()` simply wraps that helper for single-packet callers:
 
 - `DD` must be set
 - `EOF` must be set
@@ -394,25 +407,25 @@ The descriptor completion scan itself is still done by [`poll_one_rx_desc()`](ma
 
 ## Tx Queue Model
 
-Tx queue creation is done through [`add_tx_queues()`](main.c#L1007), and software ring state is reset in [`tx_ring_init()`](main.c#L1181).
+Tx queue creation is done through [`add_tx_queues()`](main.c#L1078), and software ring state is reset in [`tx_ring_init()`](main.c#L1252).
 
 There are two Tx enqueue paths:
 
-- queue-owned Tx buffers: [`tx_try_enqueue()`](main.c#L1296)
-- zero-copy pooled buffers: [`tx_try_enqueue_pkt_buf()`](main.c#L1326)
+- queue-owned Tx buffers: [`tx_try_enqueue()`](main.c#L1387)
+- zero-copy pooled buffers: [`tx_try_enqueue_pkt_buf_batch()`](main.c#L1417)
 
 Both enqueue styles share the same descriptor construction logic through:
 
-- [`tx_try_reserve_slot()`](main.c#L1256)
-- [`tx_prepare_desc()`](main.c#L1276)
-- [`tx_commit_slot()`](main.c#L1268)
-- [`tx_ring_doorbell()`](main.c#L1343)
+- [`tx_try_reserve_slot()`](main.c#L1347)
+- [`tx_prepare_desc()`](main.c#L1367)
+- [`tx_commit_slot()`](main.c#L1359)
+- [`tx_ring_doorbell()`](main.c#L1494)
 
-Tx completion and recycle happens in [`tx_update_free()`](main.c#L1196):
+Tx completion and recycle happens in [`tx_update_free()`](main.c#L1267):
 
 - read `QTX_COMM_HEAD(q)`
 - walk every completed slot from `tx_next_to_clean` to hardware head
-- if that slot carried a pooled `pkt_buf*`, return it to the mempool with [`pkt_buf_free()`](main.c#L371)
+- if that slot carried a pooled `pkt_buf*`, return it to the mempool with [`pkt_buf_free()`](main.c#L434)
 - recompute `tx_free`
 
 That is the key lifetime rule:
@@ -428,17 +441,17 @@ This section is the end-to-end ownership model for the current `--rx-reflect` im
 
 Software metadata arrays are created in:
 
-- [`alloc_queue_sw_state()`](main.c#L314)
+- [`alloc_queue_sw_state()`](main.c#L341)
 
 The DMA pool region itself is reserved in:
 
-- [`layout_dma()`](main.c#L593)
+- [`layout_dma()`](main.c#L632)
 
 ### 2. Pool entries are initialized
 
 Each pooled packet object is initialized in:
 
-- [`pkt_pool_init()`](main.c#L337)
+- [`pkt_pool_init()`](main.c#L364)
 
 At this point every buffer is:
 
@@ -450,7 +463,7 @@ At this point every buffer is:
 
 Reflect mode arms the Rx ring with pooled buffers in:
 
-- [`setup_and_enable_rxq_pool()`](main.c#L1161)
+- [`setup_and_enable_rxq_pool()`](main.c#L1232)
 
 For each descriptor slot:
 
@@ -469,58 +482,62 @@ When a packet arrives, hardware DMA-writes directly into the `pkt_buf.data` regi
 
 Software detects completion in:
 
-- [`poll_one_rx_desc()`](main.c#L1224)
+- [`poll_rx_batch()`](main.c#L1293)
 
 No packet payload copy occurs here.
 
-### 5. Software swaps in a fresh Rx buffer before handing off the old one
+### 5. Software swaps in fresh Rx buffers in a burst before handing off the old ones
 
 This is the most important zero-copy handoff step, implemented in:
 
-- [`run_rx_reflect()`](main.c#L1691)
-- [`run_rx_reflect()`](main.c#L1702)
-- [`rearm_rx_desc()`](main.c#L1363)
+- [`run_rx_reflect()`](main.c#L1681)
+- [`pkt_buf_alloc_batch()`](main.c#L408)
+- [`rearm_rx_desc_batch()`](main.c#L1443)
 
 The sequence is:
 
-1. allocate a replacement buffer from the pool
-2. remember the completed buffer in `rx_buf`
-3. install the replacement into `rx_pkt_bufs[rx_idx]`
-4. repost that replacement back to hardware with `rearm_rx_desc()`
+1. harvest a contiguous burst of completed descriptors with `poll_rx_batch()`
+2. count how many of those packets are valid reflect candidates
+3. allocate that many replacement buffers from the pool in one `pkt_buf_alloc_batch()` call
+4. remember each completed buffer in `rx_buf`
+5. install the replacement into `rx_pkt_bufs[rx_idx]`
+6. repost the whole burst back to hardware with one `rearm_rx_desc_batch()` call
 
-After that repost:
+After that burst repost:
 
 - the completed `rx_buf` is no longer attached to the Rx ring
 - the NIC can keep receiving with the replacement buffer
 - software is free to edit and transmit `rx_buf`
+- the replacement buffers came from the free-queue head, not from a LIFO reuse stack
+- `QRX_TAIL` advances once per processed burst instead of once per packet
 
 ### 6. The completed buffer is modified in place
 
 The reflect logic rewrites only L2 addresses in:
 
-- [`rewrite_reflect_l2()`](main.c#L1481)
+- [`rewrite_reflect_l2()`](main.c#L1596)
 
 The payload stays in the same DMA buffer.
 
 The exact MAC updates happen at:
 
-- [`main.c:1485`](main.c#L1485)
+- [`main.c:1611`](main.c#L1611)
   - copy the original source MAC into a temporary stack buffer
-- [`main.c:1486`](main.c#L1486)
+- [`main.c:1612`](main.c#L1612)
   - write the reflected destination MAC from that original source MAC
-- [`main.c:1487`](main.c#L1487)
+- [`main.c:1613`](main.c#L1613)
   - write the reflected source MAC from the local NIC MAC
 
 At the reflect call site, the rewrite happens here:
 
-- [`run_rx_reflect()` call at `main.c:1706`](main.c#L1706)
+- [`run_rx_reflect()`](main.c#L1860)
 
-### 7. The same buffer is queued directly to Tx
+### 7. The same buffers are queued directly to Tx as a burst
 
-The completed Rx buffer is submitted to Tx in:
+The completed Rx buffers are submitted to Tx in:
 
-- [`tx_try_enqueue_pkt_buf()`](main.c#L1326)
-- [`run_rx_reflect()`](main.c#L1710)
+- [`tx_try_enqueue_pkt_buf_batch()`](main.c#L1417)
+- [`run_rx_reflect()`](main.c#L1866)
 
 The Tx descriptor gets:
 
@@ -532,38 +549,43 @@ and the software side array gets:
 
 This is the actual zero-copy handoff.
 
-The exact Tx handoff happens immediately after the MAC rewrite:
+The exact Tx handoff happens immediately after the MAC rewrite burst:
 
-- MAC rewrite call: [`main.c:1706`](main.c#L1706)
-- zero-copy Tx handoff call: [`main.c:1710`](main.c#L1710)
+- MAC rewrite loop: [`run_rx_reflect()`](main.c#L1860)
+- zero-copy Tx handoff call: [`run_rx_reflect()`](main.c#L1866)
 
-Inside [`tx_try_enqueue_pkt_buf()`](main.c#L1326), the transfer into the Tx ring is:
+Inside [`tx_try_enqueue_pkt_buf_batch()`](main.c#L1417), the transfer into the Tx ring is:
 
-- [`main.c:1338`](main.c#L1338)
-  - program the Tx descriptor with `buf->buf_addr_iova`
-- [`main.c:1339`](main.c#L1339)
-  - store the same `pkt_buf*` in `tx_pkt_buf_refs[idx]` so completion can recycle it later
+- each Tx descriptor is programmed with `buf->buf_addr_iova`
+- the same `pkt_buf*` is stored in `tx_pkt_buf_refs[idx]` so completion can recycle it later
 
 So the hot-path order is:
 
-1. receive into pooled Rx buffer
-2. allocate replacement Rx buffer
-3. repost replacement to Rx
-4. rewrite MACs in the completed buffer at [`main.c:1706`](main.c#L1706)
-5. hand the same buffer to Tx at [`main.c:1710`](main.c#L1710)
-6. later recycle that same buffer from Tx completion in [`tx_update_free()`](main.c#L1196)
+1. receive into pooled Rx buffers
+2. allocate replacement Rx buffers for the valid packets in that burst
+3. repost the whole replacement burst to Rx with one `QRX_TAIL` update
+4. rewrite MACs in the completed buffers at [`run_rx_reflect()`](main.c#L1860)
+5. hand those same buffers to Tx at [`run_rx_reflect()`](main.c#L1866)
+6. ring Tx once for the burst in [`tx_ring_doorbell()`](main.c#L1494)
+7. later recycle those same buffers from Tx completion in [`tx_update_free()`](main.c#L1267)
 
 ### 8. Hardware transmits from that same DMA buffer
 
-Once [`tx_ring_doorbell()`](main.c#L1343) rings the queue, the NIC DMA-reads from the exact same memory region that Rx originally filled.
+Once [`tx_ring_doorbell()`](main.c#L1494) rings the queue, the NIC DMA-reads from the exact same memory region that Rx originally filled.
 
 No payload copy happens between Rx and Tx.
 
 ### 9. TX completion returns the buffer to the pool
 
-On later progress, [`tx_update_free()`](main.c#L1196) walks completed Tx slots and frees pooled buffers with:
+On later progress, [`tx_update_free()`](main.c#L1267) walks completed Tx slots and frees pooled buffers with:
 
-- [`pkt_buf_free()`](main.c#L371)
+- [`pkt_buf_free()`](main.c#L434)
+
+What happens inside that free:
+
+- the `pkt_buf` contributes only its stable `mempool_idx`
+- that index is appended at the mempool queue tail
+- the packet data itself never moves during recycle
 
 Ownership path for a reflected frame is therefore:
 
@@ -582,7 +604,7 @@ The queue-owned Tx helper is still used by:
 - `--tx-send`
 - `--tx-bench`
 
-That path lives in [`tx_try_enqueue()`](main.c#L1296) and still transmits from `q->tx_pkt_bufs`.
+That path lives in [`tx_try_enqueue()`](main.c#L1387) and still transmits from `q->tx_pkt_bufs`.
 
 So the zero-copy guarantee currently applies to:
 
@@ -625,8 +647,21 @@ Behavior:
 - rewrites only Ethernet source and destination MACs in place
 - queues the same DMA buffer directly to Tx
 - reclaims buffers only after Tx completion
+- prints one-second interval throughput reports in Gbps and Mpps
+- prints final average wire-rate and L2-rate summaries at shutdown
 
 This is now a zero-copy reflect path.
+
+The reflect throughput printouts use these formulas:
+
+- `wire_Gbps_est = ((bytes + packets * 24) * 8) / seconds / 1e9`
+- the extra `24` bytes are Ethernet wire overhead: `4` FCS + `8` preamble/SFD + `12` IFG
+- `l2_gbps = (bytes * 8) / seconds / 1e9`
+- `mpps = packets / seconds / 1e6`
+
+So for small packets the on-screen Gbps number is the estimated wire rate, while
+the final `*_l2_gbps` fields show the pure L2 byte rate from the software
+counters.
 
 ### Interpreting a tcpdump capture
 
