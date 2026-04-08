@@ -911,30 +911,32 @@ static int aq_get_default_vsi_and_lport(struct dev_ctx *d)
 
             if (type == ICE_AQC_GET_SW_CONF_RESP_PHYS_PORT && !got_lport) {
                 d->io.lport = (uint8_t)(num & 0xff);
+                d->io.sw_id = (uint8_t)(le16toh(buf[i].swid) & 0xff);
                 got_lport = true;
             }
 
             if (type == ICE_AQC_GET_SW_CONF_RESP_VSI && !got_vsi) {
                 d->io.vsi_num = num;
-                d->io.sw_id = (uint8_t)(le16toh(buf[i].swid) & 0xff);
                 got_vsi = true;
             }
         }
     } while (req_desc != 0);
 
-    if (!got_vsi) {
-        fprintf(stderr, "failed to discover default VSI number from GET_SW_CFG\n");
-        return -1;
-    }
     if (!got_lport) {
         fprintf(stderr, "failed to discover physical lport from GET_SW_CFG\n");
         return -1;
     }
 
-    /* rss_vsi_num defaults to the boot VSI; multi-queue ADD_VSI will update it */
-    d->io.rss_vsi_num = d->io.vsi_num;
-    fprintf(stderr, "[my_ice] GET_SW_CFG: vsi_num=%u sw_id=%u lport=%u\n",
-            d->io.vsi_num, d->io.sw_id, d->io.lport);
+    if (!got_vsi) {
+        /* Expected after CLEAR_PF_CFG — boot VSI wiped. ADD_VSI will create one. */
+        d->io.vsi_num = 0;
+        fprintf(stderr, "[my_ice] GET_SW_CFG: no boot VSI (expected after CLEAR_PF_CFG), sw_id=%u lport=%u\n",
+                d->io.sw_id, d->io.lport);
+    } else {
+        d->io.rss_vsi_num = d->io.vsi_num;
+        fprintf(stderr, "[my_ice] GET_SW_CFG: vsi_num=%u sw_id=%u lport=%u\n",
+                d->io.vsi_num, d->io.sw_id, d->io.lport);
+    }
     return 0;
 }
 
@@ -1473,11 +1475,20 @@ static int setup_all_rxqs(struct dev_ctx *d, bool use_pool)
     fprintf(stderr, "[my_ice] enabled %u RX queues (first_hw_q=%u)\n",
             d->rxq_count, first_q);
 
-    /* Configure RSS when multiple queues are active */
-    if (d->rxq_count > 1) {
+    /*
+     * Always create a fresh PF VSI via ADD_VSI.  After CLEAR_PF_CFG the
+     * boot VSI is gone; even for 1 queue we need a VSI context so the
+     * switch fabric can deliver packets to our queues.
+     */
+    {
         uint16_t new_vsi = 0;
-        if (aq_add_vsi_rss(d, d->rxq_count, first_q, &new_vsi) == 0)
-            d->io.rss_vsi_num = new_vsi;
+        if (aq_add_vsi_rss(d, d->rxq_count, first_q, &new_vsi) < 0)
+            return -1;
+        d->io.rss_vsi_num = new_vsi;
+    }
+
+    /* Configure RSS key + LUT when multiple queues are active */
+    if (d->rxq_count > 1) {
         if (aq_set_rss_key(d) < 0)
             return -1;
         if (aq_set_rss_lut(d, d->rxq_count) < 0)
