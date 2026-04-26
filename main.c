@@ -54,8 +54,6 @@
 static bool g_dump_topo = false;
 static bool g_qparent_override_set = false;
 static uint32_t g_qparent_override = 0;
-static atomic_uint g_rss_sample_budget = 10;
-
 struct pkt_mempool;
 
 struct pkt_buf {
@@ -104,6 +102,7 @@ struct rxq_ctx {
     uint64_t rx_bufs_iova;
     struct pkt_buf **rx_pkt_bufs;
     uint16_t rx_ntc;
+    bool rss_sampled;
 };
 
 struct io_ring_ctx {
@@ -1373,8 +1372,10 @@ static void assign_rx_queue_ids(struct dev_ctx *d, uint16_t first_q)
 {
     uint16_t i;
 
-    for (i = 0; i < d->io.rxq_count; i++)
+    for (i = 0; i < d->io.rxq_count; i++) {
         d->io.rxqs[i].rxq_id = (uint16_t)(first_q + i);
+        d->io.rxqs[i].rss_sampled = false;
+    }
 }
 
 static int add_tx_queues(struct dev_ctx *d, uint16_t count)
@@ -1599,41 +1600,358 @@ struct rss_xlt2_entry {
     uint16_t vsig;
 };
 
-static int aq_read_xlt2_rss(struct dev_ctx *d, uint16_t vsigs[ICE_XLT2_CNT])
+static int aq_upload_section(struct dev_ctx *d, void *buf, uint16_t buf_size)
 {
-    uint8_t buf[1600];
     struct ice_aq_desc desc;
-    uint16_t section_count = htole16(1);
-    uint16_t data_end = htole16((uint16_t)(12 + 4 + ICE_XLT2_CNT * 2));
-    uint32_t section_type = htole32(ICE_SID_XLT2_RSS);
-    uint16_t section_off = htole16(12);
-    uint16_t section_size = htole16((uint16_t)(4 + ICE_XLT2_CNT * 2));
-    uint16_t xlt2_count = htole16(ICE_XLT2_CNT);
-    uint16_t xlt2_offset = 0;
-    uint16_t i;
-
-    memset(buf, 0, sizeof(buf));
-    memcpy(buf + 0, &section_count, sizeof(section_count));
-    memcpy(buf + 2, &data_end, sizeof(data_end));
-    memcpy(buf + 4, &section_type, sizeof(section_type));
-    memcpy(buf + 8, &section_off, sizeof(section_off));
-    memcpy(buf + 10, &section_size, sizeof(section_size));
-    memcpy(buf + 12, &xlt2_count, sizeof(xlt2_count));
-    memcpy(buf + 14, &xlt2_offset, sizeof(xlt2_offset));
 
     fill_dflt_direct_desc(&desc, ICE_AQC_OPC_UPLOAD_SECTION);
     desc.flags = htole16(le16toh(desc.flags) | ICE_AQ_FLAG_RD);
-    if (aq_send_cmd(d, &desc, buf, sizeof(buf)) < 0)
+    return aq_send_cmd(d, &desc, buf, buf_size);
+}
+
+static int rss_build_section_request(void *buf, uint16_t buf_size, uint32_t section_type,
+                                     uint16_t section_size)
+{
+    struct ice_buf_hdr *hdr = buf;
+    struct ice_section_entry *entry;
+
+    if (!buf || buf_size < (uint16_t)(sizeof(*hdr) + sizeof(*entry) + section_size))
+        return -1;
+
+    memset(buf, 0, buf_size);
+    hdr->section_count = htole16(1);
+    hdr->data_end = htole16((uint16_t)(sizeof(*hdr) + sizeof(*entry) + section_size));
+    entry = hdr->section_entry;
+    entry->type = htole32(section_type);
+    entry->offset = htole16((uint16_t)(sizeof(*hdr) + sizeof(*entry)));
+    entry->size = htole16(section_size);
+    return 0;
+}
+
+static int aq_read_xlt2_rss(struct dev_ctx *d, uint16_t vsigs[ICE_XLT2_CNT])
+{
+    uint8_t buf[1600];
+    struct ice_xlt2_section *xlt2;
+    uint16_t i;
+
+    if (rss_build_section_request(buf, sizeof(buf), ICE_SID_XLT2_RSS,
+                                  (uint16_t)(sizeof(*xlt2) + ICE_XLT2_CNT * sizeof(uint16_t))) < 0)
+        return -1;
+
+    xlt2 = (struct ice_xlt2_section *)(buf + sizeof(struct ice_buf_hdr) +
+                                       sizeof(struct ice_section_entry));
+    xlt2->count = htole16(ICE_XLT2_CNT);
+    xlt2->offset = 0;
+
+    if (aq_upload_section(d, buf, sizeof(buf)) < 0)
         return -1;
 
     for (i = 0; i < ICE_XLT2_CNT; i++) {
         uint16_t v;
-        memcpy(&v, buf + 16 + (size_t)i * sizeof(uint16_t), sizeof(v));
+        memcpy(&v, xlt2->value + i, sizeof(v));
         vsigs[i] = le16toh(v);
     }
 
     fprintf(stderr, "[my_ice] RSS read XLT2 entries=%u\n", ICE_XLT2_CNT); // RSS:IMPL
     return 0;
+}
+
+static int aq_read_xlt1_rss(struct dev_ctx *d, uint8_t ptgs[ICE_XLT1_CNT])
+{
+    uint8_t buf[1200];
+    struct ice_xlt1_section *xlt1;
+
+    if (rss_build_section_request(buf, sizeof(buf), ICE_SID_XLT1_RSS,
+                                  (uint16_t)(sizeof(*xlt1) + ICE_XLT1_CNT)) < 0)
+        return -1;
+
+    xlt1 = (struct ice_xlt1_section *)(buf + sizeof(struct ice_buf_hdr) +
+                                       sizeof(struct ice_section_entry));
+    xlt1->count = htole16(ICE_XLT1_CNT);
+    xlt1->offset = 0;
+
+    if (aq_upload_section(d, buf, sizeof(buf)) < 0)
+        return -1;
+
+    memcpy(ptgs, xlt1->value, ICE_XLT1_CNT);
+    fprintf(stderr, "[my_ice] RSS read XLT1 entries=%u\n", ICE_XLT1_CNT); // RSS:IMPL
+    return 0;
+}
+
+static int aq_read_prof_redir_rss(struct dev_ctx *d, uint8_t prof_redir[ICE_RSS_PROF_ID_COUNT])
+{
+    uint8_t buf[160];
+    struct ice_prof_redir_section *redir;
+
+    if (rss_build_section_request(buf, sizeof(buf), ICE_SID_PROFID_REDIR_RSS,
+                                  (uint16_t)(sizeof(*redir) + ICE_RSS_PROF_ID_COUNT)) < 0)
+        return -1;
+
+    redir = (struct ice_prof_redir_section *)(buf + sizeof(struct ice_buf_hdr) +
+                                              sizeof(struct ice_section_entry));
+    redir->count = htole16(ICE_RSS_PROF_ID_COUNT);
+    redir->offset = 0;
+
+    if (aq_upload_section(d, buf, sizeof(buf)) < 0)
+        return -1;
+
+    memcpy(prof_redir, redir->redir_value, ICE_RSS_PROF_ID_COUNT);
+    fprintf(stderr, "[my_ice] RSS read PROFID_REDIR entries=%u\n", ICE_RSS_PROF_ID_COUNT); // RSS:IMPL
+    return 0;
+}
+
+static int aq_read_prof_tcam_rss(struct dev_ctx *d,
+                                 struct ice_prof_tcam_entry tcam[ICE_RSS_PROF_TCAM_COUNT])
+{
+    uint16_t base = 0;
+
+    memset(tcam, 0, sizeof(struct ice_prof_tcam_entry) * ICE_RSS_PROF_TCAM_COUNT);
+    while (base < ICE_RSS_PROF_TCAM_COUNT) {
+        uint8_t buf[ICE_AQ_MAX_BUF_LEN];
+        struct ice_prof_id_section *sec;
+        uint16_t max_entries;
+        uint16_t chunk;
+        uint16_t section_size;
+        uint16_t i;
+
+        max_entries = (uint16_t)((ICE_AQ_MAX_BUF_LEN - sizeof(struct ice_buf_hdr) -
+                                  sizeof(struct ice_section_entry) - sizeof(*sec)) /
+                                 sizeof(struct ice_prof_tcam_entry));
+        if (max_entries == 0)
+            return -1;
+        chunk = (uint16_t)(ICE_RSS_PROF_TCAM_COUNT - base);
+        if (chunk > max_entries)
+            chunk = max_entries;
+        section_size = (uint16_t)(sizeof(*sec) + chunk * sizeof(struct ice_prof_tcam_entry));
+        if (rss_build_section_request(buf, sizeof(buf), ICE_SID_PROFID_TCAM_RSS, section_size) < 0)
+            return -1;
+
+        sec = (struct ice_prof_id_section *)(buf + sizeof(struct ice_buf_hdr) +
+                                             sizeof(struct ice_section_entry));
+        sec->count = htole16(chunk);
+        for (i = 0; i < chunk; i++)
+            sec->entry[i].addr = htole16((uint16_t)(base + i));
+
+        if (aq_upload_section(d, buf, sizeof(buf)) < 0)
+            return -1;
+
+        memcpy(tcam + base, sec->entry, chunk * sizeof(struct ice_prof_tcam_entry));
+        base = (uint16_t)(base + chunk);
+    }
+
+    fprintf(stderr, "[my_ice] RSS read PROFID_TCAM entries=%u\n", ICE_RSS_PROF_TCAM_COUNT); // RSS:IMPL
+    return 0;
+}
+
+static int aq_read_fld_vec_rss(struct dev_ctx *d,
+                               struct ice_fv_word fv[ICE_RSS_PROF_ID_COUNT][ICE_RSS_FV_WORDS])
+{
+    uint16_t prof = 0;
+
+    memset(fv, 0, sizeof(struct ice_fv_word) * ICE_RSS_PROF_ID_COUNT * ICE_RSS_FV_WORDS);
+    while (prof < ICE_RSS_PROF_ID_COUNT) {
+        uint8_t buf[ICE_AQ_MAX_BUF_LEN];
+        struct ice_pkg_es *es;
+        uint16_t max_prof;
+        uint16_t prof_count;
+        uint16_t vec_bytes = (uint16_t)(ICE_RSS_FV_WORDS * sizeof(struct ice_fv_word));
+        uint16_t section_size;
+        uint16_t i;
+
+        max_prof = (uint16_t)((ICE_AQ_MAX_BUF_LEN - sizeof(struct ice_buf_hdr) -
+                               sizeof(struct ice_section_entry) - sizeof(*es)) / vec_bytes);
+        if (max_prof == 0)
+            return -1;
+        prof_count = (uint16_t)(ICE_RSS_PROF_ID_COUNT - prof);
+        if (prof_count > max_prof)
+            prof_count = max_prof;
+        section_size = (uint16_t)(sizeof(*es) + prof_count * vec_bytes);
+        if (rss_build_section_request(buf, sizeof(buf), ICE_SID_FLD_VEC_RSS, section_size) < 0)
+            return -1;
+
+        es = (struct ice_pkg_es *)(buf + sizeof(struct ice_buf_hdr) +
+                                   sizeof(struct ice_section_entry));
+        es->count = htole16(prof_count);
+        es->offset = htole16(prof);
+
+        if (aq_upload_section(d, buf, sizeof(buf)) < 0)
+            return -1;
+
+        for (i = 0; i < prof_count; i++) {
+            memcpy(fv[prof + i], es->es + (size_t)i * ICE_RSS_FV_WORDS, vec_bytes);
+        }
+        prof = (uint16_t)(prof + prof_count);
+    }
+
+    fprintf(stderr, "[my_ice] RSS read FLD_VEC entries=%u fvw=%u\n",
+            ICE_RSS_PROF_ID_COUNT, ICE_RSS_FV_WORDS); // RSS:IMPL
+    return 0;
+}
+
+static void rss_log_profile_fv(uint8_t prof_id,
+                               const struct ice_fv_word fv[ICE_RSS_FV_WORDS])
+{
+    uint16_t i;
+    bool any = false;
+
+    fprintf(stderr, "[my_ice] RSS profile prof_id=%u fv", prof_id); // RSS:IMPL
+    for (i = 0; i < ICE_RSS_FV_WORDS; i++) {
+        uint16_t off = le16toh(fv[i].off);
+
+        if (off == ICE_FV_OFFSET_INVAL)
+            continue;
+        any = true;
+        fprintf(stderr, " [%u:p=%u off=%u]", i, fv[i].prot_id, off); // RSS:IMPL
+    }
+    if (!any)
+        fprintf(stderr, " <empty>"); // RSS:IMPL
+    fprintf(stderr, "\n"); // RSS:IMPL
+}
+
+static bool rss_decode_key_byte(uint8_t key, uint8_t key_inv, uint8_t *val,
+                                uint8_t *dc, uint8_t *nm)
+{
+    uint8_t out_val = 0;
+    uint8_t out_dc = 0;
+    uint8_t out_nm = 0;
+    uint8_t bit;
+
+    for (bit = 0; bit < 8; bit++) {
+        uint8_t k = (uint8_t)((key >> bit) & 0x1U);
+        uint8_t ki = (uint8_t)((key_inv >> bit) & 0x1U);
+
+        if (k && ki) {
+            out_dc |= (uint8_t)(1U << bit);
+        } else if (!k && !ki) {
+            out_nm |= (uint8_t)(1U << bit);
+        } else if (!k && ki) {
+            out_val |= (uint8_t)(1U << bit);
+        } else if (!(k && !ki)) {
+            return false;
+        }
+    }
+
+    *val = out_val;
+    *dc = out_dc;
+    *nm = out_nm;
+    return true;
+}
+
+static bool rss_decode_tcam_entry(const struct ice_prof_tcam_entry *entry,
+                                  struct ice_prof_id_key *key_out,
+                                  uint8_t dc_mask[sizeof(struct ice_prof_id_key)],
+                                  uint8_t nm_mask[sizeof(struct ice_prof_id_key)])
+{
+    uint8_t raw[sizeof(struct ice_prof_id_key)] = {0};
+    size_t i;
+
+    for (i = 0; i < sizeof(raw); i++) {
+        if (!rss_decode_key_byte(entry->key[i], entry->key[i + sizeof(raw)],
+                                 &raw[i], &dc_mask[i], &nm_mask[i]))
+            return false;
+    }
+
+    memcpy(key_out, raw, sizeof(*key_out));
+    return true;
+}
+
+static bool rss_mask_any_set(const uint8_t *mask, size_t len)
+{
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        if (mask[i] != 0)
+            return true;
+    }
+    return false;
+}
+
+static void rss_inspect_active_vsig(struct dev_ctx *d, uint16_t active_vsig)
+{
+    uint8_t ptgs[ICE_XLT1_CNT];
+    uint8_t prof_redir[ICE_RSS_PROF_ID_COUNT];
+    struct ice_prof_tcam_entry tcam[ICE_RSS_PROF_TCAM_COUNT];
+    struct ice_fv_word fv[ICE_RSS_PROF_ID_COUNT][ICE_RSS_FV_WORDS];
+    uint16_t ptg_ptype_counts[256] = {0};
+    bool matched_ptg_seen[256] = {false};
+    bool hw_prof_seen[ICE_RSS_PROF_ID_COUNT] = {false};
+    bool any_match = false;
+    uint16_t ptype;
+    uint16_t matched_ptg_count = 0;
+    uint16_t matched_tcam_count = 0;
+    uint16_t matched_hw_prof_count = 0;
+
+    if (active_vsig == 0) {
+        fprintf(stderr, "[my_ice] RSS inspect skipped: active VSIG is default\n"); // RSS:IMPL
+        return;
+    }
+    if (aq_read_xlt1_rss(d, ptgs) < 0)
+        return;
+    if (aq_read_prof_redir_rss(d, prof_redir) < 0)
+        return;
+    if (aq_read_prof_tcam_rss(d, tcam) < 0)
+        return;
+    if (aq_read_fld_vec_rss(d, fv) < 0)
+        return;
+
+    for (ptype = 0; ptype < ICE_XLT1_CNT; ptype++)
+        ptg_ptype_counts[ptgs[ptype]]++;
+
+    fprintf(stderr, "[my_ice] RSS inspect active_vsig=0x%04x begin\n", active_vsig); // RSS:IMPL
+    for (ptype = 0; ptype < ICE_RSS_PROF_TCAM_COUNT; ptype++) {
+        struct ice_prof_id_key decoded;
+        uint8_t dc_mask[sizeof(decoded)];
+        uint8_t nm_mask[sizeof(decoded)];
+        uint8_t ptg;
+        uint8_t sw_prof;
+        uint8_t hw_prof;
+        uint16_t vsig;
+        uint16_t flags;
+        uint16_t flags_mask;
+
+        if (!rss_decode_tcam_entry(&tcam[ptype], &decoded, dc_mask, nm_mask))
+            continue;
+        if (rss_mask_any_set(nm_mask, sizeof(nm_mask)))
+            continue;
+
+        vsig = le16toh(decoded.xlt2_cdid);
+        if (vsig != active_vsig)
+            continue;
+
+        any_match = true;
+        matched_tcam_count++;
+        ptg = decoded.xlt1;
+        sw_prof = tcam[ptype].prof_id;
+        hw_prof = sw_prof < ICE_RSS_PROF_ID_COUNT ? prof_redir[sw_prof] : sw_prof;
+        flags = le16toh(decoded.flags);
+        memcpy(&flags_mask, dc_mask, sizeof(flags_mask));
+        flags_mask = (uint16_t)~le16toh(flags_mask);
+
+        if (!matched_ptg_seen[ptg]) {
+            matched_ptg_seen[ptg] = true;
+            matched_ptg_count++;
+        }
+
+        fprintf(stderr,
+                "[my_ice] RSS active_tcam idx=%u ptg=%u ptypes=%u sw_prof=%u hw_prof=%u flags=0x%04x flags_mask=0x%04x\n",
+                ptype, ptg, ptg_ptype_counts[ptg], sw_prof, hw_prof, flags, flags_mask); // RSS:IMPL
+        if (hw_prof >= ICE_RSS_PROF_ID_COUNT || hw_prof_seen[hw_prof])
+            continue;
+        hw_prof_seen[hw_prof] = true;
+        matched_hw_prof_count++;
+        rss_log_profile_fv(hw_prof, fv[hw_prof]);
+    }
+
+    if (!any_match) {
+        fprintf(stderr,
+                "[my_ice] RSS inspect active_vsig=0x%04x no PROFID_TCAM matches found\n",
+                active_vsig); // RSS:IMPL
+        return;
+    }
+
+    fprintf(stderr,
+            "[my_ice] RSS inspect active_vsig=0x%04x matched_tcam=%u matched_ptgs=%u matched_hw_profiles=%u\n",
+            active_vsig, matched_tcam_count, matched_ptg_count, matched_hw_prof_count); // RSS:IMPL
 }
 
 static int aq_acquire_change_lock(struct dev_ctx *d)
@@ -1891,7 +2209,10 @@ static int setup_rss_scaling(struct dev_ctx *d)
         return -1;
     (void)aq_get_vsi_params(d, &props);
     (void)aq_get_pkg_info_list(d);
-    return aq_associate_vsi_with_rss_profiles(d);
+    if (aq_associate_vsi_with_rss_profiles(d) < 0)
+        return -1;
+    rss_inspect_active_vsig(d, d->io.rss_target_vsig ? d->io.rss_target_vsig : d->io.rss_current_vsig);
+    return 0;
 }
 
 static int wait_rxq_ready(struct dev_ctx *d, uint16_t rxq, uint32_t *reg)
@@ -2076,19 +2397,13 @@ static int poll_rx_batch(struct dev_ctx *d, struct rxq_ctx *rxq,
             return -1;
         }
 
-        if (atomic_load_explicit(&g_rss_sample_budget, memory_order_relaxed) > 0) {
+        if (!rxq->rss_sampled) {
             uint32_t rss_hash = le32toh(rxd->wb.rss_hash);
             uint16_t rss_valid = (uint16_t)((status0 >> ICE_RX_FLEX_DESC_STATUS0_RSS_VALID_S) & 0x1U);
-            unsigned int prev = atomic_fetch_sub_explicit(&g_rss_sample_budget, 1,
-                                                          memory_order_relaxed);
-
-            if (prev > 0) {
-                fprintf(stderr,
-                        "[my_ice] RSS rx sample q=%u desc=%u rss_hash=0x%08x rss_valid=%u status0=0x%04x len=%u\n",
-                        rxq->rxq_id, idx, rss_hash, rss_valid, status0, pkt_len); // RSS:IMPL
-            } else {
-                atomic_store_explicit(&g_rss_sample_budget, 0, memory_order_relaxed);
-            }
+            rxq->rss_sampled = true;
+            fprintf(stderr,
+                    "[my_ice] RSS rx sample q=%u desc=%u rss_hash=0x%08x rss_valid=%u status0=0x%04x len=%u\n",
+                    rxq->rxq_id, idx, rss_hash, rss_valid, status0, pkt_len); // RSS:IMPL
         }
 
         out_idxs[count] = idx;
@@ -2324,14 +2639,28 @@ static void dump_rx_desc_snapshot(struct dev_ctx *d)
 
 static uint64_t read_glv_counter64(struct dev_ctx *d, uint32_t lo_off, uint32_t hi_off)
 {
-    uint64_t hi1 = reg_read32(d, hi_off) & 0xFFU;
-    uint64_t lo = reg_read32(d, lo_off);
-    uint64_t hi2 = reg_read32(d, hi_off) & 0xFFU;
+    uint32_t lo_old;
+    uint32_t hi;
+    uint32_t lo;
 
-    if (hi1 != hi2)
+    do {
+        lo_old = reg_read32(d, lo_off);
+        hi = reg_read32(d, hi_off);
         lo = reg_read32(d, lo_off);
+    } while (lo_old > lo);
 
-    return lo | (hi2 << 32);
+    return ((uint64_t)lo) | (((uint64_t)hi & 0xFFU) << 32);
+}
+
+static uint64_t counter40_delta(uint64_t after, uint64_t before)
+{
+    const uint64_t mask = (1ULL << 40) - 1;
+
+    after &= mask;
+    before &= mask;
+    if (after >= before)
+        return after - before;
+    return (after + (1ULL << 40)) - before;
 }
 
 static void print_payload_dump(const uint8_t *pkt, uint16_t len)
@@ -2443,7 +2772,7 @@ static int run_rx_listen(struct dev_ctx *d, int timeout_ms)
     gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
                                     GLV_GORCH(d->io.vsi_num));
     fprintf(stderr, "[my_ice] rx-listen timeout, VSI%u GORC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, gorc_after - gorc_before);
+            d->io.vsi_num, counter40_delta(gorc_after, gorc_before));
     dump_rx_desc_snapshot(d);
     dump_mdet_regs(d);
 
@@ -2760,18 +3089,14 @@ report_progress:
                     pkts_ns_to_mpps(interval_tx_pkts, interval_ns),
                     pkts_ns_to_mpps(interval_rx_pkts, interval_ns));
 
-            fprintf(stderr, "[my_ice] RSS queue stats"); // RSS:IMPL
+            fprintf(stderr, "[my_ice] RSS queue distribution"); // RSS:IMPL
             for (i = 0; i < d->io.rxq_count; i++) {
                 double rx_pkt_pct = rx_pkts ? (100.0 * (double)rx_pkts_per_q[i] / (double)rx_pkts) : 0.0;
-                double rx_byte_pct = rx_bytes ? (100.0 * (double)rx_bytes_per_q[i] / (double)rx_bytes) : 0.0;
                 double tx_pkt_pct = tx_pkts ? (100.0 * (double)tx_pkts_per_q[i] / (double)tx_pkts) : 0.0;
-                double tx_byte_pct = tx_bytes ? (100.0 * (double)tx_bytes_per_q[i] / (double)tx_bytes) : 0.0;
                 fprintf(stderr,
-                        " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ",%.2f%%) txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ",%.2f%%)",
-                        d->io.rxqs[i].rxq_id, rx_pkts_per_q[i], rx_pkt_pct,
-                        rx_bytes_per_q[i], rx_byte_pct,
-                        d->txqs[i].txq_id, tx_pkts_per_q[i], tx_pkt_pct,
-                        tx_bytes_per_q[i], tx_byte_pct); // RSS:IMPL
+                        " rxq%u=%.2f%% txq%u=%.2f%%",
+                        d->io.rxqs[i].rxq_id, rx_pkt_pct,
+                        d->txqs[i].txq_id, tx_pkt_pct); // RSS:IMPL
             }
             fprintf(stderr, "\n"); // RSS:IMPL
 
@@ -2851,19 +3176,18 @@ report_progress:
             bytes_ns_to_gbps(rx_bytes, active_end_ns - start_ns),
             rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
             tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
-            gorc_after - gorc_before, gotc_after - gotc_before);
+            counter40_delta(gorc_after, gorc_before),
+            counter40_delta(gotc_after, gotc_before));
     fprintf(stderr, "[my_ice] RSS final queue stats"); // RSS:IMPL
     for (uint16_t i = 0; i < d->io.rxq_count; i++) {
         double rx_pkt_pct = rx_pkts ? (100.0 * (double)rx_pkts_per_q[i] / (double)rx_pkts) : 0.0;
-        double rx_byte_pct = rx_bytes ? (100.0 * (double)rx_bytes_per_q[i] / (double)rx_bytes) : 0.0;
         double tx_pkt_pct = tx_pkts ? (100.0 * (double)tx_pkts_per_q[i] / (double)tx_pkts) : 0.0;
-        double tx_byte_pct = tx_bytes ? (100.0 * (double)tx_bytes_per_q[i] / (double)tx_bytes) : 0.0;
         fprintf(stderr,
-                " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ",%.2f%%) txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ",%.2f%%)",
+                " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ") txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ")",
                 d->io.rxqs[i].rxq_id, rx_pkts_per_q[i], rx_pkt_pct,
-                rx_bytes_per_q[i], rx_byte_pct,
+                rx_bytes_per_q[i],
                 d->txqs[i].txq_id, tx_pkts_per_q[i], tx_pkt_pct,
-                tx_bytes_per_q[i], tx_byte_pct); // RSS:IMPL
+                tx_bytes_per_q[i]); // RSS:IMPL
     }
     fprintf(stderr, "\n"); // RSS:IMPL
     rc = 0;
@@ -3350,23 +3674,17 @@ static int run_rx_reflect_mt(struct dev_ctx *d, int timeout_ms)
                     pkts_ns_to_mpps(tx_pkts - prev_tx_pkts, interval_ns),
                     pkts_ns_to_mpps(rx_pkts - prev_rx_pkts, interval_ns));
 
-            fprintf(stderr, "[my_ice] RSS queue stats"); // RSS:IMPL
+            fprintf(stderr, "[my_ice] RSS queue distribution"); // RSS:IMPL
             for (uint16_t i = 0; i < d->io.rxq_count; i++) {
                 uint64_t q_rx_pkts = atomic_load_explicit(&stats_pages[i].rx_pkts, memory_order_relaxed);
-                uint64_t q_rx_bytes = atomic_load_explicit(&stats_pages[i].rx_bytes, memory_order_relaxed);
                 uint64_t q_tx_pkts = atomic_load_explicit(&stats_pages[i].tx_pkts, memory_order_relaxed);
-                uint64_t q_tx_bytes = atomic_load_explicit(&stats_pages[i].tx_bytes, memory_order_relaxed);
                 double rx_pkt_pct = rx_pkts ? (100.0 * (double)q_rx_pkts / (double)rx_pkts) : 0.0;
-                double rx_byte_pct = rx_bytes ? (100.0 * (double)q_rx_bytes / (double)rx_bytes) : 0.0;
                 double tx_pkt_pct = tx_pkts ? (100.0 * (double)q_tx_pkts / (double)tx_pkts) : 0.0;
-                double tx_byte_pct = tx_bytes ? (100.0 * (double)q_tx_bytes / (double)tx_bytes) : 0.0;
 
                 fprintf(stderr,
-                        " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ",%.2f%%) txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ",%.2f%%)",
-                        d->io.rxqs[i].rxq_id, q_rx_pkts, rx_pkt_pct,
-                        q_rx_bytes, rx_byte_pct,
-                        d->txqs[i].txq_id, q_tx_pkts, tx_pkt_pct,
-                        q_tx_bytes, tx_byte_pct); // RSS:IMPL
+                        " rxq%u=%.2f%% txq%u=%.2f%%",
+                        d->io.rxqs[i].rxq_id, rx_pkt_pct,
+                        d->txqs[i].txq_id, tx_pkt_pct); // RSS:IMPL
             }
             fprintf(stderr, "\n"); // RSS:IMPL
 
@@ -3443,7 +3761,8 @@ join_workers:
                 bytes_ns_to_gbps(rx_bytes, active_end_ns - start_ns),
                 rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
                 tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
-                gorc_after - gorc_before, gotc_after - gotc_before);
+                counter40_delta(gorc_after, gorc_before),
+                counter40_delta(gotc_after, gotc_before));
         fprintf(stderr, "[my_ice] RSS final queue stats"); // RSS:IMPL
         for (uint16_t i = 0; i < d->io.rxq_count; i++) {
             uint64_t q_rx_pkts = atomic_load_explicit(&stats_pages[i].rx_pkts, memory_order_relaxed);
@@ -3451,16 +3770,14 @@ join_workers:
             uint64_t q_tx_pkts = atomic_load_explicit(&stats_pages[i].tx_pkts, memory_order_relaxed);
             uint64_t q_tx_bytes = atomic_load_explicit(&stats_pages[i].tx_bytes, memory_order_relaxed);
             double rx_pkt_pct = rx_pkts ? (100.0 * (double)q_rx_pkts / (double)rx_pkts) : 0.0;
-            double rx_byte_pct = rx_bytes ? (100.0 * (double)q_rx_bytes / (double)rx_bytes) : 0.0;
             double tx_pkt_pct = tx_pkts ? (100.0 * (double)q_tx_pkts / (double)tx_pkts) : 0.0;
-            double tx_byte_pct = tx_bytes ? (100.0 * (double)q_tx_bytes / (double)tx_bytes) : 0.0;
 
             fprintf(stderr,
-                    " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ",%.2f%%) txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ",%.2f%%)",
+                    " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ") txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ")",
                     d->io.rxqs[i].rxq_id, q_rx_pkts, rx_pkt_pct,
-                    q_rx_bytes, rx_byte_pct,
+                    q_rx_bytes,
                     d->txqs[i].txq_id, q_tx_pkts, tx_pkt_pct,
-                    q_tx_bytes, tx_byte_pct); // RSS:IMPL
+                    q_tx_bytes); // RSS:IMPL
         }
         fprintf(stderr, "\n"); // RSS:IMPL
     }
@@ -3579,7 +3896,7 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
     fprintf(stderr, "[my_ice] tx-send done, VSI%u GOTC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, gotc_after - gotc_before);
+            d->io.vsi_num, counter40_delta(gotc_after, gotc_before));
     return 0;
 }
 

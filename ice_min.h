@@ -131,8 +131,19 @@
 #define ICE_AQC_RSS_LUT_SIZE_SMALL  0x0
 #define ICE_AQC_RSS_LUT_SIZE_512    BIT(2)
 #define ICE_AQC_RSS_LUT_SIZE_2K     BIT(3)
+#define ICE_SID_XLT1_RSS            42
 #define ICE_SID_XLT2_RSS            43
+#define ICE_SID_PROFID_TCAM_RSS     44
+#define ICE_SID_PROFID_REDIR_RSS    45
+#define ICE_SID_FLD_VEC_RSS         46
+#define ICE_XLT1_CNT                1024
 #define ICE_XLT2_CNT                768
+#define ICE_RSS_PROF_TCAM_COUNT     512
+#define ICE_RSS_PROF_ID_COUNT       128
+#define ICE_RSS_FV_WORDS            24
+#define ICE_TCAM_KEY_VAL_SZ         5
+#define ICE_TCAM_KEY_SZ             (2 * ICE_TCAM_KEY_VAL_SZ)
+#define ICE_FV_OFFSET_INVAL         0x1FF
 #define ICE_CHANGE_LOCK_TIMEOUT_MS  1000
 #define ICE_AQC_DOWNLOAD_PKG_LAST_BUF 0x01
 
@@ -476,6 +487,71 @@ struct ice_aqc_get_pkg_info {
     uint8_t is_active;
     uint8_t is_active_at_boot;
     uint8_t is_modified;
+} __attribute__((packed));
+
+struct ice_section_entry {
+    uint32_t type;
+    uint16_t offset;
+    uint16_t size;
+} __attribute__((packed));
+
+struct ice_buf_hdr {
+    uint16_t section_count;
+    uint16_t data_end;
+    struct ice_section_entry section_entry[];
+} __attribute__((packed));
+
+struct ice_fv_word {
+    uint8_t prot_id;
+    uint16_t off;
+    uint8_t resvrd;
+} __attribute__((packed));
+
+struct ice_xlt1_section {
+    uint16_t count;
+    uint16_t offset;
+    uint8_t value[];
+} __attribute__((packed));
+
+struct ice_xlt2_section {
+    uint16_t count;
+    uint16_t offset;
+    uint16_t value[];
+} __attribute__((packed));
+
+struct ice_prof_id_key {
+    uint16_t flags;
+    uint8_t xlt1;
+    uint16_t xlt2_cdid;
+} __attribute__((packed));
+
+struct ice_prof_tcam_entry {
+    uint16_t addr;
+    uint8_t key[ICE_TCAM_KEY_SZ];
+    uint8_t prof_id;
+} __attribute__((packed));
+
+struct ice_prof_id_section {
+    uint16_t count;
+    struct ice_prof_tcam_entry entry[];
+} __attribute__((packed));
+
+struct ice_prof_redir_section {
+    uint16_t count;
+    uint16_t offset;
+    uint8_t redir_value[];
+} __attribute__((packed));
+
+struct ice_pkg_es {
+    uint16_t count;
+    uint16_t offset;
+    struct ice_fv_word es[];
+} __attribute__((packed));
+
+struct ice_sw_fv_section {
+    uint16_t count;
+    uint16_t base_offset;
+    struct ice_fv_word fv[];
 } __attribute__((packed));
 
 struct ice_aq_desc {

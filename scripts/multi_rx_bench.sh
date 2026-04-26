@@ -78,7 +78,7 @@ line, qidx, section, field = sys.argv[1:5]
 qidx = int(qidx)
 
 pattern = re.compile(
-    rf'{section}q{qidx}\(pkts=(\d+),([0-9.]+)% bytes=(\d+),([0-9.]+)%\)'
+    rf'{section}q{qidx}\(pkts=(\d+),([0-9.]+)% bytes=(\d+)\)'
 )
 m = pattern.search(line)
 if not m:
@@ -89,7 +89,7 @@ mapping = {
     'pkts': m.group(1),
     'pkts_pct': m.group(2),
     'bytes': m.group(3),
-    'bytes_pct': m.group(4),
+    'bytes_pct': m.group(2),
 }
 print(mapping.get(field, ""))
 PY
