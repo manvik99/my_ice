@@ -20,6 +20,7 @@
 #define ICE_RX_DESC_COUNT 2048
 #define ICE_RX_BUF_SIZE 128
 #define ICE_TX_PKT_BUF_SIZE 128
+#define ICE_MAX_RX_QUEUES 8
 
 /* PF FW AdminQ registers (BAR0 offsets) */
 #define PF_FW_ATQBAL                0x00080000
@@ -92,14 +93,51 @@
 
 /* AQ opcodes */
 #define ICE_AQC_OPC_GET_VER         0x0001
+#define ICE_AQC_OPC_REQUEST_RES     0x0008
+#define ICE_AQC_OPC_RELEASE_RES     0x0009
 #define ICE_AQC_OPC_MANAGE_MAC_READ 0x0107
 #define ICE_AQC_OPC_GET_SW_CFG      0x0200
+#define ICE_AQC_OPC_UPDATE_VSI      0x0211
+#define ICE_AQC_OPC_GET_VSI_PARAMS  0x0212
 #define ICE_AQC_OPC_ADD_SW_RULES    0x02A0
 #define ICE_AQC_OPC_REMOVE_SW_RULES 0x02A2
 #define ICE_AQC_OPC_GET_DFLT_TOPO   0x0400
 #define ICE_AQC_OPC_SET_MAC_LB      0x0620
 #define ICE_AQC_OPC_SET_PHY_LB      0x0619
+#define ICE_AQC_OPC_SET_RSS_KEY     0x0B02
+#define ICE_AQC_OPC_SET_RSS_LUT     0x0B03
+#define ICE_AQC_OPC_GET_RSS_KEY     0x0B04
+#define ICE_AQC_OPC_GET_RSS_LUT     0x0B05
 #define ICE_AQC_OPC_ADD_TXQS        0x0C30
+#define ICE_AQC_OPC_UPLOAD_SECTION  0x0C41
+#define ICE_AQC_OPC_UPDATE_PKG      0x0C42
+#define ICE_AQC_OPC_GET_PKG_INFO_LIST 0x0C43
+
+/* Resource ownership */
+#define ICE_AQC_RES_ID_CHNG_LOCK    3
+#define ICE_AQC_RES_ACCESS_READ     1
+#define ICE_AQC_RES_ACCESS_WRITE    2
+
+/* RSS / package constants */
+#define ICE_AQC_RSS_VSI_VALID       BIT(15)
+#define ICE_AQ_VSI_IS_VALID         BIT(15)
+#define ICE_AQC_RSS_KEY_SIZE        52
+#define ICE_AQC_RSS_VSI_LUT_SIZE    64
+#define ICE_AQC_RSS_PF_LUT_SIZE     2048
+#define ICE_AQC_RSS_GLOBAL_LUT_SIZE 512
+#define ICE_AQC_RSS_LUT_TYPE_VSI    0x0
+#define ICE_AQC_RSS_LUT_TYPE_PF     0x1
+#define ICE_AQC_RSS_LUT_TYPE_GLOBAL 0x2
+#define ICE_AQC_RSS_LUT_SIZE_SMALL  0x0
+#define ICE_AQC_RSS_LUT_SIZE_512    BIT(2)
+#define ICE_AQC_RSS_LUT_SIZE_2K     BIT(3)
+#define ICE_SID_XLT2_RSS            43
+#define ICE_XLT2_CNT                768
+#define ICE_CHANGE_LOCK_TIMEOUT_MS  1000
+#define ICE_AQC_DOWNLOAD_PKG_LAST_BUF 0x01
+
+/* AQ return codes */
+#define ICE_AQ_RC_EBUSY             12
 
 /* Manage MAC read */
 #define ICE_AQC_MAN_MAC_LAN_ADDR_VALID   BIT(4)
@@ -152,6 +190,7 @@
 #define ICE_RX_FLEX_DESC_STATUS0_DD_S    0
 #define ICE_RX_FLEX_DESC_STATUS0_EOF_S   1
 #define ICE_RX_FLEX_DESC_STATUS0_RXE_S   10
+#define ICE_RX_FLEX_DESC_STATUS0_RSS_VALID_S 12
 
 /* Tx descriptor constants */
 #define ICE_TX_DESC_DTYPE_DATA           0x0
@@ -210,6 +249,15 @@ struct ice_aqc_get_sw_cfg_resp_elem {
     uint16_t vsi_port_num;
     uint16_t swid;
     uint16_t pf_vf_num;
+} __attribute__((packed));
+
+struct ice_aqc_req_res {
+    uint16_t res_id;
+    uint16_t access_type;
+    uint32_t timeout;
+    uint32_t res_number;
+    uint16_t status;
+    uint8_t reserved[2];
 } __attribute__((packed));
 
 struct ice_aqc_get_topo {
@@ -306,6 +354,130 @@ struct ice_aqc_add_tx_qgrp {
     struct ice_aqc_add_txqs_perq txqs[STRUCT_HACK_VAR_LEN];
 } __attribute__((packed));
 
+struct ice_aqc_add_get_update_free_vsi {
+    uint16_t vsi_num;
+    uint16_t cmd_flags;
+    uint8_t vf_id;
+    uint8_t reserved;
+    uint16_t vsi_flags;
+    uint32_t addr_high;
+    uint32_t addr_low;
+} __attribute__((packed));
+
+struct ice_aqc_get_vsi_resp {
+    uint16_t vsi_num;
+    uint16_t ext_status;
+    uint16_t vsi_used;
+    uint16_t vsi_free;
+    uint32_t addr_high;
+    uint32_t addr_low;
+} __attribute__((packed));
+
+struct ice_aqc_vsi_props {
+    uint16_t valid_sections;
+    uint8_t sw_id;
+    uint8_t sw_flags;
+    uint8_t sw_flags2;
+    uint8_t veb_stat_id;
+    uint8_t sec_flags;
+    uint8_t sec_reserved;
+    uint16_t port_based_inner_vlan;
+    uint8_t inner_vlan_reserved[2];
+    uint8_t inner_vlan_flags;
+    uint8_t inner_vlan_reserved2[3];
+    uint32_t ingress_table;
+    uint32_t egress_table;
+    uint16_t port_based_outer_vlan;
+    uint8_t outer_vlan_flags;
+    uint8_t outer_vlan_reserved;
+    uint16_t mapping_flags;
+    uint16_t q_mapping[16];
+    uint16_t tc_mapping[8];
+    uint8_t q_opt_rss;
+    uint8_t q_opt_tc;
+    uint8_t q_opt_flags;
+    uint8_t q_opt_reserved[3];
+    uint32_t outer_up_table;
+    uint16_t sect_10_reserved;
+    uint16_t fd_options;
+    uint16_t max_fd_fltr_dedicated;
+    uint16_t max_fd_fltr_shared;
+    uint16_t fd_def_q;
+    uint16_t fd_report_opt;
+    uint32_t pasid_id;
+    uint8_t reserved[24];
+} __attribute__((packed));
+
+#define ICE_AQ_VSI_PROP_RXQ_MAP_VALID    BIT(6)
+#define ICE_AQ_VSI_PROP_Q_OPT_VALID      BIT(7)
+#define ICE_AQ_VSI_Q_MAP_CONTIG          0x0
+#define ICE_AQ_VSI_TC_Q_OFFSET_S         0
+#define ICE_AQ_VSI_TC_Q_NUM_S            11
+#define ICE_AQ_VSI_Q_OPT_RSS_LUT_PF      0x2
+#define ICE_AQ_VSI_Q_OPT_RSS_HASH_S      6
+#define ICE_AQ_VSI_Q_OPT_RSS_HASH_TPLZ   0x0U
+
+struct ice_aqc_get_set_rss_key {
+    uint16_t vsi_id;
+    uint8_t reserved[6];
+    uint32_t addr_high;
+    uint32_t addr_low;
+} __attribute__((packed));
+
+struct ice_aqc_get_set_rss_keys {
+    uint8_t standard_rss_key[40];
+    uint8_t extended_hash_key[12];
+} __attribute__((packed));
+
+struct ice_aqc_get_set_rss_lut {
+    uint16_t vsi_id;
+    uint16_t flags;
+    uint32_t reserved;
+    uint32_t addr_high;
+    uint32_t addr_low;
+} __attribute__((packed));
+
+struct ice_aqc_download_pkg {
+    uint8_t flags;
+    uint8_t reserved[3];
+    uint32_t reserved1;
+    uint32_t addr_high;
+    uint32_t addr_low;
+} __attribute__((packed));
+
+struct ice_aqc_download_pkg_resp {
+    uint32_t error_offset;
+    uint32_t error_info;
+    uint32_t addr_high;
+    uint32_t addr_low;
+} __attribute__((packed));
+
+struct ice_aqc_get_pkg_info_list {
+    uint32_t reserved1;
+    uint32_t reserved2;
+    uint32_t addr_high;
+    uint32_t addr_low;
+} __attribute__((packed));
+
+struct ice_pkg_ver {
+    uint8_t major;
+    uint8_t minor;
+    uint8_t update;
+    uint8_t draft;
+} __attribute__((packed));
+
+#define ICE_SEG_NAME_SIZE 28
+
+struct ice_aqc_get_pkg_info {
+    struct ice_pkg_ver ver;
+    char name[ICE_SEG_NAME_SIZE];
+    uint32_t track_id;
+    uint8_t is_in_nvm;
+    uint8_t is_active;
+    uint8_t is_active_at_boot;
+    uint8_t is_modified;
+} __attribute__((packed));
+
 struct ice_aq_desc {
     uint16_t flags;
     uint16_t opcode;
@@ -317,13 +489,20 @@ struct ice_aq_desc {
         uint8_t raw[16];
         struct ice_aqc_generic generic;
         struct ice_aqc_get_ver get_ver;
+        struct ice_aqc_req_res req_res;
         struct ice_aqc_manage_mac_read mac_read;
         struct ice_aqc_get_sw_cfg get_sw_conf;
         struct ice_aqc_sw_rules sw_rules;
         struct ice_aqc_get_topo get_topo;
         struct ice_aqc_set_phy_lb set_phy_lb;
         struct ice_aqc_set_mac_lb set_mac_lb;
+        struct ice_aqc_add_get_update_free_vsi vsi_cmd;
+        struct ice_aqc_get_vsi_resp get_vsi_resp;
+        struct ice_aqc_get_set_rss_key get_set_rss_key;
+        struct ice_aqc_get_set_rss_lut get_set_rss_lut;
         struct ice_aqc_add_txqs add_txqs;
+        struct ice_aqc_download_pkg download_pkg;
+        struct ice_aqc_get_pkg_info_list get_pkg_info_list;
     } params;
 };
 
