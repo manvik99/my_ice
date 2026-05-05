@@ -9,6 +9,7 @@
 #include <sched.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -42,18 +43,29 @@
 
 #define ALIGN_UP(v, a) (((v) + ((a) - 1)) & ~((size_t)((a) - 1)))
 #define NS_PER_S 1000000000ULL
-#define TX_BURST_SIZE 64
-#define RX_REFLECT_GLOBAL_BUDGET 512
+#define DEFAULT_TX_BATCH_SIZE 64
+#define DEFAULT_RX_REFLECT_BATCH_SIZE 512
+#define MAX_RX_REFLECT_BATCH_SIZE 1024
 #define RX_REFLECT_STATS_PAGE_SIZE 4096U
 #define TX_RS_THRESH 32
 #define ETH_WIRE_OVERHEAD_BYTES 24U
 #define ICE_PKT_BUF_DATA_SIZE \
     ((ICE_RX_BUF_SIZE > ICE_TX_PKT_BUF_SIZE) ? ICE_RX_BUF_SIZE : ICE_TX_PKT_BUF_SIZE)
-#define ICE_REFLECT_POOL_EXTRA TX_BURST_SIZE
+#define ICE_REFLECT_POOL_EXTRA DEFAULT_TX_BATCH_SIZE
 
 static bool g_dump_topo = false;
 static bool g_qparent_override_set = false;
 static uint32_t g_qparent_override = 0;
+enum verbosity_level {
+    VERBOSITY_SUMMARY = 1,
+    VERBOSITY_PROGRESS = 2,
+    VERBOSITY_INIT = 3,
+    VERBOSITY_DECISION = 4,
+    VERBOSITY_TRACE = 5,
+};
+
+static uint8_t g_verbosity = VERBOSITY_SUMMARY;
+
 struct pkt_mempool;
 
 struct pkt_buf {
@@ -128,6 +140,7 @@ struct txq_ctx {
     uint16_t tx_next_to_clean;
     uint16_t tx_free;
     uint16_t tx_pkts_since_rs;
+    bool tx_started;
     struct pkt_buf **tx_pkt_buf_refs;
 };
 
@@ -141,6 +154,8 @@ struct dev_ctx {
     char huge_path[PATH_MAX];
     uint8_t *bar0;
     size_t bar0_size;
+    uint16_t tx_batch_size;
+    uint16_t rx_reflect_batch_size;
     uint16_t txq_count;
     uint16_t txq_alloc_count;
     uint16_t tx_desc_count;
@@ -238,6 +253,59 @@ static void die_msg(const char *msg)
 {
     fprintf(stderr, "%s\n", msg);
     exit(EXIT_FAILURE);
+}
+
+static bool verbosity_enabled(uint8_t level)
+{
+    return g_verbosity >= level;
+}
+
+static void log_stderr(uint8_t level, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!verbosity_enabled(level))
+        return;
+
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+static void log_stdout(uint8_t level, const char *fmt, ...)
+{
+    va_list ap;
+
+    if (!verbosity_enabled(level))
+        return;
+
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+}
+
+static void log_putchar(uint8_t level, int ch)
+{
+    if (verbosity_enabled(level))
+        putchar(ch);
+}
+
+static bool parse_verbosity_arg(const char *arg, uint8_t *extra_levels)
+{
+    size_t i;
+
+    if (!arg || arg[0] != '-' || arg[1] != 'v')
+        return false;
+
+    for (i = 1; arg[i] != '\0'; i++) {
+        if (arg[i] != 'v')
+            return false;
+    }
+
+    if (extra_levels)
+        *extra_levels = (uint8_t)(i - 1);
+
+    return true;
 }
 
 static int parse_int_range(const char *s, int min_v, int max_v, int *out)
@@ -558,7 +626,7 @@ static uint32_t reflect_pool_entry_count_per_queue(const struct dev_ctx *d)
 {
     return (uint32_t)ICE_RX_DESC_COUNT +
            (uint32_t)d->tx_desc_count +
-           ICE_REFLECT_POOL_EXTRA;
+           (uint32_t)d->tx_batch_size;
 }
 
 static uint32_t reflect_pool_entry_count_total(const struct dev_ctx *d)
@@ -720,10 +788,10 @@ static void dump_hex(const uint8_t *buf, size_t len, size_t max_len)
 
     for (i = 0; i < n; i += 16) {
         size_t j;
-        fprintf(stderr, "  %04zx:", i);
+        log_stderr(VERBOSITY_TRACE, "  %04zx:", i);
         for (j = 0; j < 16 && i + j < n; j++)
-            fprintf(stderr, " %02x", buf[i + j]);
-        fprintf(stderr, "\n");
+            log_stderr(VERBOSITY_TRACE, " %02x", buf[i + j]);
+        log_stderr(VERBOSITY_TRACE, "\n");
     }
 }
 
@@ -741,33 +809,33 @@ static void dump_topo_response(const uint8_t *buf, size_t len, uint8_t num_branc
     if (num_branches == 0 || num_branches > max_branches)
         num_branches = (uint8_t)max_branches;
 
-    fprintf(stderr, "[my_ice] topo dump: branches=%u (max=%zu)\n",
-            num_branches, max_branches);
+    log_stderr(VERBOSITY_TRACE, "[my_ice] topo dump: branches=%u (max=%zu)\n",
+               num_branches, max_branches);
 
     for (b = 0; b < num_branches; b++) {
         uint16_t num_elems = le16toh(topo[b].hdr.num_elems);
         uint16_t i;
 
-        fprintf(stderr, "  branch %u: parent_teid=0x%08x num_elems=%u\n",
-                b, le32toh(topo[b].hdr.parent_teid), num_elems);
+        log_stderr(VERBOSITY_TRACE, "  branch %u: parent_teid=0x%08x num_elems=%u\n",
+                   b, le32toh(topo[b].hdr.parent_teid), num_elems);
 
         if (num_elems > ICE_AQC_TOPO_MAX_LEVEL_NUM)
             num_elems = ICE_AQC_TOPO_MAX_LEVEL_NUM;
 
         for (i = 0; i < num_elems; i++) {
             const struct ice_aqc_txsched_elem_data *e = &topo[b].generic[i];
-            fprintf(stderr,
-                    "    [%u] type=%u node_teid=0x%08x parent_teid=0x%08x valid=0x%02x cir_prof=%u cir_alloc=%u eir_prof=%u eir_alloc=%u\n",
-                    i, e->data.elem_type, le32toh(e->node_teid), le32toh(e->parent_teid),
-                    e->data.valid_sections,
-                    le16toh(e->data.cir_bw.bw_profile_idx),
-                    le16toh(e->data.cir_bw.bw_alloc),
-                    le16toh(e->data.eir_bw.bw_profile_idx),
-                    le16toh(e->data.eir_bw.bw_alloc));
+            log_stderr(VERBOSITY_TRACE,
+                       "    [%u] type=%u node_teid=0x%08x parent_teid=0x%08x valid=0x%02x cir_prof=%u cir_alloc=%u eir_prof=%u eir_alloc=%u\n",
+                       i, e->data.elem_type, le32toh(e->node_teid), le32toh(e->parent_teid),
+                       e->data.valid_sections,
+                       le16toh(e->data.cir_bw.bw_profile_idx),
+                       le16toh(e->data.cir_bw.bw_alloc),
+                       le16toh(e->data.eir_bw.bw_profile_idx),
+                       le16toh(e->data.eir_bw.bw_alloc));
         }
     }
 
-    fprintf(stderr, "[my_ice] topo raw (first 256 bytes):\n");
+    log_stderr(VERBOSITY_TRACE, "[my_ice] topo raw (first 256 bytes):\n");
     dump_hex(buf, len, 256);
 }
 
@@ -1088,11 +1156,11 @@ static int aq_get_fw_ver(struct dev_ctx *d)
         return -1;
 
     v = &desc.params.get_ver;
-    printf("Firmware: %u.%u.%u build %u branch %u\n",
-           v->fw_major, v->fw_minor, v->fw_patch,
-           le32toh(v->fw_build), v->fw_branch);
-    printf("API: %u.%u.%u branch %u\n",
-           v->api_major, v->api_minor, v->api_patch, v->api_branch);
+    log_stdout(VERBOSITY_INIT, "Firmware: %u.%u.%u build %u branch %u\n",
+               v->fw_major, v->fw_minor, v->fw_patch,
+               le32toh(v->fw_build), v->fw_branch);
+    log_stdout(VERBOSITY_INIT, "API: %u.%u.%u branch %u\n",
+               v->api_major, v->api_minor, v->api_patch, v->api_branch);
 
     return 0;
 }
@@ -1122,9 +1190,9 @@ static int aq_manage_mac_read(struct dev_ctx *d)
         if (resp[i].addr_type == ICE_AQC_MAN_MAC_ADDR_TYPE_LAN) {
             memcpy(d->io.mac, resp[i].mac_addr, ETHER_ADDR_LEN);
             d->io.lport = resp[i].lport_num;
-            printf("MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   d->io.mac[0], d->io.mac[1], d->io.mac[2],
-                   d->io.mac[3], d->io.mac[4], d->io.mac[5]);
+            log_stdout(VERBOSITY_INIT, "MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                       d->io.mac[0], d->io.mac[1], d->io.mac[2],
+                       d->io.mac[3], d->io.mac[4], d->io.mac[5]);
             found = true;
             break;
         }
@@ -1207,8 +1275,8 @@ static int aq_get_qparent_teid(struct dev_ctx *d)
 
     if (g_qparent_override_set) {
         d->io.qparent_teid = g_qparent_override;
-        fprintf(stderr, "[my_ice] using override qparent_teid=0x%08x\n",
-                d->io.qparent_teid);
+        log_stderr(VERBOSITY_DECISION, "[my_ice] using override qparent_teid=0x%08x\n",
+                   d->io.qparent_teid);
         return 0;
     }
 
@@ -1239,7 +1307,7 @@ static int aq_get_qparent_teid(struct dev_ctx *d)
         d->io.qparent_teid = le32toh(topo[0].generic[num_elems - 2].node_teid);
     else
         d->io.qparent_teid = le32toh(topo[0].generic[num_elems - 1].node_teid);
-    fprintf(stderr, "[my_ice] selected qparent_teid=0x%08x\n", d->io.qparent_teid);
+    log_stderr(VERBOSITY_DECISION, "[my_ice] selected qparent_teid=0x%08x\n", d->io.qparent_teid);
     return 0;
 }
 
@@ -1287,8 +1355,8 @@ static int aq_add_rx_mac_rule(struct dev_ctx *d, uint16_t *rule_idx)
 
     if (rule_idx)
         *rule_idx = le16toh(rule.index);
-    fprintf(stderr, "[my_ice] ADD_SW_RULES RX MAC index=%u\n",
-            le16toh(rule.index));
+    log_stderr(VERBOSITY_DECISION, "[my_ice] ADD_SW_RULES RX MAC index=%u\n",
+               le16toh(rule.index));
     return 0;
 }
 
@@ -1312,7 +1380,7 @@ static void aq_remove_sw_rule_best_effort(struct dev_ctx *d, uint16_t rule_type,
         fprintf(stderr, "[my_ice] warning: failed to remove switch rule %u\n",
                 rule_idx);
     else
-        fprintf(stderr, "[my_ice] removed switch rule %u\n", rule_idx);
+        log_stderr(VERBOSITY_DECISION, "[my_ice] removed switch rule %u\n", rule_idx);
 }
 
 static void set_ctx_bits(uint8_t *src_ctx, uint8_t *dest_ctx,
@@ -1434,12 +1502,12 @@ static int add_tx_queues(struct dev_ctx *d, uint16_t count)
         return -1;
     }
 
-    fprintf(stderr, "[my_ice] ADD_TXQS resp:");
+    log_stderr(VERBOSITY_DECISION, "[my_ice] ADD_TXQS resp:");
     for (i = 0; i < count; i++) {
-        fprintf(stderr, " txq_id=%u q_teid=0x%x",
-                le16toh(qg->txqs[i].txq_id), le32toh(qg->txqs[i].q_teid));
+        log_stderr(VERBOSITY_DECISION, " txq_id=%u q_teid=0x%x",
+                   le16toh(qg->txqs[i].txq_id), le32toh(qg->txqs[i].q_teid));
     }
-    fprintf(stderr, "\n");
+    log_stderr(VERBOSITY_DECISION, "\n");
 
     free(qg);
     return 0;
@@ -1457,10 +1525,10 @@ static void rss_log_lut_summary(const char *tag, const uint8_t *lut, uint16_t lu
             counts[q]++;
     }
 
-    fprintf(stderr, "[my_ice] %s size=%u queues=%u", tag, lut_size, num_rxq); // RSS:IMPL
+    log_stderr(VERBOSITY_DECISION, "[my_ice] %s size=%u queues=%u", tag, lut_size, num_rxq); // RSS:IMPL
     for (i = 0; i < num_rxq && i < ICE_MAX_RX_QUEUES; i++)
-        fprintf(stderr, " q%u=%u", i, counts[i]); // RSS:IMPL
-    fprintf(stderr, "\n"); // RSS:IMPL
+        log_stderr(VERBOSITY_DECISION, " q%u=%u", i, counts[i]); // RSS:IMPL
+    log_stderr(VERBOSITY_DECISION, "\n"); // RSS:IMPL
 }
 
 static int aq_set_rss_key(struct dev_ctx *d)
@@ -1475,8 +1543,8 @@ static int aq_set_rss_key(struct dev_ctx *d)
     rss = &desc.params.get_set_rss_key;
     rss->vsi_id = htole16((uint16_t)(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID));
 
-    fprintf(stderr, "[my_ice] RSS set key vsi=%u len=%u\n", d->io.vsi_num,
-            ICE_AQC_RSS_KEY_SIZE); // RSS:IMPL
+    log_stderr(VERBOSITY_DECISION, "[my_ice] RSS set key vsi=%u len=%u\n", d->io.vsi_num,
+               ICE_AQC_RSS_KEY_SIZE); // RSS:IMPL
     return aq_send_cmd(d, &desc, &key, sizeof(key));
 }
 
@@ -1494,8 +1562,8 @@ static int aq_get_set_rss_lut(struct dev_ctx *d, uint16_t flags, uint8_t *lut,
     cmd->vsi_id = htole16((uint16_t)(d->io.vsi_num | ICE_AQC_RSS_VSI_VALID));
     cmd->flags = htole16(flags);
 
-    fprintf(stderr, "[my_ice] RSS %s LUT vsi=%u flags=0x%04x len=%u\n",
-            set ? "set" : "get", d->io.vsi_num, flags, lut_size); // RSS:IMPL
+    log_stderr(VERBOSITY_DECISION, "[my_ice] RSS %s LUT vsi=%u flags=0x%04x len=%u\n",
+               set ? "set" : "get", d->io.vsi_num, flags, lut_size); // RSS:IMPL
     return aq_send_cmd(d, &desc, lut, lut_size);
 }
 
@@ -1520,12 +1588,12 @@ static int aq_get_vsi_params(struct dev_ctx *d, struct ice_aqc_vsi_props *props)
     if (aq_send_cmd(d, &desc, props, sizeof(*props)) < 0)
         return -1;
 
-    fprintf(stderr,
-            "[my_ice] RSS get VSI vsi=%u valid=0x%04x map_flags=0x%04x q_map0=%u q_map1=%u tc0=0x%04x q_opt_rss=0x%02x q_opt_tc=0x%02x q_opt_flags=0x%02x\n",
-            d->io.vsi_num, le16toh(props->valid_sections), le16toh(props->mapping_flags),
-            le16toh(props->q_mapping[0]), le16toh(props->q_mapping[1]),
-            le16toh(props->tc_mapping[0]), props->q_opt_rss, props->q_opt_tc,
-            props->q_opt_flags); // RSS:IMPL
+    log_stderr(VERBOSITY_DECISION,
+               "[my_ice] RSS get VSI vsi=%u valid=0x%04x map_flags=0x%04x q_map0=%u q_map1=%u tc0=0x%04x q_opt_rss=0x%02x q_opt_tc=0x%02x q_opt_flags=0x%02x\n",
+               d->io.vsi_num, le16toh(props->valid_sections), le16toh(props->mapping_flags),
+               le16toh(props->q_mapping[0]), le16toh(props->q_mapping[1]),
+               le16toh(props->tc_mapping[0]), props->q_opt_rss, props->q_opt_tc,
+               props->q_opt_flags); // RSS:IMPL
     return 0;
 }
 
@@ -1557,10 +1625,10 @@ static int aq_update_vsi_rss(struct dev_ctx *d)
     cmd = &desc.params.vsi_cmd;
     cmd->vsi_num = htole16((uint16_t)(d->io.vsi_num | ICE_AQ_VSI_IS_VALID));
 
-    fprintf(stderr,
-            "[my_ice] RSS update VSI vsi=%u first_rxq=%u num_rxq=%u tc0=0x%04x q_opt_rss=0x%02x\n",
-            d->io.vsi_num, first_rxq, d->io.rxq_count, tc_map,
-            props.q_opt_rss); // RSS:IMPL
+    log_stderr(VERBOSITY_DECISION,
+               "[my_ice] RSS update VSI vsi=%u first_rxq=%u num_rxq=%u tc0=0x%04x q_opt_rss=0x%02x\n",
+               d->io.vsi_num, first_rxq, d->io.rxq_count, tc_map,
+               props.q_opt_rss); // RSS:IMPL
     return aq_send_cmd(d, &desc, &props, sizeof(props));
 }
 
@@ -1578,7 +1646,7 @@ static int aq_get_pkg_info_list(struct dev_ctx *d)
 
     memcpy(&count, buf, sizeof(count));
     count = le32toh(count);
-    fprintf(stderr, "[my_ice] RSS package info count=%u\n", count); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "[my_ice] RSS package info count=%u\n", count); // RSS:IMPL
     for (i = 0; i < count; i++) {
         const struct ice_aqc_get_pkg_info *info;
         size_t off = sizeof(uint32_t) + (size_t)i * sizeof(*info);
@@ -1586,11 +1654,11 @@ static int aq_get_pkg_info_list(struct dev_ctx *d)
         if (off + sizeof(*info) > sizeof(buf))
             break;
         info = (const struct ice_aqc_get_pkg_info *)(buf + off);
-        fprintf(stderr,
-                "[my_ice] RSS package[%u] active=%u boot=%u modified=%u name='%.*s' ver=%u.%u.%u.%u\n",
-                i, info->is_active, info->is_active_at_boot, info->is_modified,
-                (int)sizeof(info->name), info->name, info->ver.major, info->ver.minor,
-                info->ver.update, info->ver.draft); // RSS:IMPL
+        log_stderr(VERBOSITY_TRACE,
+                   "[my_ice] RSS package[%u] active=%u boot=%u modified=%u name='%.*s' ver=%u.%u.%u.%u\n",
+                   i, info->is_active, info->is_active_at_boot, info->is_modified,
+                   (int)sizeof(info->name), info->name, info->ver.major, info->ver.minor,
+                   info->ver.update, info->ver.draft); // RSS:IMPL
     }
     return 0;
 }
@@ -1652,7 +1720,7 @@ static int aq_read_xlt2_rss(struct dev_ctx *d, uint16_t vsigs[ICE_XLT2_CNT])
         vsigs[i] = le16toh(v);
     }
 
-    fprintf(stderr, "[my_ice] RSS read XLT2 entries=%u\n", ICE_XLT2_CNT); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "[my_ice] RSS read XLT2 entries=%u\n", ICE_XLT2_CNT); // RSS:IMPL
     return 0;
 }
 
@@ -1674,7 +1742,7 @@ static int aq_read_xlt1_rss(struct dev_ctx *d, uint8_t ptgs[ICE_XLT1_CNT])
         return -1;
 
     memcpy(ptgs, xlt1->value, ICE_XLT1_CNT);
-    fprintf(stderr, "[my_ice] RSS read XLT1 entries=%u\n", ICE_XLT1_CNT); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "[my_ice] RSS read XLT1 entries=%u\n", ICE_XLT1_CNT); // RSS:IMPL
     return 0;
 }
 
@@ -1696,7 +1764,7 @@ static int aq_read_prof_redir_rss(struct dev_ctx *d, uint8_t prof_redir[ICE_RSS_
         return -1;
 
     memcpy(prof_redir, redir->redir_value, ICE_RSS_PROF_ID_COUNT);
-    fprintf(stderr, "[my_ice] RSS read PROFID_REDIR entries=%u\n", ICE_RSS_PROF_ID_COUNT); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "[my_ice] RSS read PROFID_REDIR entries=%u\n", ICE_RSS_PROF_ID_COUNT); // RSS:IMPL
     return 0;
 }
 
@@ -1739,7 +1807,7 @@ static int aq_read_prof_tcam_rss(struct dev_ctx *d,
         base = (uint16_t)(base + chunk);
     }
 
-    fprintf(stderr, "[my_ice] RSS read PROFID_TCAM entries=%u\n", ICE_RSS_PROF_TCAM_COUNT); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "[my_ice] RSS read PROFID_TCAM entries=%u\n", ICE_RSS_PROF_TCAM_COUNT); // RSS:IMPL
     return 0;
 }
 
@@ -1783,8 +1851,8 @@ static int aq_read_fld_vec_rss(struct dev_ctx *d,
         prof = (uint16_t)(prof + prof_count);
     }
 
-    fprintf(stderr, "[my_ice] RSS read FLD_VEC entries=%u fvw=%u\n",
-            ICE_RSS_PROF_ID_COUNT, ICE_RSS_FV_WORDS); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "[my_ice] RSS read FLD_VEC entries=%u fvw=%u\n",
+               ICE_RSS_PROF_ID_COUNT, ICE_RSS_FV_WORDS); // RSS:IMPL
     return 0;
 }
 
@@ -1794,18 +1862,18 @@ static void rss_log_profile_fv(uint8_t prof_id,
     uint16_t i;
     bool any = false;
 
-    fprintf(stderr, "[my_ice] RSS profile prof_id=%u fv", prof_id); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "[my_ice] RSS profile prof_id=%u fv", prof_id); // RSS:IMPL
     for (i = 0; i < ICE_RSS_FV_WORDS; i++) {
         uint16_t off = le16toh(fv[i].off);
 
         if (off == ICE_FV_OFFSET_INVAL)
             continue;
         any = true;
-        fprintf(stderr, " [%u:p=%u off=%u]", i, fv[i].prot_id, off); // RSS:IMPL
+        log_stderr(VERBOSITY_TRACE, " [%u:p=%u off=%u]", i, fv[i].prot_id, off); // RSS:IMPL
     }
     if (!any)
-        fprintf(stderr, " <empty>"); // RSS:IMPL
-    fprintf(stderr, "\n"); // RSS:IMPL
+        log_stderr(VERBOSITY_TRACE, " <empty>"); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "\n"); // RSS:IMPL
 }
 
 static bool rss_decode_key_byte(uint8_t key, uint8_t key_inv, uint8_t *val,
@@ -1882,7 +1950,7 @@ static void rss_inspect_active_vsig(struct dev_ctx *d, uint16_t active_vsig)
     uint16_t matched_hw_prof_count = 0;
 
     if (active_vsig == 0) {
-        fprintf(stderr, "[my_ice] RSS inspect skipped: active VSIG is default\n"); // RSS:IMPL
+        log_stderr(VERBOSITY_TRACE, "[my_ice] RSS inspect skipped: active VSIG is default\n"); // RSS:IMPL
         return;
     }
     if (aq_read_xlt1_rss(d, ptgs) < 0)
@@ -1897,7 +1965,7 @@ static void rss_inspect_active_vsig(struct dev_ctx *d, uint16_t active_vsig)
     for (ptype = 0; ptype < ICE_XLT1_CNT; ptype++)
         ptg_ptype_counts[ptgs[ptype]]++;
 
-    fprintf(stderr, "[my_ice] RSS inspect active_vsig=0x%04x begin\n", active_vsig); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE, "[my_ice] RSS inspect active_vsig=0x%04x begin\n", active_vsig); // RSS:IMPL
     for (ptype = 0; ptype < ICE_RSS_PROF_TCAM_COUNT; ptype++) {
         struct ice_prof_id_key decoded;
         uint8_t dc_mask[sizeof(decoded)];
@@ -1932,9 +2000,9 @@ static void rss_inspect_active_vsig(struct dev_ctx *d, uint16_t active_vsig)
             matched_ptg_count++;
         }
 
-        fprintf(stderr,
-                "[my_ice] RSS active_tcam idx=%u ptg=%u ptypes=%u sw_prof=%u hw_prof=%u flags=0x%04x flags_mask=0x%04x\n",
-                ptype, ptg, ptg_ptype_counts[ptg], sw_prof, hw_prof, flags, flags_mask); // RSS:IMPL
+        log_stderr(VERBOSITY_TRACE,
+                   "[my_ice] RSS active_tcam idx=%u ptg=%u ptypes=%u sw_prof=%u hw_prof=%u flags=0x%04x flags_mask=0x%04x\n",
+                   ptype, ptg, ptg_ptype_counts[ptg], sw_prof, hw_prof, flags, flags_mask); // RSS:IMPL
         if (hw_prof >= ICE_RSS_PROF_ID_COUNT || hw_prof_seen[hw_prof])
             continue;
         hw_prof_seen[hw_prof] = true;
@@ -1943,15 +2011,15 @@ static void rss_inspect_active_vsig(struct dev_ctx *d, uint16_t active_vsig)
     }
 
     if (!any_match) {
-        fprintf(stderr,
-                "[my_ice] RSS inspect active_vsig=0x%04x no PROFID_TCAM matches found\n",
-                active_vsig); // RSS:IMPL
+        log_stderr(VERBOSITY_TRACE,
+                   "[my_ice] RSS inspect active_vsig=0x%04x no PROFID_TCAM matches found\n",
+                   active_vsig); // RSS:IMPL
         return;
     }
 
-    fprintf(stderr,
-            "[my_ice] RSS inspect active_vsig=0x%04x matched_tcam=%u matched_ptgs=%u matched_hw_profiles=%u\n",
-            active_vsig, matched_tcam_count, matched_ptg_count, matched_hw_prof_count); // RSS:IMPL
+    log_stderr(VERBOSITY_TRACE,
+               "[my_ice] RSS inspect active_vsig=0x%04x matched_tcam=%u matched_ptgs=%u matched_hw_profiles=%u\n",
+               active_vsig, matched_tcam_count, matched_ptg_count, matched_hw_prof_count); // RSS:IMPL
 }
 
 static int aq_acquire_change_lock(struct dev_ctx *d)
@@ -1970,13 +2038,13 @@ static int aq_acquire_change_lock(struct dev_ctx *d)
         cmd->status = 0;
 
         if (aq_send_cmd(d, &desc, NULL, 0) == 0) {
-            fprintf(stderr, "[my_ice] RSS acquired change lock after %d tries\n", i + 1); // RSS:IMPL
+            log_stderr(VERBOSITY_DECISION, "[my_ice] RSS acquired change lock after %d tries\n", i + 1); // RSS:IMPL
             return 0;
         }
         if (le16toh(desc.retval) != ICE_AQ_RC_EBUSY)
             break;
-        fprintf(stderr, "[my_ice] RSS change lock busy try=%d retval=0x%04x\n",
-                i + 1, le16toh(desc.retval)); // RSS:IMPL
+        log_stderr(VERBOSITY_DECISION, "[my_ice] RSS change lock busy try=%d retval=0x%04x\n",
+                   i + 1, le16toh(desc.retval)); // RSS:IMPL
         usleep(10000);
     }
 
@@ -1996,7 +2064,7 @@ static void aq_release_change_lock(struct dev_ctx *d)
     if (aq_send_cmd(d, &desc, NULL, 0) < 0)
         fprintf(stderr, "[my_ice] RSS failed to release change lock\n"); // RSS:IMPL
     else
-        fprintf(stderr, "[my_ice] RSS released change lock\n"); // RSS:IMPL
+        log_stderr(VERBOSITY_DECISION, "[my_ice] RSS released change lock\n"); // RSS:IMPL
 }
 
 static int aq_write_xlt2_rss(struct dev_ctx *d, uint16_t vsi, uint16_t target_vsig)
@@ -2028,8 +2096,8 @@ static int aq_write_xlt2_rss(struct dev_ctx *d, uint16_t vsi, uint16_t target_vs
     cmd = &desc.params.download_pkg;
     cmd->flags = ICE_AQC_DOWNLOAD_PKG_LAST_BUF;
 
-    fprintf(stderr, "[my_ice] RSS write XLT2 vsi=%u target_vsig=0x%04x\n",
-            vsi, target_vsig); // RSS:IMPL
+    log_stderr(VERBOSITY_DECISION, "[my_ice] RSS write XLT2 vsi=%u target_vsig=0x%04x\n",
+               vsi, target_vsig); // RSS:IMPL
     return aq_send_cmd(d, &desc, buf, sizeof(buf));
 }
 
@@ -2086,9 +2154,9 @@ static int rss_select_target_vsig(struct dev_ctx *d, const uint16_t vsigs[ICE_XL
         candidates[cand_count].is_current = is_current;
         cand_count++;
 
-        fprintf(stderr,
-                "[my_ice] RSS candidate vsig=0x%04x pf=%u total=%u other=%u current=%u\n",
-                vsig, pf_num, counts[i], other, is_current ? 1 : 0); // RSS:IMPL
+        log_stderr(VERBOSITY_DECISION,
+                   "[my_ice] RSS candidate vsig=0x%04x pf=%u total=%u other=%u current=%u\n",
+                   vsig, pf_num, counts[i], other, is_current ? 1 : 0); // RSS:IMPL
     }
 
     for (i = 0; i < cand_count; i++) {
@@ -2123,10 +2191,10 @@ static int rss_select_target_vsig(struct dev_ctx *d, const uint16_t vsigs[ICE_XL
 
     *target_vsig = candidates[0].vsig;
     d->io.rss_target_vsig = *target_vsig;
-    fprintf(stderr,
-            "[my_ice] RSS selected target vsig=0x%04x current=0x%04x pf=%u other=%u\n",
-            candidates[0].vsig, d->io.rss_current_vsig, candidates[0].pf_num,
-            candidates[0].other_count); // RSS:IMPL
+    log_stderr(VERBOSITY_DECISION,
+               "[my_ice] RSS selected target vsig=0x%04x current=0x%04x pf=%u other=%u\n",
+               candidates[0].vsig, d->io.rss_current_vsig, candidates[0].pf_num,
+               candidates[0].other_count); // RSS:IMPL
     return 0;
 }
 
@@ -2145,9 +2213,9 @@ static int aq_associate_vsi_with_rss_profiles(struct dev_ctx *d)
         return 0;
     }
     if (d->io.rss_current_vsig == target_vsig) {
-        fprintf(stderr,
-                "[my_ice] RSS VSI=%u already in target VSIG=0x%04x\n",
-                d->io.vsi_num, target_vsig); // RSS:IMPL
+        log_stderr(VERBOSITY_DECISION,
+                   "[my_ice] RSS VSI=%u already in target VSIG=0x%04x\n",
+                   d->io.vsi_num, target_vsig); // RSS:IMPL
         return 0;
     }
 
@@ -2160,9 +2228,9 @@ static int aq_associate_vsi_with_rss_profiles(struct dev_ctx *d)
         return -1;
 
     if (aq_read_xlt2_rss(d, vsigs) == 0) {
-        fprintf(stderr,
-                "[my_ice] RSS verify XLT2 vsi=%u vsig=0x%04x\n",
-                d->io.vsi_num, vsigs[d->io.vsi_num]); // RSS:IMPL
+        log_stderr(VERBOSITY_DECISION,
+                   "[my_ice] RSS verify XLT2 vsi=%u vsig=0x%04x\n",
+                   d->io.vsi_num, vsigs[d->io.vsi_num]); // RSS:IMPL
     }
 
     return 0;
@@ -2177,8 +2245,8 @@ static int setup_rss_scaling(struct dev_ctx *d)
     if (d->io.rxq_count <= 1)
         return 0;
 
-    fprintf(stderr, "[my_ice] RSS setup start vsi=%u rxqs=%u first_rxq=%u\n",
-            d->io.vsi_num, d->io.rxq_count, d->io.rxqs[0].rxq_id); // RSS:IMPL
+    log_stderr(VERBOSITY_INIT, "[my_ice] RSS setup start vsi=%u rxqs=%u first_rxq=%u\n",
+               d->io.vsi_num, d->io.rxq_count, d->io.rxqs[0].rxq_id); // RSS:IMPL
     if (aq_set_rss_key(d) < 0)
         return -1;
 
@@ -2335,15 +2403,21 @@ static void tx_ring_init(struct dev_ctx *d)
         q->tx_next_to_clean = 0;
         q->tx_free = (uint16_t)(q->desc_count - 1);
         q->tx_pkts_since_rs = 0;
+        q->tx_started = false;
     }
 }
 
 static void tx_update_free(struct dev_ctx *d, struct txq_ctx *q)
 {
-    uint16_t head = (uint16_t)(reg_read32(d, QTX_COMM_HEAD(q->txq_id)) & 0x1FFFU);
+    uint16_t head;
     uint16_t ntu = q->tx_next_to_use;
     uint16_t used;
     uint16_t idx;
+
+    if (!q->tx_started)
+        return;
+
+    head = (uint16_t)(reg_read32(d, QTX_COMM_HEAD(q->txq_id)) & 0x1FFFU);
 
     if (head >= q->desc_count)
         head = (uint16_t)(head % q->desc_count);
@@ -2401,9 +2475,9 @@ static int poll_rx_batch(struct dev_ctx *d, struct rxq_ctx *rxq,
             uint32_t rss_hash = le32toh(rxd->wb.rss_hash);
             uint16_t rss_valid = (uint16_t)((status0 >> ICE_RX_FLEX_DESC_STATUS0_RSS_VALID_S) & 0x1U);
             rxq->rss_sampled = true;
-            fprintf(stderr,
-                    "[my_ice] RSS rx sample q=%u desc=%u rss_hash=0x%08x rss_valid=%u status0=0x%04x len=%u\n",
-                    rxq->rxq_id, idx, rss_hash, rss_valid, status0, pkt_len); // RSS:IMPL
+            log_stderr(VERBOSITY_TRACE,
+                       "[my_ice] RSS rx sample q=%u desc=%u rss_hash=0x%08x rss_valid=%u status0=0x%04x len=%u\n",
+                       rxq->rxq_id, idx, rss_hash, rss_valid, status0, pkt_len); // RSS:IMPL
         }
 
         out_idxs[count] = idx;
@@ -2580,6 +2654,7 @@ static int poll_one_rx_packet(struct dev_ctx *d, uint8_t *out, uint16_t out_sz, 
 
 static inline void tx_ring_doorbell(struct dev_ctx *d, struct txq_ctx *q)
 {
+    q->tx_started = true;
     reg_write32(d, QTX_COMM_DBELL(q->txq_id), q->tx_next_to_use);
 }
 
@@ -2608,17 +2683,17 @@ static void dump_mdet_regs(struct dev_ctx *d)
     uint32_t pf_rx = reg_read32(d, PF_MDET_RX);
 
     if (gl_tx_tclan & GL_MDET_TX_TCLAN_VALID_M)
-        fprintf(stderr, "[my_ice] GL_MDET_TX_TCLAN=0x%08x\n", gl_tx_tclan);
+        log_stderr(VERBOSITY_TRACE, "[my_ice] GL_MDET_TX_TCLAN=0x%08x\n", gl_tx_tclan);
     if (gl_tx_pqm & GL_MDET_TX_PQM_VALID_M)
-        fprintf(stderr, "[my_ice] GL_MDET_TX_PQM=0x%08x\n", gl_tx_pqm);
+        log_stderr(VERBOSITY_TRACE, "[my_ice] GL_MDET_TX_PQM=0x%08x\n", gl_tx_pqm);
     if (gl_rx & GL_MDET_RX_VALID_M)
-        fprintf(stderr, "[my_ice] GL_MDET_RX=0x%08x\n", gl_rx);
+        log_stderr(VERBOSITY_TRACE, "[my_ice] GL_MDET_RX=0x%08x\n", gl_rx);
     if (pf_tx_tclan & PF_MDET_TX_TCLAN_VALID_M)
-        fprintf(stderr, "[my_ice] PF_MDET_TX_TCLAN=0x%08x\n", pf_tx_tclan);
+        log_stderr(VERBOSITY_TRACE, "[my_ice] PF_MDET_TX_TCLAN=0x%08x\n", pf_tx_tclan);
     if (pf_tx_pqm & PF_MDET_TX_PQM_VALID_M)
-        fprintf(stderr, "[my_ice] PF_MDET_TX_PQM=0x%08x\n", pf_tx_pqm);
+        log_stderr(VERBOSITY_TRACE, "[my_ice] PF_MDET_TX_PQM=0x%08x\n", pf_tx_pqm);
     if (pf_rx & PF_MDET_RX_VALID_M)
-        fprintf(stderr, "[my_ice] PF_MDET_RX=0x%08x\n", pf_rx);
+        log_stderr(VERBOSITY_TRACE, "[my_ice] PF_MDET_RX=0x%08x\n", pf_rx);
 }
 
 static void dump_rx_desc_snapshot(struct dev_ctx *d)
@@ -2631,9 +2706,9 @@ static void dump_rx_desc_snapshot(struct dev_ctx *d)
         union ice_32b_rx_flex_desc *rxd = &rxq->rx_desc[idx];
         uint16_t status0 = le16toh(rxd->wb.status_error0);
         uint16_t pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
-        fprintf(stderr,
-                "[my_ice] rxdesc[%u] rxdid=%u status0=0x%04x pkt_len=%u\n",
-                idx, rxd->wb.rxdid, status0, pkt_len);
+        log_stderr(VERBOSITY_TRACE,
+                   "[my_ice] rxdesc[%u] rxdid=%u status0=0x%04x pkt_len=%u\n",
+                   idx, rxd->wb.rxdid, status0, pkt_len);
     }
 }
 
@@ -2672,31 +2747,31 @@ static void print_payload_dump(const uint8_t *pkt, uint16_t len)
     uint16_t i;
 
     if (len <= l2_len) {
-        printf("Payload: <none>\n");
+        log_stdout(VERBOSITY_TRACE, "Payload: <none>\n");
         return;
     }
 
     payload_len = (uint16_t)(len - l2_len);
     n = payload_len > dump_cap ? dump_cap : payload_len;
 
-    printf("Payload: %u bytes (showing %u)\n", payload_len, n);
-    printf("Payload ASCII: ");
+    log_stdout(VERBOSITY_TRACE, "Payload: %u bytes (showing %u)\n", payload_len, n);
+    log_stdout(VERBOSITY_TRACE, "Payload ASCII: ");
     for (i = 0; i < n; i++) {
         uint8_t c = pkt[l2_len + i];
-        putchar((c >= 32 && c <= 126) ? (char)c : '.');
+        log_putchar(VERBOSITY_TRACE, (c >= 32 && c <= 126) ? (char)c : '.');
     }
-    putchar('\n');
+    log_putchar(VERBOSITY_TRACE, '\n');
 
-    printf("Payload HEX:\n");
+    log_stdout(VERBOSITY_TRACE, "Payload HEX:\n");
     for (i = 0; i < n; i += 16) {
         uint16_t j;
         uint16_t line_end = (uint16_t)(i + 16);
         if (line_end > n)
             line_end = n;
-        printf("  %04x: ", i);
+        log_stdout(VERBOSITY_TRACE, "  %04x: ", i);
         for (j = i; j < line_end; j++)
-            printf("%02x ", pkt[l2_len + j]);
-        putchar('\n');
+            log_stdout(VERBOSITY_TRACE, "%02x ", pkt[l2_len + j]);
+        log_putchar(VERBOSITY_TRACE, '\n');
     }
 }
 
@@ -2728,10 +2803,10 @@ static int run_rx_listen(struct dev_ctx *d, int timeout_ms)
         goto out;
     }
 
-    fprintf(stderr, "[my_ice] rx-listen on vsi=%u lport=%u rxq=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-            d->io.vsi_num, d->io.lport, d->io.rxqs[0].rxq_id,
-            d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5]);
+    log_stderr(VERBOSITY_INIT, "[my_ice] rx-listen on vsi=%u lport=%u rxq=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
+               d->io.vsi_num, d->io.lport, d->io.rxqs[0].rxq_id,
+               d->io.mac[0], d->io.mac[1], d->io.mac[2],
+               d->io.mac[3], d->io.mac[4], d->io.mac[5]);
 
     if (setup_and_enable_rxq(d, &d->io.rxqs[0]) < 0) {
         fprintf(stderr, "[my_ice] setup/enable rx queue failed\n");
@@ -2754,13 +2829,13 @@ static int run_rx_listen(struct dev_ctx *d, int timeout_ms)
         }
         if (got > 0) {
             if (rxlen >= 14) {
-                printf("RXLISTEN: received %u bytes, dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x ethertype=0x%02x%02x\n",
-                       rxlen,
-                       rxpkt[0], rxpkt[1], rxpkt[2], rxpkt[3], rxpkt[4], rxpkt[5],
-                       rxpkt[6], rxpkt[7], rxpkt[8], rxpkt[9], rxpkt[10], rxpkt[11],
-                       rxpkt[12], rxpkt[13]);
+                log_stdout(VERBOSITY_TRACE, "RXLISTEN: received %u bytes, dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x ethertype=0x%02x%02x\n",
+                           rxlen,
+                           rxpkt[0], rxpkt[1], rxpkt[2], rxpkt[3], rxpkt[4], rxpkt[5],
+                           rxpkt[6], rxpkt[7], rxpkt[8], rxpkt[9], rxpkt[10], rxpkt[11],
+                           rxpkt[12], rxpkt[13]);
             } else {
-                printf("RXLISTEN: received %u bytes\n", rxlen);
+                log_stdout(VERBOSITY_TRACE, "RXLISTEN: received %u bytes\n", rxlen);
             }
             print_payload_dump(rxpkt, rxlen);
             rc = 0;
@@ -2783,7 +2858,7 @@ out:
 
 static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
 {
-    const uint16_t reflect_batch = RX_REFLECT_GLOBAL_BUDGET;
+    const uint16_t reflect_batch = d->rx_reflect_batch_size;
     struct pkt_mempool *pool = &d->reflect_pools[0];
     uint32_t tx_alloc;
     uint16_t first_rxq, last_rxq, first_txq, last_txq, avail_rxq, avail_txq;
@@ -2803,8 +2878,8 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
     uint64_t rx_bytes_per_q[ICE_MAX_RX_QUEUES] = {0};
     uint64_t tx_pkts_per_q[ICE_MAX_RX_QUEUES] = {0};
     uint64_t tx_bytes_per_q[ICE_MAX_RX_QUEUES] = {0};
-    struct pkt_buf *tx_pending_bufs[ICE_MAX_RX_QUEUES][RX_REFLECT_GLOBAL_BUDGET];
-    uint16_t tx_pending_lens[ICE_MAX_RX_QUEUES][RX_REFLECT_GLOBAL_BUDGET];
+    struct pkt_buf *tx_pending_bufs[ICE_MAX_RX_QUEUES][MAX_RX_REFLECT_BATCH_SIZE];
+    uint16_t tx_pending_lens[ICE_MAX_RX_QUEUES][MAX_RX_REFLECT_BATCH_SIZE];
     uint16_t tx_pending_count[ICE_MAX_RX_QUEUES] = {0};
     uint64_t tx_updates = 0;
     int rc = -1;
@@ -2876,12 +2951,12 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
 
     tx_ring_init(d);
 
-    fprintf(stderr,
-            "[my_ice] rx-reflect on vsi=%u lport=%u rxqs=%u rxq_base=%u txqs=%u txq_base=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d\n",
-            d->io.vsi_num, d->io.lport, d->io.rxq_count, d->io.rxqs[0].rxq_id,
-            d->txq_count, d->txqs[0].txq_id,
-            d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms);
+    log_stderr(VERBOSITY_INIT,
+               "[my_ice] rx-reflect on vsi=%u lport=%u rxqs=%u rxq_base=%u txqs=%u txq_base=%u tx_batch=%u rx_batch=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d\n",
+               d->io.vsi_num, d->io.lport, d->io.rxq_count, d->io.rxqs[0].rxq_id,
+               d->txq_count, d->txqs[0].txq_id, d->tx_batch_size, reflect_batch,
+               d->io.mac[0], d->io.mac[1], d->io.mac[2],
+               d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms);
 
     gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
                                      GLV_GORCH(d->io.vsi_num));
@@ -2894,15 +2969,15 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
     next_report_ns = start_ns + NS_PER_S;
 
     while ((now_ns = monotonic_ns()) < end_ns) {
-        uint16_t rx_idxs[RX_REFLECT_GLOBAL_BUDGET];
-        uint16_t rx_lens[RX_REFLECT_GLOBAL_BUDGET];
-        uint16_t rx_qids[RX_REFLECT_GLOBAL_BUDGET];
-        uint16_t rearm_idxs[ICE_MAX_RX_QUEUES][RX_REFLECT_GLOBAL_BUDGET];
+        uint16_t rx_idxs[MAX_RX_REFLECT_BATCH_SIZE];
+        uint16_t rx_lens[MAX_RX_REFLECT_BATCH_SIZE];
+        uint16_t rx_qids[MAX_RX_REFLECT_BATCH_SIZE];
+        uint16_t rearm_idxs[ICE_MAX_RX_QUEUES][MAX_RX_REFLECT_BATCH_SIZE];
         uint16_t rearm_counts[ICE_MAX_RX_QUEUES] = {0};
-        uint16_t tx_qids[RX_REFLECT_GLOBAL_BUDGET];
-        struct pkt_buf *replacement_bufs[RX_REFLECT_GLOBAL_BUDGET];
-        struct pkt_buf *tx_bufs[RX_REFLECT_GLOBAL_BUDGET];
-        uint16_t tx_lens[RX_REFLECT_GLOBAL_BUDGET];
+        uint16_t tx_qids[MAX_RX_REFLECT_BATCH_SIZE];
+        struct pkt_buf *replacement_bufs[MAX_RX_REFLECT_BATCH_SIZE];
+        struct pkt_buf *tx_bufs[MAX_RX_REFLECT_BATCH_SIZE];
+        uint16_t tx_lens[MAX_RX_REFLECT_BATCH_SIZE];
         uint64_t batch_rx_bytes = 0;
         bool rx_seen = false;
         bool stalled = false;
@@ -3019,11 +3094,11 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
             uint16_t qidx = (uint16_t)(tx_qids[i] % d->txq_count);
             uint16_t slot = tx_pending_count[qidx]++;
 
-            if (slot >= RX_REFLECT_GLOBAL_BUDGET) {
+            if (slot >= reflect_batch) {
                 pkt_buf_free(tx_bufs[i]);
                 tx_ring_full++;
                 stalled = true;
-                tx_pending_count[qidx] = RX_REFLECT_GLOBAL_BUDGET;
+                tx_pending_count[qidx] = reflect_batch;
                 continue;
             }
 
@@ -3036,7 +3111,7 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
             uint16_t queued = tx_pending_count[i];
             uint16_t sent;
 
-            if (queued < TX_BURST_SIZE && !stalled && now_ns + 1000000ULL < end_ns)
+            if (queued < d->tx_batch_size && !stalled && now_ns + 1000000ULL < end_ns)
                 continue;
 
             sent = tx_try_enqueue_pkt_buf_batch(d, q, tx_pending_bufs[i], queued);
@@ -3079,26 +3154,26 @@ report_progress:
             uint64_t interval_tx_pkts = tx_pkts - prev_tx_pkts;
             uint64_t interval_tx_bytes = tx_bytes - prev_tx_bytes;
 
-            fprintf(stderr,
-                    "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f\n",
-                    (double)(now_ns - start_ns) / (double)NS_PER_S,
-                    bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_tx_pkts, interval_tx_bytes),
-                                     interval_ns),
-                    bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_rx_pkts, interval_rx_bytes),
-                                     interval_ns),
-                    pkts_ns_to_mpps(interval_tx_pkts, interval_ns),
-                    pkts_ns_to_mpps(interval_rx_pkts, interval_ns));
+            log_stderr(VERBOSITY_PROGRESS,
+                       "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f\n",
+                       (double)(now_ns - start_ns) / (double)NS_PER_S,
+                       bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_tx_pkts, interval_tx_bytes),
+                                        interval_ns),
+                       bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_rx_pkts, interval_rx_bytes),
+                                        interval_ns),
+                       pkts_ns_to_mpps(interval_tx_pkts, interval_ns),
+                       pkts_ns_to_mpps(interval_rx_pkts, interval_ns));
 
-            fprintf(stderr, "[my_ice] RSS queue distribution"); // RSS:IMPL
+            log_stderr(VERBOSITY_PROGRESS, "[my_ice] RSS queue distribution"); // RSS:IMPL
             for (i = 0; i < d->io.rxq_count; i++) {
                 double rx_pkt_pct = rx_pkts ? (100.0 * (double)rx_pkts_per_q[i] / (double)rx_pkts) : 0.0;
                 double tx_pkt_pct = tx_pkts ? (100.0 * (double)tx_pkts_per_q[i] / (double)tx_pkts) : 0.0;
-                fprintf(stderr,
-                        " rxq%u=%.2f%% txq%u=%.2f%%",
-                        d->io.rxqs[i].rxq_id, rx_pkt_pct,
-                        d->txqs[i].txq_id, tx_pkt_pct); // RSS:IMPL
+                log_stderr(VERBOSITY_PROGRESS,
+                           " rxq%u=%.2f%% txq%u=%.2f%%",
+                           d->io.rxqs[i].rxq_id, rx_pkt_pct,
+                           d->txqs[i].txq_id, tx_pkt_pct); // RSS:IMPL
             }
-            fprintf(stderr, "\n"); // RSS:IMPL
+            log_stderr(VERBOSITY_PROGRESS, "\n"); // RSS:IMPL
 
             last_report_ns = now_ns;
             prev_rx_pkts = rx_pkts;
@@ -3158,38 +3233,38 @@ report_progress:
                                     GLV_GORCH(d->io.vsi_num));
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
-    fprintf(stderr,
-            "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
-            " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
-            " rx_pkts=%" PRIu64 " rx_bytes=%" PRIu64
-            " tx_pkts=%" PRIu64 " tx_bytes=%" PRIu64
-            " zero_copy_pkts=%" PRIu64 " zero_copy_bytes=%" PRIu64
-            " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
-            " pool_empty=%" PRIu64 " doorbells=%" PRIu64
-            " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
-            (double)(active_end_ns - start_ns) / 1e9,
-            bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts, tx_bytes), active_end_ns - start_ns),
-            bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts, rx_bytes), active_end_ns - start_ns),
-            pkts_ns_to_mpps(tx_pkts, active_end_ns - start_ns),
-            pkts_ns_to_mpps(rx_pkts, active_end_ns - start_ns),
-            bytes_ns_to_gbps(tx_bytes, active_end_ns - start_ns),
-            bytes_ns_to_gbps(rx_bytes, active_end_ns - start_ns),
-            rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
-            tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
-            counter40_delta(gorc_after, gorc_before),
-            counter40_delta(gotc_after, gotc_before));
-    fprintf(stderr, "[my_ice] RSS final queue stats"); // RSS:IMPL
+    log_stderr(VERBOSITY_SUMMARY,
+               "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
+               " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
+               " rx_pkts=%" PRIu64 " rx_bytes=%" PRIu64
+               " tx_pkts=%" PRIu64 " tx_bytes=%" PRIu64
+               " zero_copy_pkts=%" PRIu64 " zero_copy_bytes=%" PRIu64
+               " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
+               " pool_empty=%" PRIu64 " doorbells=%" PRIu64
+               " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
+               (double)(active_end_ns - start_ns) / 1e9,
+               bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts, tx_bytes), active_end_ns - start_ns),
+               bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts, rx_bytes), active_end_ns - start_ns),
+               pkts_ns_to_mpps(tx_pkts, active_end_ns - start_ns),
+               pkts_ns_to_mpps(rx_pkts, active_end_ns - start_ns),
+               bytes_ns_to_gbps(tx_bytes, active_end_ns - start_ns),
+               bytes_ns_to_gbps(rx_bytes, active_end_ns - start_ns),
+               rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
+               tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
+               counter40_delta(gorc_after, gorc_before),
+               counter40_delta(gotc_after, gotc_before));
+    log_stderr(VERBOSITY_SUMMARY, "[my_ice] RSS final queue stats"); // RSS:IMPL
     for (uint16_t i = 0; i < d->io.rxq_count; i++) {
         double rx_pkt_pct = rx_pkts ? (100.0 * (double)rx_pkts_per_q[i] / (double)rx_pkts) : 0.0;
         double tx_pkt_pct = tx_pkts ? (100.0 * (double)tx_pkts_per_q[i] / (double)tx_pkts) : 0.0;
-        fprintf(stderr,
-                " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ") txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ")",
-                d->io.rxqs[i].rxq_id, rx_pkts_per_q[i], rx_pkt_pct,
-                rx_bytes_per_q[i],
-                d->txqs[i].txq_id, tx_pkts_per_q[i], tx_pkt_pct,
-                tx_bytes_per_q[i]); // RSS:IMPL
+        log_stderr(VERBOSITY_SUMMARY,
+                   " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ") txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ")",
+                   d->io.rxqs[i].rxq_id, rx_pkts_per_q[i], rx_pkt_pct,
+                   rx_bytes_per_q[i],
+                   d->txqs[i].txq_id, tx_pkts_per_q[i], tx_pkt_pct,
+                   tx_bytes_per_q[i]); // RSS:IMPL
     }
-    fprintf(stderr, "\n"); // RSS:IMPL
+    log_stderr(VERBOSITY_SUMMARY, "\n"); // RSS:IMPL
     rc = 0;
 
 out:
@@ -3261,13 +3336,14 @@ static void *rx_reflect_worker_main(void *arg)
 {
     struct rx_reflect_worker *w = arg;
     struct dev_ctx *d = w->d;
+    const uint16_t reflect_batch = d->rx_reflect_batch_size;
     struct rxq_ctx *rxq = w->rxq;
     struct txq_ctx *txq = w->txq;
     struct pkt_mempool *pool = w->pool;
     struct rx_reflect_stats_page *stats = w->stats;
     struct rx_reflect_counters local = {0};
-    struct pkt_buf *tx_pending_bufs[RX_REFLECT_GLOBAL_BUDGET];
-    uint16_t tx_pending_lens[RX_REFLECT_GLOBAL_BUDGET];
+    struct pkt_buf *tx_pending_bufs[MAX_RX_REFLECT_BATCH_SIZE];
+    uint16_t tx_pending_lens[MAX_RX_REFLECT_BATCH_SIZE];
     uint16_t tx_pending_count = 0;
     uint64_t tx_updates = 0;
     uint64_t publish_budget = 0;
@@ -3280,16 +3356,16 @@ static void *rx_reflect_worker_main(void *arg)
     }
 
     while (monotonic_ns() < w->end_ns) {
-        uint16_t rx_idxs[RX_REFLECT_GLOBAL_BUDGET];
-        uint16_t rx_lens[RX_REFLECT_GLOBAL_BUDGET];
-        uint16_t rearm_idxs[RX_REFLECT_GLOBAL_BUDGET];
-        struct pkt_buf *replacement_bufs[RX_REFLECT_GLOBAL_BUDGET];
-        struct pkt_buf *tx_bufs[RX_REFLECT_GLOBAL_BUDGET];
-        uint16_t tx_lens[RX_REFLECT_GLOBAL_BUDGET];
+        uint16_t rx_idxs[MAX_RX_REFLECT_BATCH_SIZE];
+        uint16_t rx_lens[MAX_RX_REFLECT_BATCH_SIZE];
+        uint16_t rearm_idxs[MAX_RX_REFLECT_BATCH_SIZE];
+        struct pkt_buf *replacement_bufs[MAX_RX_REFLECT_BATCH_SIZE];
+        struct pkt_buf *tx_bufs[MAX_RX_REFLECT_BATCH_SIZE];
+        uint16_t tx_lens[MAX_RX_REFLECT_BATCH_SIZE];
         uint64_t batch_rx_bytes = 0;
         bool stalled = false;
         bool rx_seen = false;
-        uint16_t budget = RX_REFLECT_GLOBAL_BUDGET;
+        uint16_t budget = reflect_batch;
         uint16_t replacement_needed = 0;
         uint16_t tx_count = 0;
         uint16_t got;
@@ -3415,10 +3491,10 @@ static void *rx_reflect_worker_main(void *arg)
         for (uint16_t i = 0; i < tx_count; i++) {
             uint16_t slot = tx_pending_count++;
 
-            if (slot >= RX_REFLECT_GLOBAL_BUDGET) {
+            if (slot >= reflect_batch) {
                 pkt_buf_free(tx_bufs[i]);
                 local.tx_ring_full++;
-                tx_pending_count = RX_REFLECT_GLOBAL_BUDGET;
+                tx_pending_count = reflect_batch;
                 stalled = true;
                 continue;
             }
@@ -3611,11 +3687,11 @@ static int run_rx_reflect_mt(struct dev_ctx *d, int timeout_ms)
 
     tx_ring_init(d);
 
-    fprintf(stderr,
-            "[my_ice] rx-reflect(mt) on vsi=%u lport=%u rxqs=%u rxq_base=%u txqs=%u txq_base=%u numa=%d%s timeout_ms=%d\n",
-            d->io.vsi_num, d->io.lport, d->io.rxq_count, d->io.rxqs[0].rxq_id,
-            d->txq_count, d->txqs[0].txq_id, numa_node,
-            numa_fallback ? " (affinity fallback)" : "", timeout_ms);
+    log_stderr(VERBOSITY_INIT,
+               "[my_ice] rx-reflect(mt) on vsi=%u lport=%u rxqs=%u rxq_base=%u txqs=%u txq_base=%u tx_batch=%u rx_batch=%u numa=%d%s timeout_ms=%d\n",
+               d->io.vsi_num, d->io.lport, d->io.rxq_count, d->io.rxqs[0].rxq_id,
+               d->txq_count, d->txqs[0].txq_id, d->tx_batch_size, d->rx_reflect_batch_size, numa_node,
+               numa_fallback ? " (affinity fallback)" : "", timeout_ms);
 
     gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
                                      GLV_GORCH(d->io.vsi_num));
@@ -3662,31 +3738,31 @@ static int run_rx_reflect_mt(struct dev_ctx *d, int timeout_ms)
                 tx_pkts += atomic_load_explicit(&stats_pages[i].tx_pkts, memory_order_relaxed);
                 tx_bytes += atomic_load_explicit(&stats_pages[i].tx_bytes, memory_order_relaxed);
             }
-            fprintf(stderr,
-                    "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f\n",
-                    (double)(now_ns - start_ns) / (double)NS_PER_S,
-                    bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts - prev_tx_pkts,
-                                                            tx_bytes - prev_tx_bytes),
-                                     interval_ns),
-                    bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts - prev_rx_pkts,
-                                                            rx_bytes - prev_rx_bytes),
-                                     interval_ns),
-                    pkts_ns_to_mpps(tx_pkts - prev_tx_pkts, interval_ns),
-                    pkts_ns_to_mpps(rx_pkts - prev_rx_pkts, interval_ns));
+            log_stderr(VERBOSITY_PROGRESS,
+                       "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f\n",
+                       (double)(now_ns - start_ns) / (double)NS_PER_S,
+                       bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts - prev_tx_pkts,
+                                                               tx_bytes - prev_tx_bytes),
+                                        interval_ns),
+                       bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts - prev_rx_pkts,
+                                                               rx_bytes - prev_rx_bytes),
+                                        interval_ns),
+                       pkts_ns_to_mpps(tx_pkts - prev_tx_pkts, interval_ns),
+                       pkts_ns_to_mpps(rx_pkts - prev_rx_pkts, interval_ns));
 
-            fprintf(stderr, "[my_ice] RSS queue distribution"); // RSS:IMPL
+            log_stderr(VERBOSITY_PROGRESS, "[my_ice] RSS queue distribution"); // RSS:IMPL
             for (uint16_t i = 0; i < d->io.rxq_count; i++) {
                 uint64_t q_rx_pkts = atomic_load_explicit(&stats_pages[i].rx_pkts, memory_order_relaxed);
                 uint64_t q_tx_pkts = atomic_load_explicit(&stats_pages[i].tx_pkts, memory_order_relaxed);
                 double rx_pkt_pct = rx_pkts ? (100.0 * (double)q_rx_pkts / (double)rx_pkts) : 0.0;
                 double tx_pkt_pct = tx_pkts ? (100.0 * (double)q_tx_pkts / (double)tx_pkts) : 0.0;
 
-                fprintf(stderr,
-                        " rxq%u=%.2f%% txq%u=%.2f%%",
-                        d->io.rxqs[i].rxq_id, rx_pkt_pct,
-                        d->txqs[i].txq_id, tx_pkt_pct); // RSS:IMPL
+                log_stderr(VERBOSITY_PROGRESS,
+                           " rxq%u=%.2f%% txq%u=%.2f%%",
+                           d->io.rxqs[i].rxq_id, rx_pkt_pct,
+                           d->txqs[i].txq_id, tx_pkt_pct); // RSS:IMPL
             }
-            fprintf(stderr, "\n"); // RSS:IMPL
+            log_stderr(VERBOSITY_PROGRESS, "\n"); // RSS:IMPL
 
             last_report_ns = now_ns;
             prev_rx_pkts = rx_pkts;
@@ -3743,27 +3819,27 @@ join_workers:
                                         GLV_GORCH(d->io.vsi_num));
         gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                         GLV_GOTCH(d->io.vsi_num));
-        fprintf(stderr,
-                "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
-                " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
-                " rx_pkts=%" PRIu64 " rx_bytes=%" PRIu64
-                " tx_pkts=%" PRIu64 " tx_bytes=%" PRIu64
-                " zero_copy_pkts=%" PRIu64 " zero_copy_bytes=%" PRIu64
-                " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
-                " pool_empty=%" PRIu64 " doorbells=%" PRIu64
-                " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
-                (double)(active_end_ns - start_ns) / 1e9,
-                bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts, tx_bytes), active_end_ns - start_ns),
-                bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts, rx_bytes), active_end_ns - start_ns),
-                pkts_ns_to_mpps(tx_pkts, active_end_ns - start_ns),
-                pkts_ns_to_mpps(rx_pkts, active_end_ns - start_ns),
-                bytes_ns_to_gbps(tx_bytes, active_end_ns - start_ns),
-                bytes_ns_to_gbps(rx_bytes, active_end_ns - start_ns),
-                rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
-                tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
-                counter40_delta(gorc_after, gorc_before),
-                counter40_delta(gotc_after, gotc_before));
-        fprintf(stderr, "[my_ice] RSS final queue stats"); // RSS:IMPL
+        log_stderr(VERBOSITY_SUMMARY,
+                   "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
+                   " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
+                   " rx_pkts=%" PRIu64 " rx_bytes=%" PRIu64
+                   " tx_pkts=%" PRIu64 " tx_bytes=%" PRIu64
+                   " zero_copy_pkts=%" PRIu64 " zero_copy_bytes=%" PRIu64
+                   " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
+                   " pool_empty=%" PRIu64 " doorbells=%" PRIu64
+                   " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
+                   (double)(active_end_ns - start_ns) / 1e9,
+                   bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts, tx_bytes), active_end_ns - start_ns),
+                   bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts, rx_bytes), active_end_ns - start_ns),
+                   pkts_ns_to_mpps(tx_pkts, active_end_ns - start_ns),
+                   pkts_ns_to_mpps(rx_pkts, active_end_ns - start_ns),
+                   bytes_ns_to_gbps(tx_bytes, active_end_ns - start_ns),
+                   bytes_ns_to_gbps(rx_bytes, active_end_ns - start_ns),
+                   rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
+                   tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
+                   counter40_delta(gorc_after, gorc_before),
+                   counter40_delta(gotc_after, gotc_before));
+        log_stderr(VERBOSITY_SUMMARY, "[my_ice] RSS final queue stats"); // RSS:IMPL
         for (uint16_t i = 0; i < d->io.rxq_count; i++) {
             uint64_t q_rx_pkts = atomic_load_explicit(&stats_pages[i].rx_pkts, memory_order_relaxed);
             uint64_t q_rx_bytes = atomic_load_explicit(&stats_pages[i].rx_bytes, memory_order_relaxed);
@@ -3772,14 +3848,14 @@ join_workers:
             double rx_pkt_pct = rx_pkts ? (100.0 * (double)q_rx_pkts / (double)rx_pkts) : 0.0;
             double tx_pkt_pct = tx_pkts ? (100.0 * (double)q_tx_pkts / (double)tx_pkts) : 0.0;
 
-            fprintf(stderr,
-                    " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ") txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ")",
-                    d->io.rxqs[i].rxq_id, q_rx_pkts, rx_pkt_pct,
-                    q_rx_bytes,
-                    d->txqs[i].txq_id, q_tx_pkts, tx_pkt_pct,
-                    q_tx_bytes); // RSS:IMPL
+            log_stderr(VERBOSITY_SUMMARY,
+                       " rxq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ") txq%u(pkts=%" PRIu64 ",%.2f%% bytes=%" PRIu64 ")",
+                       d->io.rxqs[i].rxq_id, q_rx_pkts, rx_pkt_pct,
+                       q_rx_bytes,
+                       d->txqs[i].txq_id, q_tx_pkts, tx_pkt_pct,
+                       q_tx_bytes); // RSS:IMPL
         }
-        fprintf(stderr, "\n"); // RSS:IMPL
+        log_stderr(VERBOSITY_SUMMARY, "\n"); // RSS:IMPL
     }
 
     rc = 0;
@@ -3854,14 +3930,14 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
     if (frame_len < 60)
         frame_len = 60;
 
-    fprintf(stderr,
-            "[my_ice] tx-send on vsi=%u lport=%u txq=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x count=%d interval_ms=%d payload_len=%zu frame_len=%u\n",
-            d->io.vsi_num, d->io.lport, q->txq_id,
-            d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5],
-            dst_mac[0], dst_mac[1], dst_mac[2],
-            dst_mac[3], dst_mac[4], dst_mac[5],
-            count, interval_ms, payload_len, frame_len);
+    log_stderr(VERBOSITY_INIT,
+               "[my_ice] tx-send on vsi=%u lport=%u txq=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x count=%d interval_ms=%d payload_len=%zu frame_len=%u\n",
+               d->io.vsi_num, d->io.lport, q->txq_id,
+               d->io.mac[0], d->io.mac[1], d->io.mac[2],
+               d->io.mac[3], d->io.mac[4], d->io.mac[5],
+               dst_mac[0], dst_mac[1], dst_mac[2],
+               dst_mac[3], dst_mac[4], dst_mac[5],
+               count, interval_ms, payload_len, frame_len);
 
     gotc_before = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                      GLV_GOTCH(d->io.vsi_num));
@@ -3895,8 +3971,8 @@ static int run_tx_send(struct dev_ctx *d, const uint8_t *dst_mac, int count,
 
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
-    fprintf(stderr, "[my_ice] tx-send done, VSI%u GOTC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, counter40_delta(gotc_after, gotc_before));
+    log_stderr(VERBOSITY_SUMMARY, "[my_ice] tx-send done, VSI%u GOTC +%" PRIu64 " bytes\n",
+               d->io.vsi_num, counter40_delta(gotc_after, gotc_before));
     return 0;
 }
 
@@ -3913,6 +3989,7 @@ struct tx_bench_worker {
 static void *tx_bench_worker_main(void *arg)
 {
     struct tx_bench_worker *w = arg;
+    const uint16_t tx_batch = w->d->tx_batch_size;
 
     if (w->cpu_id >= 0)
         pin_thread_to_cpu(w->cpu_id);
@@ -3924,10 +4001,10 @@ static void *tx_bench_worker_main(void *arg)
         if (monotonic_ns() >= w->end_ns)
             break;
 
-        if (w->q->tx_free < TX_BURST_SIZE)
+        if (w->q->tx_free < tx_batch)
             tx_update_free(w->d, w->q);
 
-        for (i = 0; i < TX_BURST_SIZE; i++) {
+        for (i = 0; i < tx_batch; i++) {
             int enq = tx_try_enqueue(w->d, w->q, w->pkt, w->frame_len, false, NULL, NULL);
             if (enq == 0) {
                 burst_pkts++;
@@ -4029,18 +4106,19 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
             fprintf(stderr, "[my_ice] warning: failed to read CPU affinity, disabling pinning\n");
             pin_cpus = false;
         } else {
-            fprintf(stderr, "[my_ice] pinning tx threads to CPUs (count=%d)\n", cpu_count);
+            log_stderr(VERBOSITY_INIT, "[my_ice] pinning tx threads to CPUs (count=%d)\n", cpu_count);
         }
     }
 
-    fprintf(stderr,
-            "[my_ice] tx-bench on vsi=%u lport=%u txqs=%u txq_base=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x seconds=%d payload_len=%d frame_len=%u\n",
-            d->io.vsi_num, d->io.lport, d->txq_count, d->txqs[0].txq_id,
-            d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5],
-            dst_mac[0], dst_mac[1], dst_mac[2],
-            dst_mac[3], dst_mac[4], dst_mac[5],
-            seconds, payload_len, frame_len);
+    log_stderr(VERBOSITY_INIT,
+               "[my_ice] tx-bench on vsi=%u lport=%u txqs=%u txq_base=%u tx_batch=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x seconds=%d payload_len=%d frame_len=%u\n",
+               d->io.vsi_num, d->io.lport, d->txq_count, d->txqs[0].txq_id,
+               d->tx_batch_size,
+               d->io.mac[0], d->io.mac[1], d->io.mac[2],
+               d->io.mac[3], d->io.mac[4], d->io.mac[5],
+               dst_mac[0], dst_mac[1], dst_mac[2],
+               dst_mac[3], dst_mac[4], dst_mac[5],
+               seconds, payload_len, frame_len);
 
     gotc_start = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
@@ -4101,10 +4179,10 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
             gbps = interval_s > 0.0 ?
                 ((double)interval_bytes * 8.0) / (interval_s * 1e9) : 0.0;
 
-            fprintf(stderr,
-                    "[my_ice] tx-bench t=%.2fs interval: Gbps=%.3f\n",
-                    (double)(now_ns - start_ns) / (double)one_sec_ns,
-                    gbps);
+            log_stderr(VERBOSITY_PROGRESS,
+                       "[my_ice] tx-bench t=%.2fs interval: Gbps=%.3f\n",
+                       (double)(now_ns - start_ns) / (double)one_sec_ns,
+                       gbps);
 
             last_report_ns = now_ns;
             gotc_prev = gotc_now;
@@ -4146,9 +4224,9 @@ static int run_tx_bench(struct dev_ctx *d, const uint8_t *dst_mac, int seconds,
         double avg_gbps = total_s > 0.0 ?
             ((double)total_bytes * 8.0) / (total_s * 1e9) : 0.0;
 
-        fprintf(stderr,
-                "[my_ice] tx-bench done: seconds=%.3f avg_Gbps=%.3f\n",
-                total_s, avg_gbps);
+        log_stderr(VERBOSITY_SUMMARY,
+                   "[my_ice] tx-bench done: seconds=%.3f avg_Gbps=%.3f\n",
+                   total_s, avg_gbps);
     }
 
     return 0;
@@ -4264,6 +4342,8 @@ int main(int argc, char **argv)
     bool run_tx_bench_mode = false;
     bool use_hugepages = false;
     const char *huge_dir = "/mnt/huge";
+    uint16_t tx_batch_size = DEFAULT_TX_BATCH_SIZE;
+    uint16_t rx_reflect_batch_size = DEFAULT_RX_REFLECT_BATCH_SIZE;
     uint16_t rxq_count = 1;
     uint16_t txq_count = 1;
     uint16_t tx_desc_count = ICE_TX_DESC_COUNT;
@@ -4283,12 +4363,15 @@ int main(int argc, char **argv)
     size_t dma_bytes;
     size_t dma_map_bytes;
     int rc = EXIT_FAILURE;
+    int argi = 1;
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--rx-queues <1|2|4|8>] [--tx-queues <n>] [--tx-desc-count <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-v|-vv|-vvv|-vvvv] <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--rx-queues <1|2|4|8>] [--tx-queues <n>] [--tx-desc-count <n>] [--tx-batch-size <1..1024>] [--rx-batch-size <1..1024>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen\n", argv[0]);
+        fprintf(stderr, "Example: %s -vv 0000:17:00.0 --rx-reflect 60\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen 60\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60 --rx-batch-size 64 --tx-batch-size 64\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send aa:bb:cc:dd:ee:ff\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send aa:bb:cc:dd:ee:ff 20 100 hello\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-bench 10 aa:bb:cc:dd:ee:ff 46\n", argv[0]);
@@ -4296,14 +4379,30 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
-    bdf = argv[1];
+    while (argi < argc) {
+        uint8_t extra_levels;
+
+        if (!parse_verbosity_arg(argv[argi], &extra_levels))
+            break;
+        if (extra_levels > 4)
+            extra_levels = 4;
+        g_verbosity = (uint8_t)(VERBOSITY_SUMMARY + extra_levels);
+        argi++;
+    }
+
+    if (argi >= argc) {
+        fprintf(stderr, "missing <BDF>\n");
+        return EXIT_FAILURE;
+    }
+
+    bdf = argv[argi++];
     if (snprintf(d.pci_bdf, sizeof(d.pci_bdf), "%s", bdf) < 0 ||
         strlen(bdf) >= sizeof(d.pci_bdf)) {
         fprintf(stderr, "pci bdf too long: '%s'\n", bdf);
         return EXIT_FAILURE;
     }
-    if (argc >= 3) {
-        int i = 2;
+    if (argi < argc) {
+        int i = argi;
         bool mode_set = false;
 
         while (i < argc) {
@@ -4458,6 +4557,34 @@ int main(int argc, char **argv)
                 }
                 tx_desc_count = (uint16_t)v;
                 i += 2;
+            } else if (strcmp(argv[i], "--tx-batch-size") == 0) {
+                int v;
+
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--tx-batch-size requires <n>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_int_range(argv[i + 1], 1, 1024, &v) < 0) {
+                    fprintf(stderr, "invalid --tx-batch-size '%s' (expected 1..1024)\n",
+                            argv[i + 1]);
+                    return EXIT_FAILURE;
+                }
+                tx_batch_size = (uint16_t)v;
+                i += 2;
+            } else if (strcmp(argv[i], "--rx-batch-size") == 0) {
+                int v;
+
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--rx-batch-size requires <n>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_int_range(argv[i + 1], 1, MAX_RX_REFLECT_BATCH_SIZE, &v) < 0) {
+                    fprintf(stderr, "invalid --rx-batch-size '%s' (expected 1..%u)\n",
+                            argv[i + 1], MAX_RX_REFLECT_BATCH_SIZE);
+                    return EXIT_FAILURE;
+                }
+                rx_reflect_batch_size = (uint16_t)v;
+                i += 2;
             } else if (strcmp(argv[i], "--pin-cpus") == 0) {
                 pin_cpus = true;
                 i++;
@@ -4496,6 +4623,8 @@ int main(int argc, char **argv)
 
     d.io.rxq_count = rxq_count;
     d.io.rxq_poll_next = 0;
+    d.tx_batch_size = tx_batch_size;
+    d.rx_reflect_batch_size = rx_reflect_batch_size;
     d.txq_count = txq_count;
     d.txq_alloc_count = txq_count;
     d.tx_desc_count = tx_desc_count;
@@ -4507,9 +4636,9 @@ int main(int argc, char **argv)
     g_qparent_override_set = qparent_override_set;
     g_qparent_override = qparent_override;
 
-    fprintf(stderr, "[my_ice] opening VFIO device %s\n", bdf);
+    log_stderr(VERBOSITY_INIT, "[my_ice] opening VFIO device %s\n", bdf);
     vfio_init(&d, bdf);
-    fprintf(stderr, "[my_ice] vfio init done, bar0_size=0x%zx\n", d.bar0_size);
+    log_stderr(VERBOSITY_INIT, "[my_ice] vfio init done, bar0_size=0x%zx\n", d.bar0_size);
 
     dma_bytes =
         ICE_AQ_NUM_DESC * sizeof(struct ice_aq_desc) +
@@ -4525,7 +4654,7 @@ int main(int argc, char **argv)
 
     dma_map_bytes = dma_bytes;
     if (use_hugepages) {
-        fprintf(stderr, "[my_ice] using hugepages from %s\n", huge_dir);
+        log_stderr(VERBOSITY_INIT, "[my_ice] using hugepages from %s\n", huge_dir);
         dma_map_bytes = prepare_hugepage_file(&d, dma_bytes, huge_dir);
     }
 
@@ -4534,31 +4663,31 @@ int main(int argc, char **argv)
     pkt_pool_init(&d);
     adminq_hw_init(&d);
 
-    fprintf(stderr, "[my_ice] adminq initialized, sending GET_VER\n");
+    log_stderr(VERBOSITY_INIT, "[my_ice] adminq initialized, sending GET_VER\n");
     if (aq_get_fw_ver(&d) < 0)
         goto out;
 
-    fprintf(stderr, "[my_ice] GET_VER ok, sending MANAGE_MAC_READ\n");
+    log_stderr(VERBOSITY_INIT, "[my_ice] GET_VER ok, sending MANAGE_MAC_READ\n");
     if (aq_manage_mac_read(&d) < 0)
         goto out;
 
     if (run_rx_listen_mode) {
-        fprintf(stderr, "[my_ice] running rx listen path\n");
+        log_stderr(VERBOSITY_INIT, "[my_ice] running rx listen path\n");
         if (run_rx_listen(&d, rx_listen_timeout_s * 1000) < 0)
             goto out;
     } else if (run_rx_reflect_mode) {
-        fprintf(stderr, "[my_ice] running rx reflect path%s\n",
-                d.io.rxq_count > 1 ? " (multithreaded)" : "");
+        log_stderr(VERBOSITY_INIT, "[my_ice] running rx reflect path%s\n",
+                   d.io.rxq_count > 1 ? " (multithreaded)" : "");
         if ((d.io.rxq_count > 1 ? run_rx_reflect_mt(&d, rx_reflect_timeout_s * 1000)
                                 : run_rx_reflect(&d, rx_reflect_timeout_s * 1000)) < 0)
             goto out;
     } else if (run_tx_send_mode) {
-        fprintf(stderr, "[my_ice] running tx send path\n");
+        log_stderr(VERBOSITY_INIT, "[my_ice] running tx send path\n");
         if (run_tx_send(&d, tx_send_dst_mac, tx_send_count,
                         tx_send_interval_ms, tx_send_payload) < 0)
             goto out;
     } else if (run_tx_bench_mode) {
-        fprintf(stderr, "[my_ice] running tx bench path\n");
+        log_stderr(VERBOSITY_INIT, "[my_ice] running tx bench path\n");
         if (run_tx_bench(&d, tx_bench_dst_mac, tx_bench_seconds,
                          tx_bench_payload_len, pin_cpus) < 0)
             goto out;

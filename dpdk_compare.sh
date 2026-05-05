@@ -200,9 +200,9 @@ run_myice() {
   fi
 
   log="$(mktemp)"
-  echo "[compare] running my_ice..."
+  echo "[compare] running my_ice with -vvvv..."
   set +e
-  "${MYICE_BIN}" "${MYICE_BDF}" --tx-bench "${DURATION_S}" "${DST_MAC}" "${PAYLOAD_LEN}" 2>&1 | tee "${log}"
+  "${MYICE_BIN}" -vvvv "${MYICE_BDF}" --tx-bench "${DURATION_S}" "${DST_MAC}" "${PAYLOAD_LEN}" 2>&1 | tee "${log}"
   local rc=${PIPESTATUS[0]}
   set -e
 
