@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra -std=c11
+CFLAGS ?= -O2 -Wall -Wextra -std=c11 -g -fno-omit-frame-pointer
 
 TARGET = my_ice
 SRCS = main.c
