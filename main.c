@@ -42,11 +42,12 @@
 #define ALIGN_UP(v, a) (((v) + ((a) - 1)) & ~((size_t)((a) - 1)))
 #define NS_PER_S 1000000000ULL
 #define TX_BURST_SIZE 64
+#define MAX_REFLECT_BATCH 256
 #define TX_RS_THRESH 32
 #define ETH_WIRE_OVERHEAD_BYTES 24U
 #define ICE_PKT_BUF_DATA_SIZE \
     ((ICE_RX_BUF_SIZE > ICE_TX_PKT_BUF_SIZE) ? ICE_RX_BUF_SIZE : ICE_TX_PKT_BUF_SIZE)
-#define ICE_REFLECT_POOL_EXTRA TX_BURST_SIZE
+#define ICE_REFLECT_POOL_EXTRA MAX_REFLECT_BATCH
 
 static bool g_dump_topo = false;
 static bool g_qparent_override_set = false;
@@ -128,6 +129,7 @@ struct dev_ctx {
     int group_id;
     int huge_fd;
     char huge_path[PATH_MAX];
+    char metrics_log_path[PATH_MAX];
     uint8_t *bar0;
     size_t bar0_size;
     uint16_t txq_count;
@@ -140,6 +142,31 @@ struct dev_ctx {
     struct aq_ring_ctx arq;
     struct io_ring_ctx io;
     struct pkt_mempool reflect_pool;
+};
+
+struct rx_reflect_metrics {
+    double seconds_total;
+    double tx_wire_gbps;
+    double rx_wire_gbps;
+    double tx_mpps;
+    double rx_mpps;
+    double tx_l2_gbps;
+    double rx_l2_gbps;
+    uint64_t rx_pkts;
+    uint64_t rx_bytes;
+    uint64_t tx_pkts;
+    uint64_t tx_bytes;
+    uint64_t zero_copy_pkts;
+    uint64_t zero_copy_bytes;
+    uint64_t tx_ring_full;
+    uint64_t rx_short;
+    uint64_t rx_errors;
+    uint64_t pool_empty;
+    uint64_t doorbells;
+    uint16_t vsi_num;
+    uint16_t reflect_batch;
+    uint64_t gorc_delta;
+    uint64_t gotc_delta;
 };
 
 static void rearm_rx_desc(struct dev_ctx *d, uint16_t idx);
@@ -294,6 +321,112 @@ static double pkts_ns_to_mpps(uint64_t pkts, uint64_t duration_ns)
 static uint64_t l2_bytes_to_wire_bytes(uint64_t pkts, uint64_t l2_bytes)
 {
     return l2_bytes + pkts * ETH_WIRE_OVERHEAD_BYTES;
+}
+
+static int copy_path_option(char dst[PATH_MAX], const char *src, const char *opt_name)
+{
+    int n;
+
+    if (!src || src[0] == '\0') {
+        fprintf(stderr, "%s requires a non-empty path\n", opt_name);
+        return -1;
+    }
+
+    n = snprintf(dst, PATH_MAX, "%s", src);
+    if (n < 0 || n >= PATH_MAX) {
+        fprintf(stderr, "%s path too long\n", opt_name);
+        return -1;
+    }
+
+    return 0;
+}
+
+static int write_rx_reflect_metrics_log(const struct dev_ctx *d,
+                                        const struct rx_reflect_metrics *metrics)
+{
+    char tmp_path[PATH_MAX];
+    FILE *fp = NULL;
+    int n;
+    int saved_errno = 0;
+
+    if (!d || !metrics || d->metrics_log_path[0] == '\0')
+        return 0;
+
+    n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", d->metrics_log_path);
+    if (n < 0 || n >= (int)sizeof(tmp_path)) {
+        fprintf(stderr, "[my_ice] metrics log temp path too long for %s\n",
+                d->metrics_log_path);
+        return -1;
+    }
+
+    fp = fopen(tmp_path, "w");
+    if (!fp) {
+        fprintf(stderr, "[my_ice] failed to open metrics log %s: %s\n",
+                tmp_path, strerror(errno));
+        return -1;
+    }
+
+#define WRITE_METRIC(fmt, ...)                                                      \
+    do {                                                                            \
+        if (fprintf(fp, fmt "\n", ##__VA_ARGS__) < 0) {                             \
+            saved_errno = errno;                                                    \
+            goto fail;                                                              \
+        }                                                                           \
+    } while (0)
+
+    WRITE_METRIC("schema=my_ice_rx_reflect_v1");
+    WRITE_METRIC("mode=rx_reflect");
+    WRITE_METRIC("seconds_total=%.6f", metrics->seconds_total);
+    WRITE_METRIC("tx_wire_gbps=%.6f", metrics->tx_wire_gbps);
+    WRITE_METRIC("rx_wire_gbps=%.6f", metrics->rx_wire_gbps);
+    WRITE_METRIC("tx_mpps=%.6f", metrics->tx_mpps);
+    WRITE_METRIC("rx_mpps=%.6f", metrics->rx_mpps);
+    WRITE_METRIC("tx_l2_gbps=%.6f", metrics->tx_l2_gbps);
+    WRITE_METRIC("rx_l2_gbps=%.6f", metrics->rx_l2_gbps);
+    WRITE_METRIC("rx_pkts=%" PRIu64, metrics->rx_pkts);
+    WRITE_METRIC("rx_bytes=%" PRIu64, metrics->rx_bytes);
+    WRITE_METRIC("tx_pkts=%" PRIu64, metrics->tx_pkts);
+    WRITE_METRIC("tx_bytes=%" PRIu64, metrics->tx_bytes);
+    WRITE_METRIC("zero_copy_pkts=%" PRIu64, metrics->zero_copy_pkts);
+    WRITE_METRIC("zero_copy_bytes=%" PRIu64, metrics->zero_copy_bytes);
+    WRITE_METRIC("tx_ring_full=%" PRIu64, metrics->tx_ring_full);
+    WRITE_METRIC("rx_short=%" PRIu64, metrics->rx_short);
+    WRITE_METRIC("rx_errors=%" PRIu64, metrics->rx_errors);
+    WRITE_METRIC("pool_empty=%" PRIu64, metrics->pool_empty);
+    WRITE_METRIC("doorbells=%" PRIu64, metrics->doorbells);
+    WRITE_METRIC("vsi_num=%u", metrics->vsi_num);
+    WRITE_METRIC("reflect_batch=%u", metrics->reflect_batch);
+    WRITE_METRIC("gorc_delta=%" PRIu64, metrics->gorc_delta);
+    WRITE_METRIC("gotc_delta=%" PRIu64, metrics->gotc_delta);
+
+#undef WRITE_METRIC
+
+    if (fclose(fp) != 0) {
+        saved_errno = errno;
+        fp = NULL;
+        goto fail;
+    }
+    fp = NULL;
+
+    if (rename(tmp_path, d->metrics_log_path) != 0) {
+        fprintf(stderr, "[my_ice] failed to rename metrics log %s -> %s: %s\n",
+                tmp_path, d->metrics_log_path, strerror(errno));
+        unlink(tmp_path);
+        return -1;
+    }
+
+    fprintf(stderr, "[my_ice] wrote metrics log %s\n", d->metrics_log_path);
+    return 0;
+
+fail:
+    if (fp)
+        fclose(fp);
+    unlink(tmp_path);
+    if (saved_errno == 0)
+        saved_errno = errno;
+    fprintf(stderr, "[my_ice] failed to write metrics log %s: %s\n",
+            d->metrics_log_path, strerror(saved_errno));
+    return -1;
 }
 
 static int build_cpu_list(int *out, int max_out)
@@ -1678,9 +1811,8 @@ out:
     return rc;
 }
 
-static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
+static int run_rx_reflect(struct dev_ctx *d, int timeout_ms, uint16_t reflect_batch)
 {
-    const uint16_t reflect_batch = TX_BURST_SIZE;
     uint32_t rx_alloc;
     uint32_t tx_alloc;
     uint16_t first_q, last_q, avail_q;
@@ -1696,6 +1828,7 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
     uint64_t prev_tx_pkts = 0, prev_tx_bytes = 0;
     uint64_t gorc_before, gorc_after, gotc_before, gotc_after;
     uint64_t start_ns, now_ns;
+    struct rx_reflect_metrics metrics;
     struct txq_ctx *q;
     int rc = -1;
 
@@ -1751,10 +1884,10 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
     q = &d->txqs[0];
 
     fprintf(stderr,
-            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d\n",
+            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d reflect_batch=%u\n",
             d->io.vsi_num, d->io.lport, d->io.rxq_id, q->txq_id,
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms);
+            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms, reflect_batch);
 
     gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
                                      GLV_GORCH(d->io.vsi_num));
@@ -1765,12 +1898,12 @@ static int run_rx_reflect(struct dev_ctx *d, int timeout_ms)
     next_report_ns = start_ns + NS_PER_S;
 
     while (monotonic_ns() - start_ns < (uint64_t)timeout_ms * 1000000ULL) {
-        uint16_t rx_idxs[TX_BURST_SIZE];
-        uint16_t rx_lens[TX_BURST_SIZE];
-        uint16_t rearm_idxs[TX_BURST_SIZE];
-        uint16_t tx_lens[TX_BURST_SIZE];
-        struct pkt_buf *replacement_bufs[TX_BURST_SIZE];
-        struct pkt_buf *tx_bufs[TX_BURST_SIZE];
+        uint16_t rx_idxs[MAX_REFLECT_BATCH];
+        uint16_t rx_lens[MAX_REFLECT_BATCH];
+        uint16_t rearm_idxs[MAX_REFLECT_BATCH];
+        uint16_t tx_lens[MAX_REFLECT_BATCH];
+        struct pkt_buf *replacement_bufs[MAX_REFLECT_BATCH];
+        struct pkt_buf *tx_bufs[MAX_REFLECT_BATCH];
         uint64_t batch_rx_bytes = 0;
         bool rx_seen = false;
         bool stalled = false;
@@ -1930,6 +2063,30 @@ report_progress:
                                     GLV_GORCH(d->io.vsi_num));
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
+    metrics.seconds_total = (double)(now_ns - start_ns) / 1e9;
+    metrics.tx_wire_gbps =
+        bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts, tx_bytes), now_ns - start_ns);
+    metrics.rx_wire_gbps =
+        bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts, rx_bytes), now_ns - start_ns);
+    metrics.tx_mpps = pkts_ns_to_mpps(tx_pkts, now_ns - start_ns);
+    metrics.rx_mpps = pkts_ns_to_mpps(rx_pkts, now_ns - start_ns);
+    metrics.tx_l2_gbps = bytes_ns_to_gbps(tx_bytes, now_ns - start_ns);
+    metrics.rx_l2_gbps = bytes_ns_to_gbps(rx_bytes, now_ns - start_ns);
+    metrics.rx_pkts = rx_pkts;
+    metrics.rx_bytes = rx_bytes;
+    metrics.tx_pkts = tx_pkts;
+    metrics.tx_bytes = tx_bytes;
+    metrics.zero_copy_pkts = zero_copy_pkts;
+    metrics.zero_copy_bytes = zero_copy_bytes;
+    metrics.tx_ring_full = tx_ring_full;
+    metrics.rx_short = rx_short;
+    metrics.rx_errors = rx_errors;
+    metrics.pool_empty = pool_empty;
+    metrics.doorbells = doorbells;
+    metrics.vsi_num = d->io.vsi_num;
+    metrics.reflect_batch = reflect_batch;
+    metrics.gorc_delta = gorc_after - gorc_before;
+    metrics.gotc_delta = gotc_after - gotc_before;
     fprintf(stderr,
             "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
             " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
@@ -1939,16 +2096,20 @@ report_progress:
             " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
             " pool_empty=%" PRIu64 " doorbells=%" PRIu64
             " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
-            (double)(now_ns - start_ns) / 1e9,
-            bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts, tx_bytes), now_ns - start_ns),
-            bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts, rx_bytes), now_ns - start_ns),
-            pkts_ns_to_mpps(tx_pkts, now_ns - start_ns),
-            pkts_ns_to_mpps(rx_pkts, now_ns - start_ns),
-            bytes_ns_to_gbps(tx_bytes, now_ns - start_ns),
-            bytes_ns_to_gbps(rx_bytes, now_ns - start_ns),
+            metrics.seconds_total,
+            metrics.tx_wire_gbps,
+            metrics.rx_wire_gbps,
+            metrics.tx_mpps,
+            metrics.rx_mpps,
+            metrics.tx_l2_gbps,
+            metrics.rx_l2_gbps,
             rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
             tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
-            gorc_after - gorc_before, gotc_after - gotc_before);
+            metrics.gorc_delta, metrics.gotc_delta);
+
+    if (write_rx_reflect_metrics_log(d, &metrics) < 0)
+        goto out;
+
     rc = 0;
 
 out:
@@ -2420,6 +2581,7 @@ int main(int argc, char **argv)
         .device_fd = -1,
         .huge_fd = -1,
         .huge_path = {0},
+        .metrics_log_path = {0},
     };
     const char *bdf;
     bool run_rx_listen_mode = false;
@@ -2430,8 +2592,10 @@ int main(int argc, char **argv)
     const char *huge_dir = "/mnt/huge";
     uint16_t txq_count = 1;
     uint16_t tx_desc_count = ICE_TX_DESC_COUNT;
+    uint16_t reflect_batch = TX_BURST_SIZE;
     bool pin_cpus = false;
     bool dump_topo = false;
+    const char *metrics_log = NULL;
     uint32_t qparent_override = 0;
     bool qparent_override_set = false;
     int rx_listen_timeout_s = 30;
@@ -2448,10 +2612,12 @@ int main(int argc, char **argv)
     int rc = EXIT_FAILURE;
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--tx-queues <n>] [--tx-desc-count <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--tx-queues <n>] [--tx-desc-count <n>] [--reflect-batch <n>] [--metrics-log <path>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen 60\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60 --reflect-batch 32\n", argv[0]);
+        fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60 --metrics-log /tmp/my_ice_metrics.log\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send aa:bb:cc:dd:ee:ff\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-send aa:bb:cc:dd:ee:ff 20 100 hello\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --tx-bench 10 aa:bb:cc:dd:ee:ff 46\n", argv[0]);
@@ -2599,6 +2765,26 @@ int main(int argc, char **argv)
                 }
                 tx_desc_count = (uint16_t)v;
                 i += 2;
+            } else if (strcmp(argv[i], "--reflect-batch") == 0) {
+                int v;
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--reflect-batch requires <n>\n");
+                    return EXIT_FAILURE;
+                }
+                if (parse_int_range(argv[i + 1], 1, MAX_REFLECT_BATCH, &v) < 0) {
+                    fprintf(stderr, "invalid --reflect-batch '%s' (expected 1..%u)\n",
+                            argv[i + 1], MAX_REFLECT_BATCH);
+                    return EXIT_FAILURE;
+                }
+                reflect_batch = (uint16_t)v;
+                i += 2;
+            } else if (strcmp(argv[i], "--metrics-log") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--metrics-log requires <path>\n");
+                    return EXIT_FAILURE;
+                }
+                metrics_log = argv[i + 1];
+                i += 2;
             } else if (strcmp(argv[i], "--pin-cpus") == 0) {
                 pin_cpus = true;
                 i++;
@@ -2631,6 +2817,8 @@ int main(int argc, char **argv)
     d.txq_count = txq_count;
     d.txq_alloc_count = txq_count;
     d.tx_desc_count = tx_desc_count;
+    if (metrics_log && copy_path_option(d.metrics_log_path, metrics_log, "--metrics-log") < 0)
+        return EXIT_FAILURE;
     d.txqs = calloc(d.txq_count, sizeof(*d.txqs));
     if (!d.txqs)
         die_errno("calloc txqs");
@@ -2680,7 +2868,7 @@ int main(int argc, char **argv)
             goto out;
     } else if (run_rx_reflect_mode) {
         fprintf(stderr, "[my_ice] running rx reflect path\n");
-        if (run_rx_reflect(&d, rx_reflect_timeout_s * 1000) < 0)
+        if (run_rx_reflect(&d, rx_reflect_timeout_s * 1000, reflect_batch) < 0)
             goto out;
     } else if (run_tx_send_mode) {
         fprintf(stderr, "[my_ice] running tx send path\n");
