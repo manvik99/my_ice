@@ -2,10 +2,10 @@
 set -euo pipefail
 
 IFACE="${1:-enp23s0f0}"
-DST_MAC="${2:-40:a6:b7:c3:43:e8}"
-DURATION="${3:-10}"      # seconds
-PKT_SIZE="${4:-1014}"    # 14-byte Ethernet header + payload
-THREAD_SPEC="${5:-0}"    # kpktgend threads: "0" or "0,1,2,3" or "all"
+DST_MAC="${2:-40:a6:b7:c3:43:d8}"
+DURATION="${3:-100}"      # seconds
+PKT_SIZE="${4:-60}"    # 14-byte Ethernet header + payload
+THREAD_SPEC="${5:-"0,1,2,3,4,5,6,7,8,9,10,11,12"}"    # kpktgend threads: "0" or "0,1,2,3" or "all"
 QUEUE_BASE="${6:-0}"     # first TX queue index to use
 BURST="${7:-32}"         # packets per scheduling round; helps for small packets
 START_PID=""

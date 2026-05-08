@@ -29,6 +29,7 @@ NON_NUMERIC_SUMMARY_COLS = {
     "hugepage_dir",
     "stdout_log",
     "stderr_log",
+    "metrics_log",
     "perf_file",
 }
 
@@ -44,6 +45,7 @@ RATIO_METRICS = [
 ]
 
 HOTSPOT_LINE_RE = re.compile(r"^\s*[0-9]+\.[0-9]+%")
+STANDALONE_BATCH_RE = re.compile(r"batch(\d+)", re.IGNORECASE)
 
 
 def latest_run_dir(results_root: Path) -> Path:
@@ -76,6 +78,458 @@ def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
         if col not in NON_NUMERIC_SUMMARY_COLS:
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def _read_text(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return path.read_text(errors="replace")
+
+
+def _sanitize_event_name(event: str) -> str:
+    return re.sub(r"[^a-z0-9_]", "_", event.lower().replace("-", "_"))
+
+
+def _batch_size_from_name(path: Path, default: int = 64) -> int:
+    match = STANDALONE_BATCH_RE.search(path.stem)
+    if not match:
+        return default
+    return int(match.group(1))
+
+
+def _calc_gbps_from_bytes_and_seconds(num_bytes: float | int | None, seconds: float | int | None) -> float:
+    if num_bytes is None or seconds is None or pd.isna(num_bytes) or pd.isna(seconds) or float(seconds) == 0.0:
+        return np.nan
+    return (float(num_bytes) * 8.0) / (float(seconds) * 1e9)
+
+
+def _calc_avg_pkts_per_doorbell(packets: float | int | None, doorbells: float | int | None) -> float:
+    if packets is None or doorbells is None or pd.isna(packets) or pd.isna(doorbells) or float(doorbells) == 0.0:
+        return np.nan
+    return float(packets) / float(doorbells)
+
+
+def _calc_ns_per_pkt_from_mpps(mpps: float | int | None) -> float:
+    if mpps is None or pd.isna(mpps) or float(mpps) == 0.0:
+        return np.nan
+    return 1000.0 / float(mpps)
+
+
+def _calc_scaled_rate(rate: float | int | None, active_s: float | int | None, total_s: float | int | None) -> float:
+    if (
+        rate is None
+        or active_s is None
+        or total_s is None
+        or pd.isna(rate)
+        or pd.isna(active_s)
+        or pd.isna(total_s)
+        or float(total_s) == 0.0
+    ):
+        return np.nan
+    return float(rate) * float(active_s) / float(total_s)
+
+
+def _calc_bytes_per_pkt(num_bytes: float | int | None, packets: float | int | None) -> float:
+    if num_bytes is None or packets is None or pd.isna(num_bytes) or pd.isna(packets) or float(packets) == 0.0:
+        return np.nan
+    return float(num_bytes) / float(packets)
+
+
+def _calc_l2_gbps_from_mpps_and_bytes_per_pkt(mpps: float | int | None, bytes_per_pkt: float | int | None) -> float:
+    if mpps is None or bytes_per_pkt is None or pd.isna(mpps) or pd.isna(bytes_per_pkt):
+        return np.nan
+    return float(mpps) * float(bytes_per_pkt) * 0.008
+
+
+def _load_kv_metrics(path: Path) -> dict[str, str]:
+    data: dict[str, str] = {}
+    for line in _read_text(path).splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key.strip()] = value.strip()
+    return data
+
+
+def _search_last(pattern: str, text: str) -> re.Match[str] | None:
+    matches = list(re.finditer(pattern, text, flags=re.MULTILINE))
+    return matches[-1] if matches else None
+
+
+def _parse_c_summary_line(text: str) -> dict[str, float]:
+    match = _search_last(r"^\[my_ice\] rx-reflect done:.*$", text)
+    if not match:
+        return {}
+
+    line = match.group(0)
+    out: dict[str, float] = {}
+    for key in [
+        "seconds",
+        "TX",
+        "RX",
+        "tx_mpps",
+        "rx_mpps",
+        "tx_l2_gbps",
+        "rx_l2_gbps",
+        "rx_pkts",
+        "rx_bytes",
+        "tx_pkts",
+        "tx_bytes",
+        "zero_copy_pkts",
+        "zero_copy_bytes",
+        "tx_ring_full",
+        "rx_short",
+        "rx_errors",
+        "pool_empty",
+        "doorbells",
+        "GORC_delta",
+        "GOTC_delta",
+    ]:
+        found = re.search(rf"{re.escape(key)}=([^ ]+)", line)
+        if found:
+            out[key] = pd.to_numeric(found.group(1), errors="coerce")
+    return out
+
+
+def _parse_rust_run_logs(text: str) -> dict[str, float]:
+    out: dict[str, float] = {}
+
+    timing = _search_last(
+        r"^\s*active=(?P<active>[\d.]+)s\s+join=(?P<join>[\d.]+)s\s+drain=(?P<drain>[\d.]+)s\s+total=(?P<total>[\d.]+)s$",
+        text,
+    )
+    if timing:
+        out["seconds_active"] = float(timing.group("active"))
+        out["seconds_join"] = float(timing.group("join"))
+        out["seconds_drain"] = float(timing.group("drain"))
+        out["seconds_total"] = float(timing.group("total"))
+
+    sw = _search_last(
+        r"^\s*sw:\s+rx\s+(?P<rx_gbps>[\d.]+)\s+Gbps\s+tx\s+(?P<tx_gbps>[\d.]+)\s+Gbps\s+(?P<tx_mpps>[\d.]+)\s+Mpps\s+(?P<ns_per_pkt>[\d.]+)\s+ns/pkt$",
+        text,
+    )
+    if sw:
+        out["steady_rx_wire_gbps"] = float(sw.group("rx_gbps"))
+        out["steady_tx_wire_gbps"] = float(sw.group("tx_gbps"))
+        out["steady_tx_mpps"] = float(sw.group("tx_mpps"))
+        out["steady_rx_mpps"] = float(sw.group("tx_mpps"))
+        out["steady_ns_per_pkt"] = float(sw.group("ns_per_pkt"))
+
+    packets = _search_last(
+        r"^\s*total:\s+rx\s+(?P<rx_pkts>\d+)\s+pkts\s+\((?P<rx_bytes>\d+)\s+bytes\)\s+tx\s+(?P<tx_pkts>\d+)\s+pkts\s+\((?P<tx_bytes>\d+)\s+bytes\)$",
+        text,
+    )
+    if packets:
+        out["rx_pkts"] = float(packets.group("rx_pkts"))
+        out["rx_bytes"] = float(packets.group("rx_bytes"))
+        out["tx_pkts"] = float(packets.group("tx_pkts"))
+        out["tx_bytes"] = float(packets.group("tx_bytes"))
+        out["zero_copy_pkts"] = float(packets.group("tx_pkts"))
+        out["zero_copy_bytes"] = float(packets.group("tx_bytes"))
+
+    status = _search_last(r"tx_ring_full=(?P<tx_ring_full>\d+)\s+rx_short=(?P<rx_short>\d+)", text)
+    if status:
+        out["tx_ring_full"] = float(status.group("tx_ring_full"))
+        out["rx_short"] = float(status.group("rx_short"))
+
+    batching = _search_last(
+        r"^\s*doorbells=(?P<doorbells>\d+)\s+tail_advances=(?P<tail_advances>\d+)\s+total_mmio_writes=(?P<total_mmio_writes>\d+)\s+mmio/sec=(?P<mmio_per_sec>[\d.]+)$",
+        text,
+    )
+    if batching:
+        out["doorbells"] = float(batching.group("doorbells"))
+        out["tail_advances"] = float(batching.group("tail_advances"))
+        out["total_mmio_writes"] = float(batching.group("total_mmio_writes"))
+        out["mmio_per_sec"] = float(batching.group("mmio_per_sec"))
+
+    batching_avg = _search_last(
+        r"^\s*avg_pkts_per_doorbell=(?P<avg_pkts_per_doorbell>[\d.]+)\s+pkts_per_mmio_write=(?P<pkts_per_mmio_write>[\d.]+)$",
+        text,
+    )
+    if batching_avg:
+        out["avg_pkts_per_doorbell"] = float(batching_avg.group("avg_pkts_per_doorbell"))
+        out["pkts_per_mmio_write"] = float(batching_avg.group("pkts_per_mmio_write"))
+
+    polling = _search_last(
+        r"^\s*total_iterations=(?P<total_iterations>\d+)\s+empty_polls=(?P<empty_polls>\d+)\s+\((?P<empty_poll_pct>[\d.]+)%\)$",
+        text,
+    )
+    if polling:
+        out["total_iterations"] = float(polling.group("total_iterations"))
+        out["empty_polls"] = float(polling.group("empty_polls"))
+        out["empty_poll_pct"] = float(polling.group("empty_poll_pct"))
+
+    reclaim = _search_last(
+        r"^\s*reclaim_calls=(?P<reclaim_calls>\d+)\s+avg_pending_rearm_depth=(?P<avg_pending_rearm_depth>[\d.]+)$",
+        text,
+    )
+    if reclaim:
+        out["reclaim_calls"] = float(reclaim.group("reclaim_calls"))
+        out["avg_pending_rearm_depth"] = float(reclaim.group("avg_pending_rearm_depth"))
+
+    port = _search_last(
+        r"^\s*port:\s+GORC=(?P<gorc>\d+)\s+\((?P<rx_gbps>[\d.]+)\s+Gbps\)\s+GOTC=(?P<gotc>\d+)\s+\((?P<tx_gbps>[\d.]+)\s+Gbps\)$",
+        text,
+    )
+    if port:
+        out["gorc_delta"] = float(port.group("gorc"))
+        out["gotc_delta"] = float(port.group("gotc"))
+        out["port_rx_gbps"] = float(port.group("rx_gbps"))
+        out["port_tx_gbps"] = float(port.group("tx_gbps"))
+
+    final_line = _search_last(r"rx-reflect done:.*$", text)
+    if final_line:
+        line = final_line.group(0)
+        for key in ["rx_errors", "seconds", "Tx_Gbps", "Rx_Gbps", "Tx_Mpps", "Rx_Mpps"]:
+            found = re.search(rf"{re.escape(key)}=([^ ]+)", line)
+            if found:
+                out[key] = pd.to_numeric(found.group(1), errors="coerce")
+
+    if "seconds" in out:
+        out["seconds_active"] = float(out["seconds"])
+
+    if all(key in out for key in ("seconds_active", "seconds_total", "steady_tx_wire_gbps")):
+        out["final_tx_wire_gbps"] = _calc_scaled_rate(
+            out["steady_tx_wire_gbps"], out["seconds_active"], out["seconds_total"]
+        )
+        out["final_rx_wire_gbps"] = _calc_scaled_rate(
+            out.get("steady_rx_wire_gbps"), out["seconds_active"], out["seconds_total"]
+        )
+        out["final_tx_mpps"] = _calc_scaled_rate(
+            out.get("steady_tx_mpps"), out["seconds_active"], out["seconds_total"]
+        )
+        out["final_rx_mpps"] = out["final_tx_mpps"]
+
+    if "Tx_Gbps" in out:
+        out["final_tx_wire_gbps"] = float(out["Tx_Gbps"])
+    if "Rx_Gbps" in out:
+        out["final_rx_wire_gbps"] = float(out["Rx_Gbps"])
+    if "Tx_Mpps" in out:
+        out["final_tx_mpps"] = float(out["Tx_Mpps"])
+    if "Rx_Mpps" in out:
+        out["final_rx_mpps"] = float(out["Rx_Mpps"])
+
+    bytes_per_tx_pkt = _calc_bytes_per_pkt(out.get("tx_bytes"), out.get("tx_pkts"))
+    bytes_per_rx_pkt = _calc_bytes_per_pkt(out.get("rx_bytes"), out.get("rx_pkts"))
+    out["steady_tx_l2_gbps"] = _calc_l2_gbps_from_mpps_and_bytes_per_pkt(out.get("steady_tx_mpps"), bytes_per_tx_pkt)
+    out["steady_rx_l2_gbps"] = _calc_l2_gbps_from_mpps_and_bytes_per_pkt(out.get("steady_rx_mpps"), bytes_per_rx_pkt)
+    out["final_tx_l2_gbps"] = _calc_gbps_from_bytes_and_seconds(out.get("tx_bytes"), out.get("seconds_total"))
+    out["final_rx_l2_gbps"] = _calc_gbps_from_bytes_and_seconds(out.get("rx_bytes"), out.get("seconds_total"))
+
+    return out
+
+
+def _parse_perf_stat_csv(path: Path, implementation: str) -> tuple[dict[str, float], list[dict[str, object]]]:
+    summary: dict[str, float] = {}
+    rows: list[dict[str, object]] = []
+    batch_size = _batch_size_from_name(path)
+    run_id = path.stem.replace("_perf", "")
+
+    for raw_line in _read_text(path).splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = line.split(";")
+        value_raw = parts[0] if len(parts) > 0 else ""
+        unit = parts[1] if len(parts) > 1 else ""
+        event = parts[2] if len(parts) > 2 else ""
+        counter_runtime = parts[3] if len(parts) > 3 else ""
+        running_pct = parts[4] if len(parts) > 4 else ""
+        metric_value = parts[5] if len(parts) > 5 else ""
+        metric_unit = ";".join(parts[6:]) if len(parts) > 6 else ""
+
+        if not event:
+            continue
+
+        status = "ok"
+        value = pd.to_numeric(value_raw, errors="coerce")
+        if value_raw.startswith("<"):
+            status = value_raw
+            value = np.nan
+
+        sanitized = _sanitize_event_name(event)
+        summary[f"perf_{sanitized}"] = value
+        summary[f"perf_{sanitized}_running_pct"] = pd.to_numeric(running_pct, errors="coerce")
+        rows.append(
+            {
+                "timestamp_utc": "",
+                "implementation": implementation,
+                "run_id": run_id,
+                "batch_size": batch_size,
+                "repeat_index": 1,
+                "run_status": "ok",
+                "event": event,
+                "event_status": status,
+                "value": value,
+                "unit": unit,
+                "counter_runtime": pd.to_numeric(counter_runtime, errors="coerce"),
+                "running_pct": pd.to_numeric(running_pct, errors="coerce"),
+                "metric_value": pd.to_numeric(metric_value, errors="coerce"),
+                "metric_unit": metric_unit,
+                "perf_file": path.name,
+            }
+        )
+
+    return summary, rows
+
+
+def _standalone_summary_row(implementation: str, batch_size: int) -> dict[str, object]:
+    return {
+        "timestamp_utc": "",
+        "implementation": implementation,
+        "run_id": f"{implementation}_batch{batch_size:03d}_standalone",
+        "batch_size": batch_size,
+        "repeat_index": 1,
+        "status": "ok",
+        "bdf": "",
+        "requested_duration_s": np.nan,
+        "pin_cpus": np.nan,
+        "hugepages": np.nan,
+        "hugepage_dir": "",
+        "stdout_log": "",
+        "stderr_log": "",
+        "metrics_log": "",
+        "perf_file": "",
+        "seconds_total": np.nan,
+        "seconds_active": np.nan,
+        "seconds_join": np.nan,
+        "seconds_drain": np.nan,
+        "worker_threads": np.nan,
+        "interval_samples": np.nan,
+        "steady_tx_wire_gbps": np.nan,
+        "steady_rx_wire_gbps": np.nan,
+        "steady_tx_mpps": np.nan,
+        "steady_rx_mpps": np.nan,
+        "steady_tx_l2_gbps": np.nan,
+        "steady_rx_l2_gbps": np.nan,
+        "steady_ns_per_pkt": np.nan,
+        "final_tx_wire_gbps": np.nan,
+        "final_rx_wire_gbps": np.nan,
+        "final_tx_mpps": np.nan,
+        "final_rx_mpps": np.nan,
+        "final_tx_l2_gbps": np.nan,
+        "final_rx_l2_gbps": np.nan,
+        "rx_pkts": np.nan,
+        "rx_bytes": np.nan,
+        "tx_pkts": np.nan,
+        "tx_bytes": np.nan,
+        "zero_copy_pkts": np.nan,
+        "zero_copy_bytes": np.nan,
+        "tx_ring_full": np.nan,
+        "rx_short": np.nan,
+        "rx_errors": np.nan,
+        "pool_empty": np.nan,
+        "doorbells": np.nan,
+        "avg_pkts_per_doorbell": np.nan,
+        "port_rx_gbps": np.nan,
+        "port_tx_gbps": np.nan,
+        "gorc_delta": np.nan,
+        "gotc_delta": np.nan,
+        "total_mmio_writes": np.nan,
+        "mmio_per_sec": np.nan,
+        "tail_advances": np.nan,
+        "pkts_per_mmio_write": np.nan,
+        "total_iterations": np.nan,
+        "empty_polls": np.nan,
+        "empty_poll_pct": np.nan,
+        "reclaim_calls": np.nan,
+        "avg_pending_rearm_depth": np.nan,
+        "port_rx_unicast_pkts": np.nan,
+        "port_tx_unicast_pkts": np.nan,
+        "port_tx_drop_linkdown": np.nan,
+        "crc_errors": np.nan,
+        "illegal_bytes": np.nan,
+    }
+
+
+def _load_standalone_artifacts(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    c_perf = base_dir / "c_batch064_perf.csv"
+    rust_perf = base_dir / "rust_batch064_perf.csv"
+    c_metrics = base_dir / "c_batch064_metrics.log"
+    if not c_metrics.exists():
+        c_metrics = base_dir / "my_ice_metrics.log"
+
+    c_stdout = base_dir / "c_batch064.stdout.log"
+    c_stderr = base_dir / "c_batch064.stderr.log"
+    rust_stdout = base_dir / "rust_batch064.stdout.log"
+    rust_stderr = base_dir / "rust_batch064.stderr.log"
+    rust_combined = base_dir / "rust_batch064.log"
+
+    rows: list[dict[str, object]] = []
+    raw_rows: list[dict[str, object]] = []
+
+    if c_perf.exists():
+        batch_size = _batch_size_from_name(c_perf)
+        row = _standalone_summary_row("c", batch_size)
+        perf_summary, perf_rows = _parse_perf_stat_csv(c_perf, "c")
+        row.update(perf_summary)
+        row["perf_file"] = c_perf.name
+        row["metrics_log"] = c_metrics.name if c_metrics.exists() else ""
+        row["stdout_log"] = c_stdout.name if c_stdout.exists() else ""
+        row["stderr_log"] = c_stderr.name if c_stderr.exists() else ""
+
+        c_data = _load_kv_metrics(c_metrics) if c_metrics.exists() else _parse_c_summary_line(_read_text(c_stdout) + "\n" + _read_text(c_stderr))
+        row["seconds_total"] = pd.to_numeric(c_data.get("seconds_total", c_data.get("seconds")), errors="coerce")
+        row["seconds_active"] = row["seconds_total"]
+        row["seconds_join"] = 0.0
+        row["seconds_drain"] = 0.0
+        row["worker_threads"] = 1.0
+        row["steady_tx_wire_gbps"] = pd.to_numeric(c_data.get("tx_wire_gbps", c_data.get("TX")), errors="coerce")
+        row["steady_rx_wire_gbps"] = pd.to_numeric(c_data.get("rx_wire_gbps", c_data.get("RX")), errors="coerce")
+        row["steady_tx_mpps"] = pd.to_numeric(c_data.get("tx_mpps"), errors="coerce")
+        row["steady_rx_mpps"] = pd.to_numeric(c_data.get("rx_mpps"), errors="coerce")
+        row["steady_tx_l2_gbps"] = pd.to_numeric(c_data.get("tx_l2_gbps"), errors="coerce")
+        row["steady_rx_l2_gbps"] = pd.to_numeric(c_data.get("rx_l2_gbps"), errors="coerce")
+        row["steady_ns_per_pkt"] = _calc_ns_per_pkt_from_mpps(row["steady_tx_mpps"])
+        row["final_tx_wire_gbps"] = row["steady_tx_wire_gbps"]
+        row["final_rx_wire_gbps"] = row["steady_rx_wire_gbps"]
+        row["final_tx_mpps"] = row["steady_tx_mpps"]
+        row["final_rx_mpps"] = row["steady_rx_mpps"]
+        row["final_tx_l2_gbps"] = row["steady_tx_l2_gbps"]
+        row["final_rx_l2_gbps"] = row["steady_rx_l2_gbps"]
+        for key in [
+            "rx_pkts",
+            "rx_bytes",
+            "tx_pkts",
+            "tx_bytes",
+            "zero_copy_pkts",
+            "zero_copy_bytes",
+            "tx_ring_full",
+            "rx_short",
+            "rx_errors",
+            "pool_empty",
+            "doorbells",
+            "gorc_delta",
+            "gotc_delta",
+        ]:
+            row[key] = pd.to_numeric(c_data.get(key), errors="coerce")
+        row["avg_pkts_per_doorbell"] = _calc_avg_pkts_per_doorbell(row["tx_pkts"], row["doorbells"])
+        row["port_rx_gbps"] = _calc_gbps_from_bytes_and_seconds(row["gorc_delta"], row["seconds_total"])
+        row["port_tx_gbps"] = _calc_gbps_from_bytes_and_seconds(row["gotc_delta"], row["seconds_total"])
+
+        rows.append(row)
+        raw_rows.extend(perf_rows)
+
+    if rust_perf.exists():
+        batch_size = _batch_size_from_name(rust_perf)
+        row = _standalone_summary_row("rust", batch_size)
+        perf_summary, perf_rows = _parse_perf_stat_csv(rust_perf, "rust")
+        row.update(perf_summary)
+        row["perf_file"] = rust_perf.name
+        row["stdout_log"] = rust_stdout.name if rust_stdout.exists() else rust_combined.name if rust_combined.exists() else ""
+        row["stderr_log"] = rust_stderr.name if rust_stderr.exists() else ""
+
+        rust_text = _read_text(rust_combined) if rust_combined.exists() else _read_text(rust_stdout) + "\n" + _read_text(rust_stderr)
+        rust_data = _parse_rust_run_logs(rust_text)
+        for key, value in rust_data.items():
+            row[key] = value
+        row["worker_threads"] = 1.0
+
+        rows.append(row)
+        raw_rows.extend(perf_rows)
+
+    return _coerce_numeric(pd.DataFrame(rows)), pd.DataFrame(raw_rows)
 
 
 def derive_metrics(df: pd.DataFrame) -> pd.DataFrame:
@@ -436,15 +890,31 @@ def render_report(run_dir: Path) -> None:
     perf_record_index_csv = run_dir / "perf_record_index.csv"
 
     metadata = load_metadata(metadata_file)
-    summary_df = _coerce_numeric(_read_csv(summary_csv))
-    raw_perf_df = _read_csv(raw_perf_csv)
-    perf_record_df = _read_csv(perf_record_index_csv)
+    if summary_csv.exists():
+        summary_df = _coerce_numeric(_read_csv(summary_csv))
+        raw_perf_df = _read_csv(raw_perf_csv)
+        perf_record_df = _read_csv(perf_record_index_csv)
+    else:
+        summary_df, raw_perf_df = _load_standalone_artifacts(run_dir)
+        perf_record_df = pd.DataFrame()
+        metadata.setdefault("result_dir", str(run_dir))
+        metadata.setdefault("mode", "standalone_artifacts")
+
     summary_df = derive_metrics(summary_df)
     agg = aggregate_batches(summary_df)
     focus_batch = choose_focus_batch(agg, metadata)
 
     display(Markdown("## Run Metadata"))
     display(pd.Series(metadata, name="value").to_frame())
+
+    if metadata.get("mode") == "standalone_artifacts":
+        display(
+            Markdown(
+                "## Standalone Artifacts\n"
+                "Loaded per-run data from top-level files like `c_batch064_perf.csv`, `c_batch064_metrics.log`, "
+                "`rust_batch064_perf.csv`, and `rust_batch064.stdout.log` / `rust_batch064.stderr.log`."
+            )
+        )
 
     display(Markdown(_perf_record_markdown(metadata, focus_batch)))
 
