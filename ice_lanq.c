@@ -17,6 +17,20 @@
 #include "ice_regs.h"
 #include "ice_utils.h"
 
+#define ICE_RX_DESC_MASK (ICE_RX_DESC_COUNT - 1)
+
+#if (ICE_RX_DESC_COUNT & ICE_RX_DESC_MASK) != 0
+#error "RX fast path assumes ICE_RX_DESC_COUNT is a power of two"
+#endif
+
+#ifndef likely
+#define likely(x) __builtin_expect(!!(x), 1)
+#endif
+
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
 static const struct ice_ctx_ele rlan_ctx_info[] = {
     ICE_CTX_STORE(ice_rlan_ctx, head,        13, 0),
     ICE_CTX_STORE(ice_rlan_ctx, cpuid,        8, 13),
@@ -305,14 +319,18 @@ static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t o
         union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
         uint16_t status0 = le16toh(rxd->wb.status_error0);
         uint16_t pkt_len;
+        uint16_t next_idx = (uint16_t)((idx + 1) & ICE_RX_DESC_MASK);
+
+        if (likely(count + 1 < max_count))
+            __builtin_prefetch(&d->io.rx_desc[next_idx], 0, 1);
 
         if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)))
             break;
 
         pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
-        if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_EOF_S)) ||
+        if (unlikely(!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_EOF_S)) ||
             (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S)) ||
-            pkt_len == 0) {
+            pkt_len == 0)) {
             fprintf(stderr,
                     "[my_ice] rx descriptor error idx=%u status0=0x%04x pkt_len=%u\n",
                     idx, status0, pkt_len);
@@ -322,7 +340,7 @@ static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t o
         out_idxs[count] = idx;
         out_lens[count] = pkt_len;
         count++;
-        idx = (uint16_t)((idx + 1) % ICE_RX_DESC_COUNT);
+        idx = next_idx;
     }
 
     return count;
@@ -355,15 +373,14 @@ static int tx_try_reserve_slot(struct ice_vfio_dev *d, struct txq_ctx *q, uint16
     return 0;
 }
 
-static void tx_commit_slot(struct txq_ctx *q, uint16_t idx, struct pkt_buf *buf_ref)
+static inline void tx_commit_slot(struct txq_ctx *q, uint16_t idx, struct pkt_buf *buf_ref)
 {
     q->tx_pkt_buf_refs[idx] = buf_ref;
-    __sync_synchronize();
     q->tx_next_to_use = (uint16_t)((idx + 1) % q->desc_count);
     q->tx_free--;
 }
 
-static void tx_prepare_desc(struct txq_ctx *q, uint16_t idx, uint64_t buf_iova, uint16_t len)
+static inline void tx_prepare_desc(struct txq_ctx *q, uint16_t idx, uint64_t buf_iova, uint16_t len)
 {
     struct ice_tx_desc *txd = &q->tx_desc[idx];
     uint16_t cmd = ICE_TX_DESC_CMD_EOP;
@@ -413,29 +430,39 @@ static int tx_try_enqueue(struct ice_vfio_dev *d, struct txq_ctx *q, const uint8
     return 0;
 }
 
-static uint16_t tx_try_enqueue_pkt_buf_batch(struct ice_vfio_dev *d, struct txq_ctx *q,
-                                             struct pkt_buf *bufs[], uint16_t num_bufs)
+static uint16_t tx_reflect_enqueue_batch(struct ice_vfio_dev *d, struct txq_ctx *q,
+                                         struct pkt_buf *bufs[], uint16_t num_bufs,
+                                         uint64_t *bytes_sent)
 {
+    uint16_t desc_count = q->desc_count;
     uint16_t sent = 0;
-
-    if (!q || !bufs || num_bufs == 0)
-        return 0;
+    uint16_t idx = q->tx_next_to_use;
+    uint64_t bytes = 0;
 
     if (q->tx_free < num_bufs)
         tx_update_free(d, q);
 
     while (sent < num_bufs && q->tx_free != 0) {
-        uint16_t idx = q->tx_next_to_use;
         struct pkt_buf *buf = bufs[sent];
+        uint16_t len;
 
-        if (!buf || buf->size == 0 || buf->size > ICE_PKT_BUF_DATA_SIZE)
+        if (unlikely(!buf || buf->size == 0 || buf->size > ICE_PKT_BUF_DATA_SIZE))
             break;
 
-        tx_prepare_desc(q, idx, buf->buf_addr_iova, (uint16_t)buf->size);
-        tx_commit_slot(q, idx, buf);
+        len = (uint16_t)buf->size;
+        tx_prepare_desc(q, idx, buf->buf_addr_iova, len);
+        q->tx_pkt_buf_refs[idx] = buf;
+        bytes += len;
         sent++;
+        q->tx_free--;
+
+        idx++;
+        if (idx == desc_count)
+            idx = 0;
     }
 
+    q->tx_next_to_use = idx;
+    *bytes_sent = bytes;
     return sent;
 }
 
@@ -464,7 +491,29 @@ static void rearm_rx_desc_batch(struct ice_vfio_dev *d, const uint16_t idxs[], u
     }
 
     reg_write32(d, QRX_TAIL(d->io.rxq_id), idxs[count - 1]);
-    d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) % ICE_RX_DESC_COUNT);
+    d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
+}
+
+static void rearm_rx_desc_pool_batch(struct ice_vfio_dev *d, const uint16_t idxs[],
+                                     uint16_t count)
+{
+    struct pkt_buf **rx_pkt_bufs = d->io.rx_pkt_bufs;
+    union ice_32b_rx_flex_desc *rx_desc = d->io.rx_desc;
+    uint16_t i;
+
+    for (i = 0; i < count; i++) {
+        uint16_t idx = idxs[i];
+        struct pkt_buf *buf = rx_pkt_bufs[idx];
+
+        buf->size = 0;
+        rx_desc[idx].read.pkt_addr = htole64(buf->buf_addr_iova);
+        rx_desc[idx].read.hdr_addr = 0;
+        rx_desc[idx].read.rsvd1 = 0;
+        rx_desc[idx].read.rsvd2 = 0;
+    }
+
+    reg_write32(d, QRX_TAIL(d->io.rxq_id), idxs[count - 1]);
+    d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
 }
 
 static void rearm_rx_desc(struct ice_vfio_dev *d, uint16_t idx)
@@ -492,6 +541,7 @@ static int poll_one_rx_packet(struct ice_vfio_dev *d, uint8_t *out, uint16_t out
 
 static inline void tx_ring_doorbell(struct ice_vfio_dev *d, struct txq_ctx *q)
 {
+    __sync_synchronize();
     reg_write32(d, QTX_COMM_DBELL(q->txq_id), q->tx_next_to_use);
 }
 
@@ -538,7 +588,7 @@ static void dump_rx_desc_snapshot(struct ice_vfio_dev *d)
     uint16_t i;
 
     for (i = 0; i < 8; i++) {
-        uint16_t idx = (uint16_t)((d->io.rx_ntc + i) % ICE_RX_DESC_COUNT);
+        uint16_t idx = (uint16_t)((d->io.rx_ntc + i) & ICE_RX_DESC_MASK);
         union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
         uint16_t status0 = le16toh(rxd->wb.status_error0);
         uint16_t pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
@@ -766,17 +816,15 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     while (monotonic_ns() - start_ns < (uint64_t)timeout_ms * 1000000ULL) {
         uint16_t rx_idxs[MAX_REFLECT_BATCH];
         uint16_t rx_lens[MAX_REFLECT_BATCH];
-        uint16_t rearm_idxs[MAX_REFLECT_BATCH];
-        uint16_t tx_lens[MAX_REFLECT_BATCH];
         struct pkt_buf *replacement_bufs[MAX_REFLECT_BATCH];
         struct pkt_buf *tx_bufs[MAX_REFLECT_BATCH];
         uint64_t batch_rx_bytes = 0;
+        uint64_t batch_tx_bytes = 0;
         bool rx_seen = false;
         bool stalled = false;
         uint16_t budget;
         int got;
         uint16_t replacement_needed = 0;
-        uint16_t rearm_count = 0;
         uint16_t tx_count = 0;
         uint16_t replacement_count;
         uint16_t sent = 0;
@@ -801,7 +849,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         }
 
         got = poll_rx_batch(d, rx_idxs, rx_lens, budget);
-        if (got < 0) {
+        if (unlikely(got < 0)) {
             rx_errors++;
             dump_mdet_regs(d);
             goto out;
@@ -814,7 +862,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         for (i = 0; i < (uint16_t)got; i++) {
             uint16_t rx_idx = rx_idxs[i];
 
-            if (!d->io.rx_pkt_bufs[rx_idx]) {
+            if (unlikely(!d->io.rx_pkt_bufs[rx_idx])) {
                 fprintf(stderr, "[my_ice] missing rx pool buffer for descriptor %u\n", rx_idx);
                 rx_errors++;
                 goto out;
@@ -825,7 +873,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
         replacement_count = (uint16_t)pkt_buf_alloc_batch(&d->reflect_pool, replacement_bufs,
                                                           replacement_needed);
-        if (replacement_count != replacement_needed) {
+        if (unlikely(replacement_count != replacement_needed)) {
             fprintf(stderr,
                     "[my_ice] reflect pool underflow: needed=%u got=%u free_count=%u\n",
                     replacement_needed, replacement_count, d->reflect_pool.free_count);
@@ -838,8 +886,6 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             uint16_t rx_len = rx_lens[i];
             struct pkt_buf *rx_buf = d->io.rx_pkt_bufs[rx_idx];
 
-            rearm_idxs[rearm_count++] = rx_idx;
-
             if (rx_len < 14) {
                 rx_short++;
                 continue;
@@ -850,26 +896,19 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             rewrite_reflect_l2(rx_buf, d->io.mac);
 
             tx_bufs[tx_count] = rx_buf;
-            tx_lens[tx_count] = rx_len;
             batch_rx_bytes += rx_len;
             tx_count++;
         }
 
-        if (rearm_count > 0)
-            rearm_rx_desc_batch(d, rearm_idxs, rearm_count);
+        rearm_rx_desc_pool_batch(d, rx_idxs, (uint16_t)got);
 
         rx_pkts += tx_count;
         rx_bytes += batch_rx_bytes;
 
         if (tx_count > 0)
-            sent = tx_try_enqueue_pkt_buf_batch(d, q, tx_bufs, tx_count);
+            sent = tx_reflect_enqueue_batch(d, q, tx_bufs, tx_count, &batch_tx_bytes);
 
         if (sent > 0) {
-            uint64_t batch_tx_bytes = 0;
-
-            for (i = 0; i < sent; i++)
-                batch_tx_bytes += tx_lens[i];
-
             tx_ring_doorbell(d, q);
             doorbells++;
             tx_pkts += sent;
@@ -1346,4 +1385,3 @@ int run_tx_bench(struct ice_vfio_dev *d, const uint8_t *dst_mac, int seconds,
 
     return 0;
 }
-
