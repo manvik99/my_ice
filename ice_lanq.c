@@ -18,6 +18,8 @@
 #include "ice_utils.h"
 
 #define ICE_RX_DESC_MASK (ICE_RX_DESC_COUNT - 1)
+#define REFLECT_TIME_CHECK_BURSTS 1024U
+#define REFLECT_TX_DOORBELL_BATCH 256U
 
 #if (ICE_RX_DESC_COUNT & ICE_RX_DESC_MASK) != 0
 #error "RX fast path assumes ICE_RX_DESC_COUNT is a power of two"
@@ -439,15 +441,15 @@ static uint16_t tx_reflect_enqueue_batch(struct ice_vfio_dev *d, struct txq_ctx 
     uint16_t idx = q->tx_next_to_use;
     uint64_t bytes = 0;
 
-    if (q->tx_free < num_bufs)
+    if (q->tx_free < num_bufs) {
         tx_update_free(d, q);
+        if (q->tx_free < num_bufs)
+            num_bufs = q->tx_free;
+    }
 
-    while (sent < num_bufs && q->tx_free != 0) {
+    while (sent < num_bufs) {
         struct pkt_buf *buf = bufs[sent];
         uint16_t len;
-
-        if (unlikely(!buf || buf->size == 0 || buf->size > ICE_PKT_BUF_DATA_SIZE))
-            break;
 
         len = (uint16_t)buf->size;
         tx_prepare_desc(q, idx, buf->buf_addr_iova, len);
@@ -495,17 +497,15 @@ static void rearm_rx_desc_batch(struct ice_vfio_dev *d, const uint16_t idxs[], u
 }
 
 static void rearm_rx_desc_pool_batch(struct ice_vfio_dev *d, const uint16_t idxs[],
-                                     uint16_t count)
+                                     struct pkt_buf *const bufs[], uint16_t count)
 {
-    struct pkt_buf **rx_pkt_bufs = d->io.rx_pkt_bufs;
     union ice_32b_rx_flex_desc *rx_desc = d->io.rx_desc;
     uint16_t i;
 
     for (i = 0; i < count; i++) {
         uint16_t idx = idxs[i];
-        struct pkt_buf *buf = rx_pkt_bufs[idx];
+        struct pkt_buf *buf = bufs[i];
 
-        buf->size = 0;
         rx_desc[idx].read.pkt_addr = htole64(buf->buf_addr_iova);
         rx_desc[idx].read.hdr_addr = 0;
         rx_desc[idx].read.rsvd1 = 0;
@@ -642,13 +642,50 @@ static void print_payload_dump(const uint8_t *pkt, uint16_t len)
     }
 }
 
-static void rewrite_reflect_l2(struct pkt_buf *buf, const uint8_t *local_mac)
+struct reflect_l2_ctx {
+    uint8_t local_mac[ETHER_ADDR_LEN];
+#if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN
+    uint16_t local_mac01;
+    uint32_t local_mac25;
+#endif
+};
+
+static inline void reflect_l2_ctx_init(struct reflect_l2_ctx *ctx, const uint8_t *local_mac)
 {
+    memcpy(ctx->local_mac, local_mac, ETHER_ADDR_LEN);
+#if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN
+    memcpy(&ctx->local_mac01, local_mac, sizeof(ctx->local_mac01));
+    memcpy(&ctx->local_mac25, local_mac + sizeof(ctx->local_mac01),
+           sizeof(ctx->local_mac25));
+#endif
+}
+
+static inline void rewrite_reflect_l2(struct pkt_buf *buf, const struct reflect_l2_ctx *ctx)
+{
+#if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN
+    uint8_t *data = buf->data;
+    uint64_t word0;
+    uint64_t word1;
+    uint64_t new_word0;
+
+    memcpy(&word0, data, sizeof(word0));
+    memcpy(&word1, data + sizeof(word0), sizeof(word1));
+
+    new_word0 = (word0 >> 48) |
+                ((word1 & UINT64_C(0x00000000ffffffff)) << 16) |
+                ((uint64_t)ctx->local_mac01 << 48);
+    word1 = (word1 & UINT64_C(0xffffffff00000000)) |
+            (uint64_t)ctx->local_mac25;
+
+    memcpy(data, &new_word0, sizeof(new_word0));
+    memcpy(data + sizeof(new_word0), &word1, sizeof(word1));
+#else
     uint8_t original_src[ETHER_ADDR_LEN];
 
     memcpy(original_src, buf->data + ETHER_ADDR_LEN, ETHER_ADDR_LEN);
     memcpy(buf->data, original_src, ETHER_ADDR_LEN);
-    memcpy(buf->data + ETHER_ADDR_LEN, local_mac, ETHER_ADDR_LEN);
+    memcpy(buf->data + ETHER_ADDR_LEN, ctx->local_mac, ETHER_ADDR_LEN);
+#endif
 }
 
 int run_rx_listen(struct ice_vfio_dev *d, int timeout_ms)
@@ -743,7 +780,11 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     uint64_t prev_rx_pkts = 0, prev_rx_bytes = 0;
     uint64_t prev_tx_pkts = 0, prev_tx_bytes = 0;
     uint64_t gorc_before, gorc_after, gotc_before, gotc_after;
-    uint64_t start_ns, now_ns;
+    uint64_t start_ns, end_ns, now_ns;
+    uint32_t time_check_countdown = 0;
+    uint16_t tx_doorbell_batch = REFLECT_TX_DOORBELL_BATCH;
+    uint16_t tx_pkts_pending_db = 0;
+    struct reflect_l2_ctx l2_ctx;
     struct rx_reflect_metrics metrics;
     struct txq_ctx *q;
     int rc = -1;
@@ -798,22 +839,30 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
     tx_ring_init(d);
     q = &d->txqs[0];
+    if (tx_doorbell_batch < reflect_batch)
+        tx_doorbell_batch = reflect_batch;
+    if (tx_doorbell_batch > q->tx_free)
+        tx_doorbell_batch = q->tx_free;
 
     fprintf(stderr,
-            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d reflect_batch=%u\n",
+            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d reflect_batch=%u tx_doorbell_batch=%u\n",
             d->io.vsi_num, d->io.lport, d->io.rxq_id, q->txq_id,
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms, reflect_batch);
+            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms, reflect_batch,
+            tx_doorbell_batch);
+
+    reflect_l2_ctx_init(&l2_ctx, d->io.mac);
 
     gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
                                      GLV_GORCH(d->io.vsi_num));
     gotc_before = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                      GLV_GOTCH(d->io.vsi_num));
     start_ns = monotonic_ns();
+    end_ns = start_ns + (uint64_t)timeout_ms * 1000000ULL;
     last_report_ns = start_ns;
     next_report_ns = start_ns + NS_PER_S;
 
-    while (monotonic_ns() - start_ns < (uint64_t)timeout_ms * 1000000ULL) {
+    while (true) {
         uint16_t rx_idxs[MAX_REFLECT_BATCH];
         uint16_t rx_lens[MAX_REFLECT_BATCH];
         struct pkt_buf *replacement_bufs[MAX_REFLECT_BATCH];
@@ -824,7 +873,6 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         bool stalled = false;
         uint16_t budget;
         int got;
-        uint16_t replacement_needed = 0;
         uint16_t tx_count = 0;
         uint16_t replacement_count;
         uint16_t sent = 0;
@@ -840,6 +888,11 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             budget = (uint16_t)d->reflect_pool.free_count;
 
         if (budget == 0) {
+            if (tx_pkts_pending_db != 0) {
+                tx_ring_doorbell(d, q);
+                doorbells++;
+                tx_pkts_pending_db = 0;
+            }
             if (q->tx_free == 0)
                 tx_ring_full++;
             if (d->reflect_pool.free_count == 0)
@@ -859,24 +912,13 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
         rx_seen = true;
 
-        for (i = 0; i < (uint16_t)got; i++) {
-            uint16_t rx_idx = rx_idxs[i];
-
-            if (unlikely(!d->io.rx_pkt_bufs[rx_idx])) {
-                fprintf(stderr, "[my_ice] missing rx pool buffer for descriptor %u\n", rx_idx);
-                rx_errors++;
-                goto out;
-            }
-            if (rx_lens[i] >= 14)
-                replacement_needed++;
-        }
-
-        replacement_count = (uint16_t)pkt_buf_alloc_batch(&d->reflect_pool, replacement_bufs,
-                                                          replacement_needed);
-        if (unlikely(replacement_count != replacement_needed)) {
+        replacement_count = (uint16_t)pkt_buf_alloc_batch_noinit(&d->reflect_pool,
+                                                                 replacement_bufs,
+                                                                 (uint16_t)got);
+        if (unlikely(replacement_count != (uint16_t)got)) {
             fprintf(stderr,
                     "[my_ice] reflect pool underflow: needed=%u got=%u free_count=%u\n",
-                    replacement_needed, replacement_count, d->reflect_pool.free_count);
+                    (uint16_t)got, replacement_count, d->reflect_pool.free_count);
             rx_errors++;
             goto out;
         }
@@ -886,21 +928,29 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             uint16_t rx_len = rx_lens[i];
             struct pkt_buf *rx_buf = d->io.rx_pkt_bufs[rx_idx];
 
+            if (unlikely(!rx_buf)) {
+                fprintf(stderr, "[my_ice] missing rx pool buffer for descriptor %u\n", rx_idx);
+                rx_errors++;
+                goto out;
+            }
+
+            d->io.rx_pkt_bufs[rx_idx] = replacement_bufs[i];
+
             if (rx_len < 14) {
                 rx_short++;
+                pkt_buf_free(rx_buf);
                 continue;
             }
 
             rx_buf->size = rx_len;
-            d->io.rx_pkt_bufs[rx_idx] = replacement_bufs[tx_count];
-            rewrite_reflect_l2(rx_buf, d->io.mac);
+            rewrite_reflect_l2(rx_buf, &l2_ctx);
 
             tx_bufs[tx_count] = rx_buf;
             batch_rx_bytes += rx_len;
             tx_count++;
         }
 
-        rearm_rx_desc_pool_batch(d, rx_idxs, (uint16_t)got);
+        rearm_rx_desc_pool_batch(d, rx_idxs, replacement_bufs, (uint16_t)got);
 
         rx_pkts += tx_count;
         rx_bytes += batch_rx_bytes;
@@ -909,12 +959,16 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             sent = tx_reflect_enqueue_batch(d, q, tx_bufs, tx_count, &batch_tx_bytes);
 
         if (sent > 0) {
-            tx_ring_doorbell(d, q);
-            doorbells++;
             tx_pkts += sent;
             tx_bytes += batch_tx_bytes;
             zero_copy_pkts += sent;
             zero_copy_bytes += batch_tx_bytes;
+            tx_pkts_pending_db = (uint16_t)(tx_pkts_pending_db + sent);
+            if (tx_pkts_pending_db >= tx_doorbell_batch || sent < tx_count) {
+                tx_ring_doorbell(d, q);
+                doorbells++;
+                tx_pkts_pending_db = 0;
+            }
         }
 
         if (sent < tx_count) {
@@ -925,32 +979,44 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         }
 
 report_progress:
-        now_ns = monotonic_ns();
-        if (now_ns >= next_report_ns) {
-            uint64_t interval_ns = now_ns - last_report_ns;
-            uint64_t interval_rx_pkts = rx_pkts - prev_rx_pkts;
-            uint64_t interval_rx_bytes = rx_bytes - prev_rx_bytes;
-            uint64_t interval_tx_pkts = tx_pkts - prev_tx_pkts;
-            uint64_t interval_tx_bytes = tx_bytes - prev_tx_bytes;
+        if (!rx_seen && tx_pkts_pending_db != 0) {
+            tx_ring_doorbell(d, q);
+            doorbells++;
+            tx_pkts_pending_db = 0;
+        }
+        if (time_check_countdown == 0 || stalled || !rx_seen) {
+            time_check_countdown = REFLECT_TIME_CHECK_BURSTS;
+            now_ns = monotonic_ns();
+            if (now_ns >= end_ns)
+                break;
+            if (now_ns >= next_report_ns) {
+                uint64_t interval_ns = now_ns - last_report_ns;
+                uint64_t interval_rx_pkts = rx_pkts - prev_rx_pkts;
+                uint64_t interval_rx_bytes = rx_bytes - prev_rx_bytes;
+                uint64_t interval_tx_pkts = tx_pkts - prev_tx_pkts;
+                uint64_t interval_tx_bytes = tx_bytes - prev_tx_bytes;
 
-            fprintf(stderr,
-                    "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f\n",
-                    (double)(now_ns - start_ns) / (double)NS_PER_S,
-                    bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_tx_pkts, interval_tx_bytes),
-                                     interval_ns),
-                    bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_rx_pkts, interval_rx_bytes),
-                                     interval_ns),
-                    pkts_ns_to_mpps(interval_tx_pkts, interval_ns),
-                    pkts_ns_to_mpps(interval_rx_pkts, interval_ns));
+                fprintf(stderr,
+                        "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f\n",
+                        (double)(now_ns - start_ns) / (double)NS_PER_S,
+                        bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_tx_pkts, interval_tx_bytes),
+                                         interval_ns),
+                        bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_rx_pkts, interval_rx_bytes),
+                                         interval_ns),
+                        pkts_ns_to_mpps(interval_tx_pkts, interval_ns),
+                        pkts_ns_to_mpps(interval_rx_pkts, interval_ns));
 
-            last_report_ns = now_ns;
-            prev_rx_pkts = rx_pkts;
-            prev_rx_bytes = rx_bytes;
-            prev_tx_pkts = tx_pkts;
-            prev_tx_bytes = tx_bytes;
-            next_report_ns += NS_PER_S;
-            if (next_report_ns < now_ns)
-                next_report_ns = now_ns + NS_PER_S;
+                last_report_ns = now_ns;
+                prev_rx_pkts = rx_pkts;
+                prev_rx_bytes = rx_bytes;
+                prev_tx_pkts = tx_pkts;
+                prev_tx_bytes = tx_bytes;
+                next_report_ns += NS_PER_S;
+                if (next_report_ns < now_ns)
+                    next_report_ns = now_ns + NS_PER_S;
+            }
+        } else {
+            time_check_countdown--;
         }
 
         if (stalled) {
@@ -962,8 +1028,13 @@ report_progress:
             usleep(1000);
     }
 
+    if (tx_pkts_pending_db != 0) {
+        tx_ring_doorbell(d, q);
+        doorbells++;
+        tx_pkts_pending_db = 0;
+    }
     (void)tx_wait_drain(d, q, 1000);
-    now_ns = monotonic_ns();
+    now_ns = end_ns;
     gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
                                     GLV_GORCH(d->io.vsi_num));
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),

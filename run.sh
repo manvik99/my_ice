@@ -6,7 +6,7 @@ RUST_ROOT="/users/manvik12/my_ice_rust"
 
 BDF="0000:17:00.0"
 DURATION_S="10"
-BATCH_SIZE="64"
+BATCH_SIZE="256"
 
 EVENTS="instructions,cycles,stalled-cycles-frontend,stalled-cycles-backend,L1-dcache-load-misses,L1-icache-load-misses,LLC-load-misses,LLC-stores,LLC-store-misses,L1-dcache-prefetches,dTLB-load-misses,iTLB-load-misses,branches,branch-misses,node-loads,node-load-misses,faults,cs,cpu-migrations,bus-cycles"
 
@@ -17,14 +17,16 @@ else
   RUST_BIN="${RUST_ROOT}/target/debug/my_ice_rust"
 fi
 
-C_PERF_CSV="${ROOT}/c_batch064_perf.csv"
-C_METRICS_LOG="${ROOT}/c_batch064_metrics.log"
-C_STDOUT_LOG="${ROOT}/c_batch064.stdout.log"
-C_STDERR_LOG="${ROOT}/c_batch064.stderr.log"
+RUN_TAG="batch${BATCH_SIZE}"
 
-RUST_PERF_CSV="${ROOT}/rust_batch064_perf.csv"
-RUST_STDOUT_LOG="${ROOT}/rust_batch064.stdout.log"
-RUST_STDERR_LOG="${ROOT}/rust_batch064.stderr.log"
+C_PERF_CSV="${ROOT}/c_${RUN_TAG}_perf.csv"
+C_METRICS_LOG="${ROOT}/c_${RUN_TAG}_metrics.log"
+C_STDOUT_LOG="${ROOT}/c_${RUN_TAG}.stdout.log"
+C_STDERR_LOG="${ROOT}/c_${RUN_TAG}.stderr.log"
+
+RUST_PERF_CSV="${ROOT}/rust_${RUN_TAG}_perf.csv"
+RUST_STDOUT_LOG="${ROOT}/rust_${RUN_TAG}.stdout.log"
+RUST_STDERR_LOG="${ROOT}/rust_${RUN_TAG}.stderr.log"
 
 sudo perf stat --no-big-num -x ';' \
   -e "${EVENTS}" \

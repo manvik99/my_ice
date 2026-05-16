@@ -22,7 +22,7 @@ int main(int argc, char **argv)
     const char *huge_dir = "/mnt/huge";
     uint16_t txq_count = 1;
     uint16_t tx_desc_count = ICE_TX_DESC_COUNT;
-    uint16_t reflect_batch = TX_BURST_SIZE;
+    uint16_t reflect_batch = DEFAULT_REFLECT_BATCH;
     bool pin_cpus = false;
     bool dump_topo = false;
     const char *metrics_log = NULL;

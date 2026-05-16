@@ -15,8 +15,9 @@
 #define ALIGN_UP(v, a) (((v) + ((a) - 1)) & ~((size_t)((a) - 1)))
 #define NS_PER_S 1000000000ULL
 #define TX_BURST_SIZE 64
+#define DEFAULT_REFLECT_BATCH 256
 #define MAX_REFLECT_BATCH 256
-#define TX_RS_THRESH 32
+#define TX_RS_THRESH 128
 #define ETH_WIRE_OVERHEAD_BYTES 24U
 #define ICE_PKT_BUF_DATA_SIZE \
     ((ICE_RX_BUF_SIZE > ICE_TX_PKT_BUF_SIZE) ? ICE_RX_BUF_SIZE : ICE_TX_PKT_BUF_SIZE)

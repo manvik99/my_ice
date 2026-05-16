@@ -121,6 +121,31 @@ uint32_t pkt_buf_alloc_batch(struct pkt_mempool *pool, struct pkt_buf *bufs[],
     return avail;
 }
 
+uint32_t pkt_buf_alloc_batch_noinit(struct pkt_mempool *pool, struct pkt_buf *bufs[],
+                                    uint32_t num_bufs)
+{
+    uint32_t avail;
+    uint32_t i;
+
+    if (!pool || !bufs || num_bufs == 0)
+        return 0;
+
+    avail = pool->free_count < num_bufs ? pool->free_count : num_bufs;
+    for (i = 0; i < avail; i++) {
+        uint32_t head = pool->free_head;
+        uint32_t idx = pool->free_ring[head];
+
+        head++;
+        if (head == pool->num_entries)
+            head = 0;
+        pool->free_head = head;
+        pool->free_count--;
+        bufs[i] = pkt_pool_get_entry(pool, idx);
+    }
+
+    return avail;
+}
+
 void pkt_buf_free(struct pkt_buf *buf)
 {
     struct pkt_mempool *pool;
@@ -133,7 +158,6 @@ void pkt_buf_free(struct pkt_buf *buf)
     if (pool->free_count >= pool->num_entries)
         return;
 
-    buf->size = 0;
     tail = pool->free_tail;
     pool->free_ring[tail] = buf->mempool_idx;
     tail++;

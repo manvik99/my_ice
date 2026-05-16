@@ -16,6 +16,8 @@ void pkt_pool_init(struct ice_vfio_dev *d);
 struct pkt_buf *pkt_buf_alloc(struct pkt_mempool *pool);
 uint32_t pkt_buf_alloc_batch(struct pkt_mempool *pool, struct pkt_buf *bufs[],
                              uint32_t num_bufs);
+uint32_t pkt_buf_alloc_batch_noinit(struct pkt_mempool *pool, struct pkt_buf *bufs[],
+                                    uint32_t num_bufs);
 void pkt_buf_free(struct pkt_buf *buf);
 
 #endif
