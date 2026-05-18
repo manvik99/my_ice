@@ -3,7 +3,7 @@ set -euo pipefail
 
 IFACE="${1:-enp23s0f0}"
 DST_MAC="${2:-40:a6:b7:c2:c1:58}"
-DURATION="${3:-60}"      # secondss
+DURATION="${3:-60}"      # seconds
 PKT_SIZE="${4:-60}"    # 14-byte Ethernet header + payload
 THREAD_SPEC="${5:-"0,1,2,3,4,5,6,7,8,9,10,11,12"}"    # kpktgend threads: "0" or "0,1,2,3" or "all"
 QUEUE_BASE="${6:-0}"     # first TX queue index to use
