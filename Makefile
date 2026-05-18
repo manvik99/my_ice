@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -Wall -Wextra -std=c11 -g -fno-omit-frame-pointer
+CFLAGS ?= -O3 -march=native -mtune=native -Wall -Wextra -std=c11 -g -fno-omit-frame-pointer
 
 TARGET = my_ice
 SRCS = main.c ice_vfio.c ice_pci.c ice_dma.c ice_adminq.c ice_controlq.c ice_lanq.c ice_utils.c
