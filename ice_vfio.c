@@ -80,7 +80,9 @@ void ice_vfio_close(struct ice_vfio_dev *dev)
         unlink(dev->huge_path);
     free(dev->io.rx_pkt_bufs);
     free(dev->reflect_pool.free_ring);
-    for (i = 0; i < dev->txq_alloc_count; i++)
+    for (i = 0; i < dev->txq_alloc_count; i++) {
         free(dev->txqs[i].tx_pkt_buf_refs);
+        free(dev->txqs[i].tx_rsq);
+    }
     free(dev->txqs);
 }

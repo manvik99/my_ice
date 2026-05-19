@@ -18,6 +18,29 @@ uint32_t pkt_buf_alloc_batch(struct pkt_mempool *pool, struct pkt_buf *bufs[],
                              uint32_t num_bufs);
 uint32_t pkt_buf_alloc_batch_noinit(struct pkt_mempool *pool, struct pkt_buf *bufs[],
                                     uint32_t num_bufs);
+
+static inline void pkt_buf_free_fast(struct pkt_buf *buf)
+{
+    struct pkt_mempool *pool;
+    uint32_t tail;
+
+    /* Added for the reflect cleanup hot path: inline the same simple free-ring push every time. */
+    if (!buf || !buf->mempool)
+        return;
+
+    pool = buf->mempool;
+    if (pool->free_count >= pool->num_entries)
+        return;
+
+    tail = pool->free_tail;
+    pool->free_ring[tail] = buf->mempool_idx;
+    tail++;
+    if (tail == pool->num_entries)
+        tail = 0;
+    pool->free_tail = tail;
+    pool->free_count++;
+}
+
 void pkt_buf_free(struct pkt_buf *buf);
 
 #endif

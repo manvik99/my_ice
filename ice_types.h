@@ -90,6 +90,10 @@ struct txq_ctx {
     uint16_t tx_free;
     uint16_t tx_pkts_since_rs;
     struct pkt_buf **tx_pkt_buf_refs;
+    uint16_t *tx_rsq;
+    uint16_t tx_rsq_count;
+    uint16_t tx_rsq_pidx;
+    uint16_t tx_rsq_cidx;
 };
 
 struct ice_vfio_dev {
@@ -138,6 +142,7 @@ struct rx_reflect_metrics {
     uint16_t reflect_batch;
     uint64_t gorc_delta;
     uint64_t gotc_delta;
+    uint64_t tx_pkts_pending_db;
 };
 
 #endif

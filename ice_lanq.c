@@ -272,11 +272,31 @@ static void tx_ring_init(struct ice_vfio_dev *d)
         struct txq_ctx *q = &d->txqs[i];
         memset(q->tx_desc, 0, (size_t)q->desc_count * sizeof(struct ice_tx_desc));
         memset(q->tx_pkt_buf_refs, 0, (size_t)q->desc_count * sizeof(*q->tx_pkt_buf_refs));
+        memset(q->tx_rsq, 0, (size_t)q->tx_rsq_count * sizeof(*q->tx_rsq));
         q->tx_next_to_use = 0;
         q->tx_next_to_clean = 0;
         q->tx_free = (uint16_t)(q->desc_count - 1);
         q->tx_pkts_since_rs = 0;
+        q->tx_rsq_pidx = 0;
+        q->tx_rsq_cidx = 0;
     }
+}
+
+static inline uint16_t tx_ring_next(uint16_t idx, uint16_t desc_count)
+{
+    /* Mirrors Rust's ring_next() so the C hot path avoids modulo/division too. */
+    idx++;
+    if (idx == desc_count)
+        return 0;
+    return idx;
+}
+
+static inline uint16_t tx_ring_clamp(uint16_t idx, uint16_t desc_count)
+{
+    /* Same single-wrap clamp as Rust update_free(): HEAD is masked to 13 bits first. */
+    if (idx >= desc_count)
+        return (uint16_t)(idx - desc_count);
+    return idx;
 }
 
 static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
@@ -286,18 +306,39 @@ static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
     uint16_t used;
     uint16_t idx;
 
-    if (head >= q->desc_count)
-        head = (uint16_t)(head % q->desc_count);
+    head = tx_ring_clamp(head, q->desc_count);
+
+    if (head == q->tx_next_to_clean)
+        return;
 
     idx = q->tx_next_to_clean;
     while (idx != head) {
         if (q->tx_pkt_buf_refs[idx]) {
-            pkt_buf_free(q->tx_pkt_buf_refs[idx]);
+            pkt_buf_free_fast(q->tx_pkt_buf_refs[idx]);
             q->tx_pkt_buf_refs[idx] = NULL;
         }
-        idx = (uint16_t)((idx + 1) % q->desc_count);
+        idx = tx_ring_next(idx, q->desc_count);
     }
     q->tx_next_to_clean = head;
+
+    while (q->tx_rsq_cidx != q->tx_rsq_pidx) {
+        uint16_t rs_slot = q->tx_rsq[q->tx_rsq_cidx];
+        bool in_flight;
+
+        /* RS slots mirror Rust/FreeBSD-style completion tracking; this avoids rescanning Tx. */
+
+        if (head <= ntu)
+            in_flight = rs_slot >= head && rs_slot < ntu;
+        else
+            in_flight = rs_slot >= head || rs_slot < ntu;
+
+        if (in_flight)
+            break;
+
+        q->tx_rsq_cidx++;
+        if (q->tx_rsq_cidx == q->tx_rsq_count)
+            q->tx_rsq_cidx = 0;
+    }
 
     if (ntu >= head)
         used = (uint16_t)(ntu - head);
@@ -305,6 +346,15 @@ static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
         used = (uint16_t)(q->desc_count - (head - ntu));
 
     q->tx_free = (uint16_t)(q->desc_count - used - 1);
+}
+
+static inline void tx_record_rs_slot(struct txq_ctx *q, uint16_t idx)
+{
+    /* Mirrors Rust's RS bookkeeping: remember which descriptor should advance completion state. */
+    q->tx_rsq[q->tx_rsq_pidx] = idx;
+    q->tx_rsq_pidx++;
+    if (q->tx_rsq_pidx == q->tx_rsq_count)
+        q->tx_rsq_pidx = 0;
 }
 
 static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t out_lens[],
@@ -316,6 +366,7 @@ static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t o
     if (max_count == 0)
         return 0;
 
+    /* Added to mirror Rust's batched poller so both reflect loops amortize descriptor checks the same way. */
     idx = d->io.rx_ntc;
     while (count < max_count) {
         union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
@@ -377,8 +428,9 @@ static int tx_try_reserve_slot(struct ice_vfio_dev *d, struct txq_ctx *q, uint16
 
 static inline void tx_commit_slot(struct txq_ctx *q, uint16_t idx, struct pkt_buf *buf_ref)
 {
+    /* Keep slot commit tiny: record ownership, advance ring, consume one free descriptor. */
     q->tx_pkt_buf_refs[idx] = buf_ref;
-    q->tx_next_to_use = (uint16_t)((idx + 1) % q->desc_count);
+    q->tx_next_to_use = tx_ring_next(idx, q->desc_count);
     q->tx_free--;
 }
 
@@ -390,7 +442,9 @@ static inline void tx_prepare_desc(struct txq_ctx *q, uint16_t idx, uint64_t buf
 
     q->tx_pkts_since_rs++;
     if (q->tx_pkts_since_rs >= TX_RS_THRESH) {
+        /* RS cadence matches Rust so QTX_COMM_HEAD advances often enough to recycle reflected buffers. */
         cmd |= ICE_TX_DESC_CMD_RS;
+        tx_record_rs_slot(q, idx);
         q->tx_pkts_since_rs = 0;
     }
 
@@ -447,6 +501,7 @@ static uint16_t tx_reflect_enqueue_batch(struct ice_vfio_dev *d, struct txq_ctx 
             num_bufs = q->tx_free;
     }
 
+    /* Ported from the Rust reflect enqueue shape so both sides submit borrowed Rx buffers similarly. */
     while (sent < num_bufs) {
         struct pkt_buf *buf = bufs[sent];
         uint16_t len;
@@ -502,6 +557,7 @@ static void rearm_rx_desc_pool_batch(struct ice_vfio_dev *d, const uint16_t idxs
     union ice_32b_rx_flex_desc *rx_desc = d->io.rx_desc;
     uint16_t i;
 
+    /* This is the replacement-buffer reflect path: descriptors are rearmed with fresh pool buffers immediately. */
     for (i = 0; i < count; i++) {
         uint16_t idx = idxs[i];
         struct pkt_buf *buf = bufs[i];
@@ -605,6 +661,20 @@ static uint64_t read_glv_counter64(struct ice_vfio_dev *d, uint32_t lo_off, uint
     return lo | (hi << 32);
 }
 
+static uint64_t counter40_delta(uint64_t after, uint64_t before)
+{
+    const uint64_t mask_40 = (UINT64_C(1) << 40) - 1;
+    uint64_t a = after & mask_40;
+    uint64_t b = before & mask_40;
+
+    /* Matches Rust's wrap-safe 40-bit VSI counter handling so hw byte deltas compare cleanly. */
+
+    if (a >= b)
+        return a - b;
+
+    return (mask_40 + 1 - b) + a;
+}
+
 static void print_payload_dump(const uint8_t *pkt, uint16_t len)
 {
     const uint16_t l2_len = 14;
@@ -652,6 +722,7 @@ struct reflect_l2_ctx {
 
 static inline void reflect_l2_ctx_init(struct reflect_l2_ctx *ctx, const uint8_t *local_mac)
 {
+    /* Precompute the local-MAC words once, following the Rust helper, so the packet loop stays tiny. */
     memcpy(ctx->local_mac, local_mac, ETHER_ADDR_LEN);
 #if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN
     memcpy(&ctx->local_mac01, local_mac, sizeof(ctx->local_mac01));
@@ -667,6 +738,9 @@ static inline void rewrite_reflect_l2(struct pkt_buf *buf, const struct reflect_
     uint64_t word0;
     uint64_t word1;
     uint64_t new_word0;
+
+    /* Ported from the Rust reflect fast path: rewrite the first 16 bytes in two words. */
+    /* This keeps bytes 12..15 intact while avoiding the older byte-at-a-time MAC swap. */
 
     memcpy(&word0, data, sizeof(word0));
     memcpy(&word1, data + sizeof(word0), sizeof(word1));
@@ -755,7 +829,7 @@ int run_rx_listen(struct ice_vfio_dev *d, int timeout_ms)
     gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
                                     GLV_GORCH(d->io.vsi_num));
     fprintf(stderr, "[my_ice] rx-listen timeout, VSI%u GORC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, gorc_after - gorc_before);
+            d->io.vsi_num, counter40_delta(gorc_after, gorc_before));
     dump_rx_desc_snapshot(d);
     dump_mdet_regs(d);
 
@@ -779,6 +853,11 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     uint64_t last_report_ns, next_report_ns;
     uint64_t prev_rx_pkts = 0, prev_rx_bytes = 0;
     uint64_t prev_tx_pkts = 0, prev_tx_bytes = 0;
+    uint64_t prev_doorbells = 0;
+    uint64_t prev_tx_ring_full = 0;
+    uint64_t prev_pool_empty = 0;
+    uint64_t prev_rx_short = 0;
+    uint64_t prev_rx_errors = 0;
     uint64_t gorc_before, gorc_after, gotc_before, gotc_after;
     uint64_t start_ns, end_ns, now_ns;
     uint32_t time_check_countdown = 0;
@@ -839,6 +918,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
     tx_ring_init(d);
     q = &d->txqs[0];
+    /* Share one doorbell target with Rust: never ring more often than reflect_batch or more than free space allows. */
     if (tx_doorbell_batch < reflect_batch)
         tx_doorbell_batch = reflect_batch;
     if (tx_doorbell_batch > q->tx_free)
@@ -878,6 +958,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         uint16_t sent = 0;
         uint16_t i;
 
+        /* Same pre-check as Rust: refresh TX completion state before budgeting the next reflect burst. */
         if (q->tx_free < reflect_batch || d->reflect_pool.free_count < reflect_batch)
             tx_update_free(d, q);
 
@@ -912,6 +993,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
         rx_seen = true;
 
+        /* Borrow replacement buffers in a batch so the just-received buffers can move straight to Tx. */
         replacement_count = (uint16_t)pkt_buf_alloc_batch_noinit(&d->reflect_pool,
                                                                  replacement_bufs,
                                                                  (uint16_t)got);
@@ -934,11 +1016,12 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
                 goto out;
             }
 
+            /* Swap in the replacement buffer now; rx_buf becomes the borrowed buffer handed to Tx. */
             d->io.rx_pkt_bufs[rx_idx] = replacement_bufs[i];
 
             if (rx_len < 14) {
                 rx_short++;
-                pkt_buf_free(rx_buf);
+                pkt_buf_free_fast(rx_buf);
                 continue;
             }
 
@@ -950,6 +1033,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             tx_count++;
         }
 
+        /* Replacement buffers rearm Rx immediately; unlike the older zero-copy path, no deferred tailing is needed. */
         rearm_rx_desc_pool_batch(d, rx_idxs, replacement_bufs, (uint16_t)got);
 
         rx_pkts += tx_count;
@@ -963,6 +1047,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             tx_bytes += batch_tx_bytes;
             zero_copy_pkts += sent;
             zero_copy_bytes += batch_tx_bytes;
+            /* Track packets staged since the last doorbell so interval/final logs match Rust's reporting. */
             tx_pkts_pending_db = (uint16_t)(tx_pkts_pending_db + sent);
             if (tx_pkts_pending_db >= tx_doorbell_batch || sent < tx_count) {
                 tx_ring_doorbell(d, q);
@@ -973,7 +1058,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
         if (sent < tx_count) {
             for (i = sent; i < tx_count; i++)
-                pkt_buf_free(tx_bufs[i]);
+                pkt_buf_free_fast(tx_bufs[i]);
             tx_ring_full++;
             stalled = true;
         }
@@ -997,20 +1082,37 @@ report_progress:
                 uint64_t interval_tx_bytes = tx_bytes - prev_tx_bytes;
 
                 fprintf(stderr,
-                        "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f\n",
+                        "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f doorbells=%" PRIu64 " avg_pkts_per_db=%.3f tx_ring_full=%" PRIu64 " pool_empty=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64 " tx_pending_db=%u budget=%u tx_free=%u pool_free=%u\n",
                         (double)(now_ns - start_ns) / (double)NS_PER_S,
                         bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_tx_pkts, interval_tx_bytes),
                                          interval_ns),
                         bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_rx_pkts, interval_rx_bytes),
                                          interval_ns),
                         pkts_ns_to_mpps(interval_tx_pkts, interval_ns),
-                        pkts_ns_to_mpps(interval_rx_pkts, interval_ns));
+                        pkts_ns_to_mpps(interval_rx_pkts, interval_ns),
+                        doorbells - prev_doorbells,
+                        (doorbells > prev_doorbells)
+                            ? (double)interval_tx_pkts / (double)(doorbells - prev_doorbells)
+                            : 0.0,
+                        tx_ring_full - prev_tx_ring_full,
+                        pool_empty - prev_pool_empty,
+                        rx_short - prev_rx_short,
+                        rx_errors - prev_rx_errors,
+                        tx_pkts_pending_db,
+                        budget,
+                        q->tx_free,
+                        d->reflect_pool.free_count);
 
                 last_report_ns = now_ns;
                 prev_rx_pkts = rx_pkts;
                 prev_rx_bytes = rx_bytes;
                 prev_tx_pkts = tx_pkts;
                 prev_tx_bytes = tx_bytes;
+                prev_doorbells = doorbells;
+                prev_tx_ring_full = tx_ring_full;
+                prev_pool_empty = pool_empty;
+                prev_rx_short = rx_short;
+                prev_rx_errors = rx_errors;
                 next_report_ns += NS_PER_S;
                 if (next_report_ns < now_ns)
                     next_report_ns = now_ns + NS_PER_S;
@@ -1061,8 +1163,10 @@ report_progress:
     metrics.doorbells = doorbells;
     metrics.vsi_num = d->io.vsi_num;
     metrics.reflect_batch = reflect_batch;
-    metrics.gorc_delta = gorc_after - gorc_before;
-    metrics.gotc_delta = gotc_after - gotc_before;
+    metrics.gorc_delta = counter40_delta(gorc_after, gorc_before);
+    metrics.gotc_delta = counter40_delta(gotc_after, gotc_before);
+    /* Persist the shared parser field even when it is zero at steady state. */
+    metrics.tx_pkts_pending_db = tx_pkts_pending_db;
     fprintf(stderr,
             "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
             " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
@@ -1071,6 +1175,7 @@ report_progress:
             " zero_copy_pkts=%" PRIu64 " zero_copy_bytes=%" PRIu64
             " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
             " pool_empty=%" PRIu64 " doorbells=%" PRIu64
+            " tx_pkts_pending_db=%u avg_pkts_per_db=%.3f"
             " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
             metrics.seconds_total,
             metrics.tx_wire_gbps,
@@ -1080,7 +1185,10 @@ report_progress:
             metrics.tx_l2_gbps,
             metrics.rx_l2_gbps,
             rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
-            tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
+            tx_ring_full, rx_short, rx_errors, pool_empty, doorbells,
+            tx_pkts_pending_db,
+            doorbells ? (double)tx_pkts / (double)doorbells : 0.0,
+            d->io.vsi_num,
             metrics.gorc_delta, metrics.gotc_delta);
 
     if (write_rx_reflect_metrics_log(d, &metrics) < 0)
@@ -1199,7 +1307,7 @@ int run_tx_send(struct ice_vfio_dev *d, const uint8_t *dst_mac, int count,
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
     fprintf(stderr, "[my_ice] tx-send done, VSI%u GOTC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, gotc_after - gotc_before);
+            d->io.vsi_num, counter40_delta(gotc_after, gotc_before));
     return 0;
 }
 
@@ -1398,7 +1506,7 @@ int run_tx_bench(struct ice_vfio_dev *d, const uint8_t *dst_mac, int seconds,
             gotc_now = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                           GLV_GOTCH(d->io.vsi_num));
             interval_ns = now_ns - last_report_ns;
-            interval_bytes = gotc_now - gotc_prev;
+            interval_bytes = counter40_delta(gotc_now, gotc_prev);
             interval_s = (double)interval_ns / (double)one_sec_ns;
 
             gbps = interval_s > 0.0 ?
@@ -1444,7 +1552,7 @@ int run_tx_bench(struct ice_vfio_dev *d, const uint8_t *dst_mac, int seconds,
 
     {
         uint64_t total_ns = now_ns - start_ns;
-        uint64_t total_bytes = gotc_now - gotc_start;
+        uint64_t total_bytes = counter40_delta(gotc_now, gotc_start);
         double total_s = (double)total_ns / (double)one_sec_ns;
         double avg_gbps = total_s > 0.0 ?
             ((double)total_bytes * 8.0) / (total_s * 1e9) : 0.0;

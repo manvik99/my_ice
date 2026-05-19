@@ -41,6 +41,12 @@ void alloc_queue_sw_state(struct ice_vfio_dev *d)
             calloc(d->tx_desc_count, sizeof(*d->txqs[i].tx_pkt_buf_refs));
         if (!d->txqs[i].tx_pkt_buf_refs)
             die_errno("calloc tx pkt buf refs");
+
+        d->txqs[i].tx_rsq_count = (uint16_t)(d->tx_desc_count / TX_RS_THRESH + 2);
+        d->txqs[i].tx_rsq =
+            calloc(d->txqs[i].tx_rsq_count, sizeof(*d->txqs[i].tx_rsq));
+        if (!d->txqs[i].tx_rsq)
+            die_errno("calloc tx rsq");
     }
 
     d->reflect_pool.entry_size = ICE_PKT_BUF_ENTRY_SIZE;
@@ -125,46 +131,34 @@ uint32_t pkt_buf_alloc_batch_noinit(struct pkt_mempool *pool, struct pkt_buf *bu
                                     uint32_t num_bufs)
 {
     uint32_t avail;
+    uint32_t head;
     uint32_t i;
 
     if (!pool || !bufs || num_bufs == 0)
         return 0;
 
+    /* This noinit variant exists for rx-reflect: callers overwrite size/header data immediately. */
     avail = pool->free_count < num_bufs ? pool->free_count : num_bufs;
+    head = pool->free_head;
     for (i = 0; i < avail; i++) {
-        uint32_t head = pool->free_head;
         uint32_t idx = pool->free_ring[head];
 
         head++;
         if (head == pool->num_entries)
             head = 0;
-        pool->free_head = head;
-        pool->free_count--;
         bufs[i] = pkt_pool_get_entry(pool, idx);
     }
+
+    /* Simple hot-path fix: commit free_head/free_count once, not once per borrowed buffer. */
+    pool->free_head = head;
+    pool->free_count -= avail;
 
     return avail;
 }
 
 void pkt_buf_free(struct pkt_buf *buf)
 {
-    struct pkt_mempool *pool;
-    uint32_t tail;
-
-    if (!buf || !buf->mempool)
-        return;
-
-    pool = buf->mempool;
-    if (pool->free_count >= pool->num_entries)
-        return;
-
-    tail = pool->free_tail;
-    pool->free_ring[tail] = buf->mempool_idx;
-    tail++;
-    if (tail == pool->num_entries)
-        tail = 0;
-    pool->free_tail = tail;
-    pool->free_count++;
+    pkt_buf_free_fast(buf);
 }
 
 
@@ -260,6 +254,8 @@ void layout_dma(struct ice_vfio_dev *d)
         q->tx_next_to_use = 0;
         q->tx_next_to_clean = 0;
         q->tx_pkts_since_rs = 0;
+        q->tx_rsq_pidx = 0;
+        q->tx_rsq_cidx = 0;
     }
 
     if (off > d->dma.size)
