@@ -190,6 +190,10 @@ int write_rx_reflect_metrics_log(const struct ice_vfio_dev *d,
     WRITE_METRIC("reflect_batch=%u", metrics->reflect_batch);
     WRITE_METRIC("gorc_delta=%" PRIu64, metrics->gorc_delta);
     WRITE_METRIC("gotc_delta=%" PRIu64, metrics->gotc_delta);
+    WRITE_METRIC("reflect_vector_requested=%s",
+                 metrics->reflect_vector_requested ? metrics->reflect_vector_requested : "unknown");
+    WRITE_METRIC("reflect_vector_active=%s",
+                 metrics->reflect_vector_active ? metrics->reflect_vector_active : "unknown");
 
 #undef WRITE_METRIC
 
@@ -322,4 +326,3 @@ size_t prepare_hugepage_file(struct ice_vfio_dev *d, size_t size, const char *di
     d->huge_alloc_size = aligned;
     return aligned;
 }
-

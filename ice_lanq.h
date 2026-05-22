@@ -6,8 +6,16 @@
 
 #include "ice_types.h"
 
+enum reflect_vector_mode {
+    REFLECT_VECTOR_OFF = 0,
+    REFLECT_VECTOR_AUTO,
+    REFLECT_VECTOR_AVX2,
+    REFLECT_VECTOR_AVX512,
+};
+
 int run_rx_listen(struct ice_vfio_dev *d, int timeout_ms);
-int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batch);
+int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms,
+                   uint16_t reflect_batch, enum reflect_vector_mode vector_mode);
 int run_tx_send(struct ice_vfio_dev *d, const uint8_t *dst_mac, int count,
                 int interval_ms, const char *payload);
 int run_tx_bench(struct ice_vfio_dev *d, const uint8_t *dst_mac, int seconds,

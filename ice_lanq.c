@@ -4,11 +4,21 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#include <immintrin.h>
+#define MY_ICE_HAVE_AVX2_INTRINSICS 1
+#define MY_ICE_HAVE_AVX512_INTRINSICS 1
+#else
+#define MY_ICE_HAVE_AVX2_INTRINSICS 0
+#define MY_ICE_HAVE_AVX512_INTRINSICS 0
+#endif
 
 #include "ice_adminq.h"
 #include "ice_controlq.h"
@@ -19,7 +29,12 @@
 
 #define ICE_RX_DESC_MASK (ICE_RX_DESC_COUNT - 1)
 #define REFLECT_TIME_CHECK_BURSTS 1024U
-#define REFLECT_TX_DOORBELL_BATCH 256U
+#define REFLECT_TX_DOORBELL_BATCH 64U
+#define REFLECT_PREFETCH_AHEAD 8U
+#define ICE_RX_DESC_AVX2_SCAN 8U
+#define ICE_RX_DESC_AVX512_SCAN 16U
+#define ICE_TX_DESC_AVX2_BATCH 4U
+#define ICE_TX_DESC_AVX512_BATCH 8U
 
 #if (ICE_RX_DESC_COUNT & ICE_RX_DESC_MASK) != 0
 #error "RX fast path assumes ICE_RX_DESC_COUNT is a power of two"
@@ -32,6 +47,67 @@
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
+
+_Static_assert(sizeof(union ice_32b_rx_flex_desc) == 32,
+               "AVX2 RX scan assumes 32-byte ICE Rx descriptors");
+_Static_assert(offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) == 4,
+               "AVX2 RX scan assumes pkt_len offset 4");
+_Static_assert(offsetof(union ice_32b_rx_flex_desc, wb.status_error0) == 8,
+               "AVX2 RX scan assumes status_error0 offset 8");
+_Static_assert(sizeof(struct ice_tx_desc) == 16,
+               "AVX2 TX enqueue assumes 16-byte ICE Tx descriptors");
+_Static_assert(offsetof(struct ice_tx_desc, buf_addr) == 0,
+               "AVX2 TX enqueue assumes buf_addr offset 0");
+_Static_assert(offsetof(struct ice_tx_desc, cmd_type_offset_bsz) == 8,
+               "AVX2 TX enqueue assumes cmd_type_offset_bsz offset 8");
+
+enum reflect_vector_active {
+    REFLECT_VECTOR_ACTIVE_SCALAR = 0,
+    REFLECT_VECTOR_ACTIVE_AVX2,
+    REFLECT_VECTOR_ACTIVE_AVX512,
+};
+
+struct reflect_l2_ctx;
+
+typedef int (*poll_rx_batch_fn)(struct ice_vfio_dev *d, uint16_t out_idxs[],
+                                uint16_t out_lens[], uint16_t max_count);
+typedef uint16_t (*tx_reflect_enqueue_fn)(struct ice_vfio_dev *d, struct txq_ctx *q,
+                                          struct pkt_buf *bufs[], uint16_t num_bufs,
+                                          uint64_t *bytes_sent);
+typedef void (*rearm_rx_desc_pool_batch_fn)(struct ice_vfio_dev *d, const uint16_t idxs[],
+                                            struct pkt_buf *const bufs[], uint16_t count);
+typedef void (*rewrite_reflect_l2_batch_fn)(struct pkt_buf *bufs[], uint16_t count,
+                                            const struct reflect_l2_ctx *ctx);
+
+static const char *reflect_vector_mode_name(enum reflect_vector_mode mode)
+{
+    switch (mode) {
+    case REFLECT_VECTOR_OFF:
+        return "off";
+    case REFLECT_VECTOR_AUTO:
+        return "auto";
+    case REFLECT_VECTOR_AVX2:
+        return "avx2";
+    case REFLECT_VECTOR_AVX512:
+        return "avx512";
+    default:
+        return "unknown";
+    }
+}
+
+static const char *reflect_vector_active_name(enum reflect_vector_active active)
+{
+    switch (active) {
+    case REFLECT_VECTOR_ACTIVE_SCALAR:
+        return "scalar";
+    case REFLECT_VECTOR_ACTIVE_AVX2:
+        return "avx2";
+    case REFLECT_VECTOR_ACTIVE_AVX512:
+        return "avx512";
+    default:
+        return "unknown";
+    }
+}
 
 static const struct ice_ctx_ele rlan_ctx_info[] = {
     ICE_CTX_STORE(ice_rlan_ctx, head,        13, 0),
@@ -307,8 +383,41 @@ static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
     q->tx_free = (uint16_t)(q->desc_count - used - 1);
 }
 
-static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t out_lens[],
-                         uint16_t max_count)
+static inline int rx_desc_validate_complete(uint16_t idx, uint16_t status0,
+                                            uint16_t pkt_len)
+{
+    if (unlikely(!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_EOF_S)) ||
+        (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S)) ||
+        pkt_len == 0)) {
+        fprintf(stderr,
+                "[my_ice] rx descriptor error idx=%u status0=0x%04x pkt_len=%u\n",
+                idx, status0, pkt_len);
+        return -1;
+    }
+
+    return 0;
+}
+
+static inline int poll_rx_desc_one(struct ice_vfio_dev *d, uint16_t idx,
+                                   uint16_t *out_len)
+{
+    union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
+    uint16_t status0 = le16toh(rxd->wb.status_error0);
+    uint16_t pkt_len;
+
+    if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)))
+        return 0;
+
+    pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
+    if (rx_desc_validate_complete(idx, status0, pkt_len) < 0)
+        return -1;
+
+    *out_len = pkt_len;
+    return 1;
+}
+
+static int poll_rx_batch_scalar(struct ice_vfio_dev *d, uint16_t out_idxs[],
+                                uint16_t out_lens[], uint16_t max_count)
 {
     uint16_t idx;
     uint16_t count = 0;
@@ -318,26 +427,18 @@ static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t o
 
     idx = d->io.rx_ntc;
     while (count < max_count) {
-        union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
-        uint16_t status0 = le16toh(rxd->wb.status_error0);
         uint16_t pkt_len;
         uint16_t next_idx = (uint16_t)((idx + 1) & ICE_RX_DESC_MASK);
+        int got;
 
         if (likely(count + 1 < max_count))
             __builtin_prefetch(&d->io.rx_desc[next_idx], 0, 1);
 
-        if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)))
-            break;
-
-        pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
-        if (unlikely(!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_EOF_S)) ||
-            (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S)) ||
-            pkt_len == 0)) {
-            fprintf(stderr,
-                    "[my_ice] rx descriptor error idx=%u status0=0x%04x pkt_len=%u\n",
-                    idx, status0, pkt_len);
+        got = poll_rx_desc_one(d, idx, &pkt_len);
+        if (unlikely(got < 0))
             return -1;
-        }
+        if (got == 0)
+            break;
 
         out_idxs[count] = idx;
         out_lens[count] = pkt_len;
@@ -348,13 +449,278 @@ static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t o
     return count;
 }
 
+#if MY_ICE_HAVE_AVX2_INTRINSICS
+static bool reflect_avx2_supported(void)
+{
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx2");
+}
+
+static bool reflect_avx512_supported(void)
+{
+    __builtin_cpu_init();
+    return __builtin_cpu_supports("avx512f") &&
+           __builtin_cpu_supports("avx512bw") &&
+           __builtin_cpu_supports("avx512vl");
+}
+
+__attribute__((target("avx2"), noinline))
+static int poll_rx_batch_avx2(struct ice_vfio_dev *d, uint16_t out_idxs[],
+                              uint16_t out_lens[], uint16_t max_count)
+{
+    const __m256i status_offsets = _mm256_setr_epi32(
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 0 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 1 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 2 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 3 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 4 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 5 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 6 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 7 * sizeof(union ice_32b_rx_flex_desc));
+    const __m256i len_offsets = _mm256_setr_epi32(
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 0 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 1 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 2 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 3 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 4 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 5 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 6 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 7 * sizeof(union ice_32b_rx_flex_desc));
+    const __m256i dd_bit = _mm256_set1_epi32(BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S));
+    uint16_t idx;
+    uint16_t count = 0;
+
+    if (max_count == 0)
+        return 0;
+
+    idx = d->io.rx_ntc;
+    while (count < max_count) {
+        uint16_t left = (uint16_t)(max_count - count);
+
+        if (left >= ICE_RX_DESC_AVX2_SCAN &&
+            idx <= (uint16_t)(ICE_RX_DESC_COUNT - ICE_RX_DESC_AVX2_SCAN)) {
+            const uint8_t *base = (const uint8_t *)&d->io.rx_desc[idx];
+            __m256i status_vec;
+            __m256i dd_vec;
+            __m256i cmp_vec;
+            uint32_t status_words[ICE_RX_DESC_AVX2_SCAN];
+            uint32_t len_words[ICE_RX_DESC_AVX2_SCAN];
+            uint32_t not_ready;
+            uint16_t ready;
+            uint16_t lane;
+            int ready_mask;
+
+            if (likely(left > ICE_RX_DESC_AVX2_SCAN &&
+                       idx <= (uint16_t)(ICE_RX_DESC_COUNT - 2 * ICE_RX_DESC_AVX2_SCAN)))
+                __builtin_prefetch(&d->io.rx_desc[idx + ICE_RX_DESC_AVX2_SCAN], 0, 1);
+
+            status_vec = _mm256_i32gather_epi32((const int *)(const void *)base,
+                                                status_offsets, 1);
+            dd_vec = _mm256_and_si256(status_vec, dd_bit);
+            cmp_vec = _mm256_cmpeq_epi32(dd_vec, dd_bit);
+            ready_mask = _mm256_movemask_ps(_mm256_castsi256_ps(cmp_vec)) & 0xff;
+            not_ready = (~(uint32_t)ready_mask) & 0xffU;
+            ready = not_ready ? (uint16_t)__builtin_ctz(not_ready) : ICE_RX_DESC_AVX2_SCAN;
+
+            if (ready == 0)
+                break;
+
+            _mm256_storeu_si256((__m256i *)(void *)status_words, status_vec);
+            _mm256_storeu_si256((__m256i *)(void *)len_words,
+                                _mm256_i32gather_epi32((const int *)(const void *)base,
+                                                       len_offsets, 1));
+
+            for (lane = 0; lane < ready; lane++) {
+                uint16_t desc_idx = (uint16_t)(idx + lane);
+                uint16_t status0 = le16toh((uint16_t)status_words[lane]);
+                uint16_t pkt_len =
+                    (uint16_t)(le16toh((uint16_t)len_words[lane]) & ICE_RX_FLX_DESC_PKT_LEN_M);
+
+                if (rx_desc_validate_complete(desc_idx, status0, pkt_len) < 0)
+                    return -1;
+
+                out_idxs[count + lane] = desc_idx;
+                out_lens[count + lane] = pkt_len;
+            }
+
+            count = (uint16_t)(count + ready);
+            idx = (uint16_t)(idx + ready);
+            if (idx == ICE_RX_DESC_COUNT)
+                idx = 0;
+            if (ready < ICE_RX_DESC_AVX2_SCAN)
+                break;
+            continue;
+        }
+
+        {
+            uint16_t pkt_len;
+            uint16_t next_idx = (uint16_t)((idx + 1) & ICE_RX_DESC_MASK);
+            int got;
+
+            if (likely(count + 1 < max_count))
+                __builtin_prefetch(&d->io.rx_desc[next_idx], 0, 1);
+
+            got = poll_rx_desc_one(d, idx, &pkt_len);
+            if (unlikely(got < 0))
+                return -1;
+            if (got == 0)
+                break;
+
+            out_idxs[count] = idx;
+            out_lens[count] = pkt_len;
+            count++;
+            idx = next_idx;
+        }
+    }
+
+    return count;
+}
+
+#if MY_ICE_HAVE_AVX512_INTRINSICS
+__attribute__((target("avx512f,avx512bw,avx512vl"), noinline))
+static int poll_rx_batch_avx512(struct ice_vfio_dev *d, uint16_t out_idxs[],
+                                uint16_t out_lens[], uint16_t max_count)
+{
+    const __m512i status_offsets = _mm512_setr_epi32(
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 0 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 1 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 2 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 3 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 4 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 5 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 6 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 7 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 8 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 9 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 10 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 11 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 12 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 13 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 14 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.status_error0) + 15 * sizeof(union ice_32b_rx_flex_desc));
+    const __m512i len_offsets = _mm512_setr_epi32(
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 0 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 1 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 2 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 3 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 4 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 5 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 6 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 7 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 8 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 9 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 10 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 11 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 12 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 13 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 14 * sizeof(union ice_32b_rx_flex_desc),
+        offsetof(union ice_32b_rx_flex_desc, wb.pkt_len) + 15 * sizeof(union ice_32b_rx_flex_desc));
+    const __m512i dd_bit = _mm512_set1_epi32(BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S));
+    uint16_t idx;
+    uint16_t count = 0;
+
+    if (max_count == 0)
+        return 0;
+
+    idx = d->io.rx_ntc;
+    while (count < max_count) {
+        uint16_t left = (uint16_t)(max_count - count);
+
+        if (left >= ICE_RX_DESC_AVX512_SCAN &&
+            idx <= (uint16_t)(ICE_RX_DESC_COUNT - ICE_RX_DESC_AVX512_SCAN)) {
+            const uint8_t *base = (const uint8_t *)&d->io.rx_desc[idx];
+            __m512i status_vec;
+            __m512i len_vec;
+            uint32_t status_words[ICE_RX_DESC_AVX512_SCAN];
+            uint32_t len_words[ICE_RX_DESC_AVX512_SCAN];
+            uint32_t ready_mask;
+            uint32_t not_ready;
+            uint16_t ready;
+            uint16_t lane;
+
+            if (likely(left > ICE_RX_DESC_AVX512_SCAN &&
+                       idx <= (uint16_t)(ICE_RX_DESC_COUNT - 2 * ICE_RX_DESC_AVX512_SCAN)))
+                __builtin_prefetch(&d->io.rx_desc[idx + ICE_RX_DESC_AVX512_SCAN], 0, 1);
+
+            status_vec = _mm512_i32gather_epi32(status_offsets,
+                                                (const void *)base, 1);
+            ready_mask = _mm512_cmpeq_epi32_mask(_mm512_and_si512(status_vec, dd_bit),
+                                                 dd_bit);
+            not_ready = (~ready_mask) & 0xffffU;
+            ready = not_ready ? (uint16_t)__builtin_ctz(not_ready) : ICE_RX_DESC_AVX512_SCAN;
+
+            if (ready == 0)
+                break;
+
+            len_vec = _mm512_i32gather_epi32(len_offsets, (const void *)base, 1);
+            _mm512_storeu_si512((void *)status_words, status_vec);
+            _mm512_storeu_si512((void *)len_words, len_vec);
+
+            for (lane = 0; lane < ready; lane++) {
+                uint16_t desc_idx = (uint16_t)(idx + lane);
+                uint16_t status0 = le16toh((uint16_t)status_words[lane]);
+                uint16_t pkt_len =
+                    (uint16_t)(le16toh((uint16_t)len_words[lane]) & ICE_RX_FLX_DESC_PKT_LEN_M);
+
+                if (rx_desc_validate_complete(desc_idx, status0, pkt_len) < 0)
+                    return -1;
+
+                out_idxs[count + lane] = desc_idx;
+                out_lens[count + lane] = pkt_len;
+            }
+
+            count = (uint16_t)(count + ready);
+            idx = (uint16_t)(idx + ready);
+            if (idx == ICE_RX_DESC_COUNT)
+                idx = 0;
+            if (ready < ICE_RX_DESC_AVX512_SCAN)
+                break;
+            continue;
+        }
+
+        {
+            uint16_t pkt_len;
+            uint16_t next_idx = (uint16_t)((idx + 1) & ICE_RX_DESC_MASK);
+            int got;
+
+            if (likely(count + 1 < max_count))
+                __builtin_prefetch(&d->io.rx_desc[next_idx], 0, 1);
+
+            got = poll_rx_desc_one(d, idx, &pkt_len);
+            if (unlikely(got < 0))
+                return -1;
+            if (got == 0)
+                break;
+
+            out_idxs[count] = idx;
+            out_lens[count] = pkt_len;
+            count++;
+            idx = next_idx;
+        }
+    }
+
+    return count;
+}
+#endif
+#else
+static bool reflect_avx2_supported(void)
+{
+    return false;
+}
+
+static bool reflect_avx512_supported(void)
+{
+    return false;
+}
+#endif
+
 static int poll_one_rx_desc(struct ice_vfio_dev *d, uint16_t *out_idx, uint16_t *out_len)
 {
     uint16_t idx;
     uint16_t len;
     int count;
 
-    count = poll_rx_batch(d, &idx, &len, 1);
+    count = poll_rx_batch_scalar(d, &idx, &len, 1);
     if (count <= 0)
         return count;
 
@@ -382,11 +748,20 @@ static inline void tx_commit_slot(struct txq_ctx *q, uint16_t idx, struct pkt_bu
     q->tx_free--;
 }
 
+static inline uint64_t tx_desc_qw1_le(uint16_t cmd, uint16_t len)
+{
+    uint64_t qw1;
+
+    qw1 = ((uint64_t)ICE_TX_DESC_DTYPE_DATA << ICE_TXD_QW1_DTYPE_S) |
+          ((uint64_t)cmd << ICE_TXD_QW1_CMD_S) |
+          ((uint64_t)len << ICE_TXD_QW1_TX_BUF_SZ_S);
+    return htole64(qw1);
+}
+
 static inline void tx_prepare_desc(struct txq_ctx *q, uint16_t idx, uint64_t buf_iova, uint16_t len)
 {
     struct ice_tx_desc *txd = &q->tx_desc[idx];
     uint16_t cmd = ICE_TX_DESC_CMD_EOP;
-    uint64_t qw1;
 
     q->tx_pkts_since_rs++;
     if (q->tx_pkts_since_rs >= TX_RS_THRESH) {
@@ -395,10 +770,7 @@ static inline void tx_prepare_desc(struct txq_ctx *q, uint16_t idx, uint64_t buf
     }
 
     txd->buf_addr = htole64(buf_iova);
-    qw1 = ((uint64_t)ICE_TX_DESC_DTYPE_DATA << ICE_TXD_QW1_DTYPE_S) |
-          ((uint64_t)cmd << ICE_TXD_QW1_CMD_S) |
-          ((uint64_t)len << ICE_TXD_QW1_TX_BUF_SZ_S);
-    txd->cmd_type_offset_bsz = htole64(qw1);
+    txd->cmd_type_offset_bsz = tx_desc_qw1_le(cmd, len);
 }
 
 /* Returns: 0=enqueued, 1=ring full, -1=invalid packet */
@@ -432,9 +804,9 @@ static int tx_try_enqueue(struct ice_vfio_dev *d, struct txq_ctx *q, const uint8
     return 0;
 }
 
-static uint16_t tx_reflect_enqueue_batch(struct ice_vfio_dev *d, struct txq_ctx *q,
-                                         struct pkt_buf *bufs[], uint16_t num_bufs,
-                                         uint64_t *bytes_sent)
+static uint16_t tx_reflect_enqueue_batch_scalar(struct ice_vfio_dev *d, struct txq_ctx *q,
+                                                struct pkt_buf *bufs[], uint16_t num_bufs,
+                                                uint64_t *bytes_sent)
 {
     uint16_t desc_count = q->desc_count;
     uint16_t sent = 0;
@@ -468,6 +840,220 @@ static uint16_t tx_reflect_enqueue_batch(struct ice_vfio_dev *d, struct txq_ctx 
     return sent;
 }
 
+#if MY_ICE_HAVE_AVX2_INTRINSICS
+__attribute__((target("avx2"), noinline))
+static uint16_t tx_reflect_enqueue_batch_avx2(struct ice_vfio_dev *d, struct txq_ctx *q,
+                                              struct pkt_buf *bufs[], uint16_t num_bufs,
+                                              uint64_t *bytes_sent)
+{
+    uint16_t desc_count = q->desc_count;
+    uint16_t sent = 0;
+    uint16_t idx = q->tx_next_to_use;
+    uint64_t bytes = 0;
+
+    if (q->tx_free < num_bufs) {
+        tx_update_free(d, q);
+        if (q->tx_free < num_bufs)
+            num_bufs = q->tx_free;
+    }
+
+    while (sent < num_bufs) {
+        uint16_t left = (uint16_t)(num_bufs - sent);
+
+        if (left >= ICE_TX_DESC_AVX2_BATCH &&
+            desc_count >= ICE_TX_DESC_AVX2_BATCH &&
+            idx <= (uint16_t)(desc_count - ICE_TX_DESC_AVX2_BATCH) &&
+            q->tx_pkts_since_rs + ICE_TX_DESC_AVX2_BATCH < TX_RS_THRESH) {
+            struct pkt_buf *buf0 = bufs[sent + 0];
+            struct pkt_buf *buf1 = bufs[sent + 1];
+            struct pkt_buf *buf2 = bufs[sent + 2];
+            struct pkt_buf *buf3 = bufs[sent + 3];
+            uint16_t len0 = (uint16_t)buf0->size;
+            uint16_t len1 = (uint16_t)buf1->size;
+            uint16_t len2 = (uint16_t)buf2->size;
+            uint16_t len3 = (uint16_t)buf3->size;
+            uint64_t addr0 = htole64(buf0->buf_addr_iova);
+            uint64_t addr1 = htole64(buf1->buf_addr_iova);
+            uint64_t addr2 = htole64(buf2->buf_addr_iova);
+            uint64_t addr3 = htole64(buf3->buf_addr_iova);
+            uint64_t qw0 = tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len0);
+            uint64_t qw1 = tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len1);
+            uint64_t qw2 = tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len2);
+            uint64_t qw3 = tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len3);
+            __m256i desc01 = _mm256_setr_epi64x((long long)addr0, (long long)qw0,
+                                                (long long)addr1, (long long)qw1);
+            __m256i desc23 = _mm256_setr_epi64x((long long)addr2, (long long)qw2,
+                                                (long long)addr3, (long long)qw3);
+
+            if (likely(sent + REFLECT_PREFETCH_AHEAD < num_bufs))
+                __builtin_prefetch(&bufs[sent + REFLECT_PREFETCH_AHEAD], 0, 1);
+
+            _mm256_storeu_si256((__m256i *)(void *)&q->tx_desc[idx], desc01);
+            _mm256_storeu_si256((__m256i *)(void *)&q->tx_desc[idx + 2], desc23);
+
+            q->tx_pkt_buf_refs[idx + 0] = buf0;
+            q->tx_pkt_buf_refs[idx + 1] = buf1;
+            q->tx_pkt_buf_refs[idx + 2] = buf2;
+            q->tx_pkt_buf_refs[idx + 3] = buf3;
+
+            bytes += (uint64_t)len0 + len1 + len2 + len3;
+            sent = (uint16_t)(sent + ICE_TX_DESC_AVX2_BATCH);
+            idx = (uint16_t)(idx + ICE_TX_DESC_AVX2_BATCH);
+            if (idx == desc_count)
+                idx = 0;
+            q->tx_free = (uint16_t)(q->tx_free - ICE_TX_DESC_AVX2_BATCH);
+            q->tx_pkts_since_rs = (uint16_t)(q->tx_pkts_since_rs + ICE_TX_DESC_AVX2_BATCH);
+            continue;
+        }
+
+        {
+            struct pkt_buf *buf = bufs[sent];
+            uint16_t len = (uint16_t)buf->size;
+
+            tx_prepare_desc(q, idx, buf->buf_addr_iova, len);
+            q->tx_pkt_buf_refs[idx] = buf;
+            bytes += len;
+            sent++;
+            q->tx_free--;
+
+            idx++;
+            if (idx == desc_count)
+                idx = 0;
+        }
+    }
+
+    q->tx_next_to_use = idx;
+    *bytes_sent = bytes;
+    return sent;
+}
+#endif
+
+#if MY_ICE_HAVE_AVX512_INTRINSICS
+__attribute__((target("avx512f,avx512bw,avx512vl"), noinline))
+static uint16_t tx_reflect_enqueue_batch_avx512(struct ice_vfio_dev *d, struct txq_ctx *q,
+                                                struct pkt_buf *bufs[], uint16_t num_bufs,
+                                                uint64_t *bytes_sent)
+{
+    uint16_t desc_count = q->desc_count;
+    uint16_t sent = 0;
+    uint16_t idx = q->tx_next_to_use;
+    uint64_t bytes = 0;
+
+    if (q->tx_free < num_bufs) {
+        tx_update_free(d, q);
+        if (q->tx_free < num_bufs)
+            num_bufs = q->tx_free;
+    }
+
+    while (sent < num_bufs) {
+        uint16_t left = (uint16_t)(num_bufs - sent);
+
+        if (left >= ICE_TX_DESC_AVX512_BATCH &&
+            desc_count >= ICE_TX_DESC_AVX512_BATCH &&
+            idx <= (uint16_t)(desc_count - ICE_TX_DESC_AVX512_BATCH) &&
+            q->tx_pkts_since_rs + ICE_TX_DESC_AVX512_BATCH < TX_RS_THRESH) {
+            struct pkt_buf *buf0 = bufs[sent + 0];
+            struct pkt_buf *buf1 = bufs[sent + 1];
+            struct pkt_buf *buf2 = bufs[sent + 2];
+            struct pkt_buf *buf3 = bufs[sent + 3];
+            struct pkt_buf *buf4 = bufs[sent + 4];
+            struct pkt_buf *buf5 = bufs[sent + 5];
+            struct pkt_buf *buf6 = bufs[sent + 6];
+            struct pkt_buf *buf7 = bufs[sent + 7];
+            uint16_t len0 = (uint16_t)buf0->size;
+            uint16_t len1 = (uint16_t)buf1->size;
+            uint16_t len2 = (uint16_t)buf2->size;
+            uint16_t len3 = (uint16_t)buf3->size;
+            uint16_t len4 = (uint16_t)buf4->size;
+            uint16_t len5 = (uint16_t)buf5->size;
+            uint16_t len6 = (uint16_t)buf6->size;
+            uint16_t len7 = (uint16_t)buf7->size;
+            __m512i desc03;
+            __m512i desc47;
+
+            desc03 = _mm512_setr_epi64(
+                (long long)htole64(buf0->buf_addr_iova),
+                (long long)tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len0),
+                (long long)htole64(buf1->buf_addr_iova),
+                (long long)tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len1),
+                (long long)htole64(buf2->buf_addr_iova),
+                (long long)tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len2),
+                (long long)htole64(buf3->buf_addr_iova),
+                (long long)tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len3));
+            desc47 = _mm512_setr_epi64(
+                (long long)htole64(buf4->buf_addr_iova),
+                (long long)tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len4),
+                (long long)htole64(buf5->buf_addr_iova),
+                (long long)tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len5),
+                (long long)htole64(buf6->buf_addr_iova),
+                (long long)tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len6),
+                (long long)htole64(buf7->buf_addr_iova),
+                (long long)tx_desc_qw1_le(ICE_TX_DESC_CMD_EOP, len7));
+
+            if (likely(sent + REFLECT_PREFETCH_AHEAD < num_bufs))
+                __builtin_prefetch(&bufs[sent + REFLECT_PREFETCH_AHEAD], 0, 1);
+
+            _mm512_storeu_si512((void *)&q->tx_desc[idx], desc03);
+            _mm512_storeu_si512((void *)&q->tx_desc[idx + 4], desc47);
+
+#if UINTPTR_MAX == UINT64_MAX
+            {
+                __m512i refs = _mm512_setr_epi64(
+                    (long long)(uintptr_t)buf0,
+                    (long long)(uintptr_t)buf1,
+                    (long long)(uintptr_t)buf2,
+                    (long long)(uintptr_t)buf3,
+                    (long long)(uintptr_t)buf4,
+                    (long long)(uintptr_t)buf5,
+                    (long long)(uintptr_t)buf6,
+                    (long long)(uintptr_t)buf7);
+
+                _mm512_storeu_si512((void *)&q->tx_pkt_buf_refs[idx], refs);
+            }
+#else
+            q->tx_pkt_buf_refs[idx + 0] = buf0;
+            q->tx_pkt_buf_refs[idx + 1] = buf1;
+            q->tx_pkt_buf_refs[idx + 2] = buf2;
+            q->tx_pkt_buf_refs[idx + 3] = buf3;
+            q->tx_pkt_buf_refs[idx + 4] = buf4;
+            q->tx_pkt_buf_refs[idx + 5] = buf5;
+            q->tx_pkt_buf_refs[idx + 6] = buf6;
+            q->tx_pkt_buf_refs[idx + 7] = buf7;
+#endif
+
+            bytes += (uint64_t)len0 + len1 + len2 + len3 +
+                     len4 + len5 + len6 + len7;
+            sent = (uint16_t)(sent + ICE_TX_DESC_AVX512_BATCH);
+            idx = (uint16_t)(idx + ICE_TX_DESC_AVX512_BATCH);
+            if (idx == desc_count)
+                idx = 0;
+            q->tx_free = (uint16_t)(q->tx_free - ICE_TX_DESC_AVX512_BATCH);
+            q->tx_pkts_since_rs = (uint16_t)(q->tx_pkts_since_rs + ICE_TX_DESC_AVX512_BATCH);
+            continue;
+        }
+
+        {
+            struct pkt_buf *buf = bufs[sent];
+            uint16_t len = (uint16_t)buf->size;
+
+            tx_prepare_desc(q, idx, buf->buf_addr_iova, len);
+            q->tx_pkt_buf_refs[idx] = buf;
+            bytes += len;
+            sent++;
+            q->tx_free--;
+
+            idx++;
+            if (idx == desc_count)
+                idx = 0;
+        }
+    }
+
+    q->tx_next_to_use = idx;
+    *bytes_sent = bytes;
+    return sent;
+}
+#endif
+
 static void rearm_rx_desc_batch(struct ice_vfio_dev *d, const uint16_t idxs[], uint16_t count)
 {
     uint16_t i;
@@ -496,8 +1082,8 @@ static void rearm_rx_desc_batch(struct ice_vfio_dev *d, const uint16_t idxs[], u
     d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
 }
 
-static void rearm_rx_desc_pool_batch(struct ice_vfio_dev *d, const uint16_t idxs[],
-                                     struct pkt_buf *const bufs[], uint16_t count)
+static void rearm_rx_desc_pool_batch_scalar(struct ice_vfio_dev *d, const uint16_t idxs[],
+                                            struct pkt_buf *const bufs[], uint16_t count)
 {
     union ice_32b_rx_flex_desc *rx_desc = d->io.rx_desc;
     uint16_t i;
@@ -515,6 +1101,62 @@ static void rearm_rx_desc_pool_batch(struct ice_vfio_dev *d, const uint16_t idxs
     reg_write32(d, QRX_TAIL(d->io.rxq_id), idxs[count - 1]);
     d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
 }
+
+#if MY_ICE_HAVE_AVX2_INTRINSICS
+__attribute__((target("avx2"), noinline))
+static void rearm_rx_desc_pool_batch_avx2(struct ice_vfio_dev *d, const uint16_t idxs[],
+                                          struct pkt_buf *const bufs[], uint16_t count)
+{
+    union ice_32b_rx_flex_desc *rx_desc = d->io.rx_desc;
+    uint16_t i;
+
+    for (i = 0; i < count; i++) {
+        uint16_t idx = idxs[i];
+        uint64_t pkt_addr = htole64(bufs[i]->buf_addr_iova);
+        __m256i desc = _mm256_setr_epi64x((long long)pkt_addr, 0, 0, 0);
+
+        _mm256_storeu_si256((__m256i *)(void *)&rx_desc[idx], desc);
+    }
+
+    reg_write32(d, QRX_TAIL(d->io.rxq_id), idxs[count - 1]);
+    d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
+}
+#endif
+
+#if MY_ICE_HAVE_AVX512_INTRINSICS
+__attribute__((target("avx512f,avx512bw,avx512vl"), noinline))
+static void rearm_rx_desc_pool_batch_avx512(struct ice_vfio_dev *d, const uint16_t idxs[],
+                                            struct pkt_buf *const bufs[], uint16_t count)
+{
+    union ice_32b_rx_flex_desc *rx_desc = d->io.rx_desc;
+    uint16_t i = 0;
+
+    while (i < count) {
+        uint16_t idx = idxs[i];
+
+        if (i + 1 < count && idx + 1 == idxs[i + 1]) {
+            uint64_t pkt_addr0 = htole64(bufs[i]->buf_addr_iova);
+            uint64_t pkt_addr1 = htole64(bufs[i + 1]->buf_addr_iova);
+            __m512i desc_pair = _mm512_setr_epi64(
+                (long long)pkt_addr0, 0, 0, 0,
+                (long long)pkt_addr1, 0, 0, 0);
+
+            _mm512_storeu_si512((void *)&rx_desc[idx], desc_pair);
+            i = (uint16_t)(i + 2);
+            continue;
+        }
+
+        rx_desc[idx].read.pkt_addr = htole64(bufs[i]->buf_addr_iova);
+        rx_desc[idx].read.hdr_addr = 0;
+        rx_desc[idx].read.rsvd1 = 0;
+        rx_desc[idx].read.rsvd2 = 0;
+        i++;
+    }
+
+    reg_write32(d, QRX_TAIL(d->io.rxq_id), idxs[count - 1]);
+    d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
+}
+#endif
 
 static void rearm_rx_desc(struct ice_vfio_dev *d, uint16_t idx)
 {
@@ -648,6 +1290,10 @@ struct reflect_l2_ctx {
     uint16_t local_mac01;
     uint32_t local_mac25;
 #endif
+#if MY_ICE_HAVE_AVX2_INTRINSICS
+    uint8_t avx_shuffle_mask[16];
+    uint8_t avx_local_src[16];
+#endif
 };
 
 static inline void reflect_l2_ctx_init(struct reflect_l2_ctx *ctx, const uint8_t *local_mac)
@@ -657,6 +1303,19 @@ static inline void reflect_l2_ctx_init(struct reflect_l2_ctx *ctx, const uint8_t
     memcpy(&ctx->local_mac01, local_mac, sizeof(ctx->local_mac01));
     memcpy(&ctx->local_mac25, local_mac + sizeof(ctx->local_mac01),
            sizeof(ctx->local_mac25));
+#endif
+#if MY_ICE_HAVE_AVX2_INTRINSICS
+    {
+        static const uint8_t shuffle_mask[16] = {
+            6, 7, 8, 9, 10, 11,
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+            12, 13, 14, 15
+        };
+
+        memcpy(ctx->avx_shuffle_mask, shuffle_mask, sizeof(ctx->avx_shuffle_mask));
+        memset(ctx->avx_local_src, 0, sizeof(ctx->avx_local_src));
+        memcpy(ctx->avx_local_src + ETHER_ADDR_LEN, local_mac, ETHER_ADDR_LEN);
+    }
 #endif
 }
 
@@ -687,6 +1346,79 @@ static inline void rewrite_reflect_l2(struct pkt_buf *buf, const struct reflect_
     memcpy(buf->data + ETHER_ADDR_LEN, ctx->local_mac, ETHER_ADDR_LEN);
 #endif
 }
+
+static void rewrite_reflect_l2_batch_scalar(struct pkt_buf *bufs[], uint16_t count,
+                                            const struct reflect_l2_ctx *ctx)
+{
+    uint16_t i;
+
+    for (i = 0; i < count; i++)
+        rewrite_reflect_l2(bufs[i], ctx);
+}
+
+#if MY_ICE_HAVE_AVX2_INTRINSICS
+__attribute__((target("avx2"), noinline))
+static void rewrite_reflect_l2_batch_avx2(struct pkt_buf *bufs[], uint16_t count,
+                                          const struct reflect_l2_ctx *ctx)
+{
+    const __m128i shuffle_mask =
+        _mm_loadu_si128((const __m128i *)(const void *)ctx->avx_shuffle_mask);
+    const __m128i local_src =
+        _mm_loadu_si128((const __m128i *)(const void *)ctx->avx_local_src);
+    uint16_t i;
+
+    for (i = 0; i < count; i++) {
+        uint8_t *data = bufs[i]->data;
+        __m128i eth = _mm_loadu_si128((const __m128i *)(const void *)data);
+        __m128i out = _mm_or_si128(_mm_shuffle_epi8(eth, shuffle_mask), local_src);
+
+        _mm_storeu_si128((__m128i *)(void *)data, out);
+    }
+}
+#endif
+
+#if MY_ICE_HAVE_AVX512_INTRINSICS
+__attribute__((target("avx512f,avx512bw,avx512vl"), noinline))
+static void rewrite_reflect_l2_batch_avx512(struct pkt_buf *bufs[], uint16_t count,
+                                            const struct reflect_l2_ctx *ctx)
+{
+    const __m128i shuffle_mask =
+        _mm_loadu_si128((const __m128i *)(const void *)ctx->avx_shuffle_mask);
+    const __m128i local_src =
+        _mm_loadu_si128((const __m128i *)(const void *)ctx->avx_local_src);
+    uint16_t i = 0;
+
+    while (i + 4 <= count) {
+        uint8_t *data0 = bufs[i + 0]->data;
+        uint8_t *data1 = bufs[i + 1]->data;
+        uint8_t *data2 = bufs[i + 2]->data;
+        uint8_t *data3 = bufs[i + 3]->data;
+        __m128i eth0 = _mm_loadu_si128((const __m128i *)(const void *)data0);
+        __m128i eth1 = _mm_loadu_si128((const __m128i *)(const void *)data1);
+        __m128i eth2 = _mm_loadu_si128((const __m128i *)(const void *)data2);
+        __m128i eth3 = _mm_loadu_si128((const __m128i *)(const void *)data3);
+
+        _mm_storeu_si128((__m128i *)(void *)data0,
+                         _mm_or_si128(_mm_shuffle_epi8(eth0, shuffle_mask), local_src));
+        _mm_storeu_si128((__m128i *)(void *)data1,
+                         _mm_or_si128(_mm_shuffle_epi8(eth1, shuffle_mask), local_src));
+        _mm_storeu_si128((__m128i *)(void *)data2,
+                         _mm_or_si128(_mm_shuffle_epi8(eth2, shuffle_mask), local_src));
+        _mm_storeu_si128((__m128i *)(void *)data3,
+                         _mm_or_si128(_mm_shuffle_epi8(eth3, shuffle_mask), local_src));
+        i = (uint16_t)(i + 4);
+    }
+
+    while (i < count) {
+        uint8_t *data = bufs[i]->data;
+        __m128i eth = _mm_loadu_si128((const __m128i *)(const void *)data);
+        __m128i out = _mm_or_si128(_mm_shuffle_epi8(eth, shuffle_mask), local_src);
+
+        _mm_storeu_si128((__m128i *)(void *)data, out);
+        i++;
+    }
+}
+#endif
 
 int run_rx_listen(struct ice_vfio_dev *d, int timeout_ms)
 {
@@ -764,7 +1496,8 @@ out:
     return rc;
 }
 
-int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batch)
+int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms,
+                   uint16_t reflect_batch, enum reflect_vector_mode vector_mode)
 {
     uint32_t rx_alloc;
     uint32_t tx_alloc;
@@ -787,7 +1520,36 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     struct reflect_l2_ctx l2_ctx;
     struct rx_reflect_metrics metrics;
     struct txq_ctx *q;
+    poll_rx_batch_fn poll_rx_batch_active = poll_rx_batch_scalar;
+    tx_reflect_enqueue_fn tx_reflect_enqueue_active = tx_reflect_enqueue_batch_scalar;
+    rearm_rx_desc_pool_batch_fn rearm_rx_desc_pool_batch_active =
+        rearm_rx_desc_pool_batch_scalar;
+    rewrite_reflect_l2_batch_fn rewrite_reflect_l2_batch_active =
+        rewrite_reflect_l2_batch_scalar;
+    enum reflect_vector_active vector_active = REFLECT_VECTOR_ACTIVE_SCALAR;
+    const char *vector_requested_name = reflect_vector_mode_name(vector_mode);
+    const char *vector_active_name;
     int rc = -1;
+
+    if ((vector_mode == REFLECT_VECTOR_AUTO || vector_mode == REFLECT_VECTOR_AVX2) &&
+        reflect_avx2_supported()) {
+#if MY_ICE_HAVE_AVX2_INTRINSICS
+        poll_rx_batch_active = poll_rx_batch_avx2;
+        tx_reflect_enqueue_active = tx_reflect_enqueue_batch_avx2;
+        rearm_rx_desc_pool_batch_active = rearm_rx_desc_pool_batch_avx2;
+        rewrite_reflect_l2_batch_active = rewrite_reflect_l2_batch_avx2;
+        vector_active = REFLECT_VECTOR_ACTIVE_AVX2;
+#endif
+    } else if (vector_mode == REFLECT_VECTOR_AVX512 && reflect_avx512_supported()) {
+#if MY_ICE_HAVE_AVX512_INTRINSICS
+        poll_rx_batch_active = poll_rx_batch_avx512;
+        tx_reflect_enqueue_active = tx_reflect_enqueue_batch_avx512;
+        rearm_rx_desc_pool_batch_active = rearm_rx_desc_pool_batch_avx512;
+        rewrite_reflect_l2_batch_active = rewrite_reflect_l2_batch_avx512;
+        vector_active = REFLECT_VECTOR_ACTIVE_AVX512;
+#endif
+    }
+    vector_active_name = reflect_vector_active_name(vector_active);
 
     if (d->txq_count != 1) {
         fprintf(stderr, "[my_ice] rx-reflect uses one TX queue, using txq[0] only (configured=%u)\n",
@@ -850,6 +1612,9 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
             d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms, reflect_batch,
             tx_doorbell_batch);
+    fprintf(stderr,
+            "[my_ice] rx-reflect vector: requested=%s active=%s\n",
+            vector_requested_name, vector_active_name);
 
     reflect_l2_ctx_init(&l2_ctx, d->io.mac);
 
@@ -901,7 +1666,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             goto report_progress;
         }
 
-        got = poll_rx_batch(d, rx_idxs, rx_lens, budget);
+        got = poll_rx_batch_active(d, rx_idxs, rx_lens, budget);
         if (unlikely(got < 0)) {
             rx_errors++;
             dump_mdet_regs(d);
@@ -928,6 +1693,17 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             uint16_t rx_len = rx_lens[i];
             struct pkt_buf *rx_buf = d->io.rx_pkt_bufs[rx_idx];
 
+            if (likely(i + REFLECT_PREFETCH_AHEAD < (uint16_t)got)) {
+                uint16_t pf_idx = rx_idxs[i + REFLECT_PREFETCH_AHEAD];
+                struct pkt_buf *pf_rx_buf;
+
+                __builtin_prefetch(&d->io.rx_pkt_bufs[pf_idx], 0, 1);
+                pf_rx_buf = d->io.rx_pkt_bufs[pf_idx];
+                if (likely(pf_rx_buf))
+                    __builtin_prefetch(pf_rx_buf->data, 1, 1);
+                __builtin_prefetch(replacement_bufs[i + REFLECT_PREFETCH_AHEAD], 0, 1);
+            }
+
             if (unlikely(!rx_buf)) {
                 fprintf(stderr, "[my_ice] missing rx pool buffer for descriptor %u\n", rx_idx);
                 rx_errors++;
@@ -943,20 +1719,22 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             }
 
             rx_buf->size = rx_len;
-            rewrite_reflect_l2(rx_buf, &l2_ctx);
 
             tx_bufs[tx_count] = rx_buf;
             batch_rx_bytes += rx_len;
             tx_count++;
         }
 
-        rearm_rx_desc_pool_batch(d, rx_idxs, replacement_bufs, (uint16_t)got);
+        if (tx_count > 0)
+            rewrite_reflect_l2_batch_active(tx_bufs, tx_count, &l2_ctx);
+
+        rearm_rx_desc_pool_batch_active(d, rx_idxs, replacement_bufs, (uint16_t)got);
 
         rx_pkts += tx_count;
         rx_bytes += batch_rx_bytes;
 
         if (tx_count > 0)
-            sent = tx_reflect_enqueue_batch(d, q, tx_bufs, tx_count, &batch_tx_bytes);
+            sent = tx_reflect_enqueue_active(d, q, tx_bufs, tx_count, &batch_tx_bytes);
 
         if (sent > 0) {
             tx_pkts += sent;
@@ -1063,6 +1841,8 @@ report_progress:
     metrics.reflect_batch = reflect_batch;
     metrics.gorc_delta = gorc_after - gorc_before;
     metrics.gotc_delta = gotc_after - gotc_before;
+    metrics.reflect_vector_requested = vector_requested_name;
+    metrics.reflect_vector_active = vector_active_name;
     fprintf(stderr,
             "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
             " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
@@ -1071,7 +1851,8 @@ report_progress:
             " zero_copy_pkts=%" PRIu64 " zero_copy_bytes=%" PRIu64
             " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
             " pool_empty=%" PRIu64 " doorbells=%" PRIu64
-            " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
+            " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64
+            " reflect_vector_requested=%s reflect_vector_active=%s\n",
             metrics.seconds_total,
             metrics.tx_wire_gbps,
             metrics.rx_wire_gbps,
@@ -1081,7 +1862,7 @@ report_progress:
             metrics.rx_l2_gbps,
             rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
             tx_ring_full, rx_short, rx_errors, pool_empty, doorbells, d->io.vsi_num,
-            metrics.gorc_delta, metrics.gotc_delta);
+            metrics.gorc_delta, metrics.gotc_delta, vector_requested_name, vector_active_name);
 
     if (write_rx_reflect_metrics_log(d, &metrics) < 0)
         goto out;

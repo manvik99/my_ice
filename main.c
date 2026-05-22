@@ -23,6 +23,7 @@ int main(int argc, char **argv)
     uint16_t txq_count = 1;
     uint16_t tx_desc_count = ICE_TX_DESC_COUNT;
     uint16_t reflect_batch = DEFAULT_REFLECT_BATCH;
+    enum reflect_vector_mode reflect_vector_mode = REFLECT_VECTOR_OFF;
     bool pin_cpus = false;
     bool dump_topo = false;
     const char *metrics_log = NULL;
@@ -42,7 +43,7 @@ int main(int argc, char **argv)
     ice_vfio_dev_init(&d);
 
     if (argc < 2) {
-        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--tx-queues <n>] [--tx-desc-count <n>] [--reflect-batch <n>] [--metrics-log <path>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <BDF> [--rx-listen [seconds]|--rx-reflect [seconds]|--tx-send <dst-mac> [count] [interval-ms] [payload]|--tx-bench <seconds> <dst-mac> <payload-len>] [--tx-queues <n>] [--tx-desc-count <n>] [--reflect-batch <n>] [--reflect-vector off|auto|avx2|avx512] [--metrics-log <path>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-listen 60\n", argv[0]);
         fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60\n", argv[0]);
@@ -208,6 +209,25 @@ int main(int argc, char **argv)
                 }
                 reflect_batch = (uint16_t)v;
                 i += 2;
+            } else if (strcmp(argv[i], "--reflect-vector") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "--reflect-vector requires off|auto|avx2|avx512\n");
+                    return EXIT_FAILURE;
+                }
+                if (strcmp(argv[i + 1], "off") == 0) {
+                    reflect_vector_mode = REFLECT_VECTOR_OFF;
+                } else if (strcmp(argv[i + 1], "auto") == 0) {
+                    reflect_vector_mode = REFLECT_VECTOR_AUTO;
+                } else if (strcmp(argv[i + 1], "avx2") == 0) {
+                    reflect_vector_mode = REFLECT_VECTOR_AVX2;
+                } else if (strcmp(argv[i + 1], "avx512") == 0) {
+                    reflect_vector_mode = REFLECT_VECTOR_AVX512;
+                } else {
+                    fprintf(stderr, "invalid --reflect-vector '%s' (expected off|auto|avx2|avx512)\n",
+                            argv[i + 1]);
+                    return EXIT_FAILURE;
+                }
+                i += 2;
             } else if (strcmp(argv[i], "--metrics-log") == 0) {
                 if (i + 1 >= argc) {
                     fprintf(stderr, "--metrics-log requires <path>\n");
@@ -274,7 +294,8 @@ int main(int argc, char **argv)
             goto out;
     } else if (run_rx_reflect_mode) {
         fprintf(stderr, "[my_ice] running rx reflect path\n");
-        if (run_rx_reflect(&d, rx_reflect_timeout_s * 1000, reflect_batch) < 0)
+        if (run_rx_reflect(&d, rx_reflect_timeout_s * 1000, reflect_batch,
+                           reflect_vector_mode) < 0)
             goto out;
     } else if (run_tx_send_mode) {
         fprintf(stderr, "[my_ice] running tx send path\n");

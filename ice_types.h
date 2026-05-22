@@ -138,6 +138,8 @@ struct rx_reflect_metrics {
     uint16_t reflect_batch;
     uint64_t gorc_delta;
     uint64_t gotc_delta;
+    const char *reflect_vector_requested;
+    const char *reflect_vector_active;
 };
 
 #endif
