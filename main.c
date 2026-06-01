@@ -82,6 +82,7 @@ int main(int argc, char **argv)
                     fprintf(stderr, "only one mode allowed (--rx-listen/--rx-reflect/--tx-send/--tx-bench)\n");
                     return EXIT_FAILURE;
                 }
+                /* rx-reflect runs the receive -> rewrite -> transmit loop for the requested duration. */
                 mode_set = true;
                 run_rx_reflect_mode = true;
                 i++;
@@ -201,6 +202,7 @@ int main(int argc, char **argv)
                     fprintf(stderr, "--reflect-batch requires <n>\n");
                     return EXIT_FAILURE;
                 }
+                /* reflect_batch caps one hot-loop burst: how many packets we poll, swap, rearm, and enqueue together. */
                 if (parse_int_range(argv[i + 1], 1, MAX_REFLECT_BATCH, &v) < 0) {
                     fprintf(stderr, "invalid --reflect-batch '%s' (expected 1..%u)\n",
                             argv[i + 1], MAX_REFLECT_BATCH);
@@ -274,6 +276,7 @@ int main(int argc, char **argv)
             goto out;
     } else if (run_rx_reflect_mode) {
         fprintf(stderr, "[my_ice] running rx reflect path\n");
+        /* The reflect mode owns one Rx queue and one Tx queue, rewrites Ethernet headers in place, and recycles buffers through reflect_pool. */
         if (run_rx_reflect(&d, rx_reflect_timeout_s * 1000, reflect_batch) < 0)
             goto out;
     } else if (run_tx_send_mode) {

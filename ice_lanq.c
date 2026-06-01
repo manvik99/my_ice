@@ -19,7 +19,6 @@
 
 #define ICE_RX_DESC_MASK (ICE_RX_DESC_COUNT - 1)
 #define REFLECT_TIME_CHECK_BURSTS 1024U
-#define REFLECT_TX_DOORBELL_BATCH 256U
 
 #if (ICE_RX_DESC_COUNT & ICE_RX_DESC_MASK) != 0
 #error "RX fast path assumes ICE_RX_DESC_COUNT is a power of two"
@@ -102,6 +101,7 @@ static int add_tx_queues(struct ice_vfio_dev *d, uint16_t count)
     if (count > 255)
         count = 255;
 
+    /* ADD_TXQS is the control-plane step that turns our software Tx ring into a hardware-scheduled transmit queue. */
     qg_size = sizeof(*qg) + (size_t)(count - 1) * sizeof(struct ice_aqc_add_txqs_perq);
     qg = calloc(1, qg_size);
     if (!qg)
@@ -114,6 +114,7 @@ static int add_tx_queues(struct ice_vfio_dev *d, uint16_t count)
         struct txq_ctx *q = &d->txqs[i];
         struct ice_tlan_ctx tlan = {0};
 
+        /* Describe which descriptor ring, port, and VSI firmware should bind to this Tx queue. */
         tlan.port_num = d->io.lport;
         tlan.qlen = d->tx_desc_count;
         tlan.base = q->tx_desc_iova >> 7;
@@ -161,6 +162,7 @@ static int wait_rxq_ready(struct ice_vfio_dev *d, uint16_t rxq, uint32_t *reg)
 {
     int i;
 
+    /* QRX_CTRL is a small enable-state machine: wait until driver intent (QENA_REQ) matches hardware state (QENA_STAT). */
     for (i = 0; i < 2000; i++) {
         uint32_t qrx_ctrl = reg_read32(d, QRX_CTRL(rxq));
         uint32_t qena_req = qrx_ctrl & QRX_CTRL_QENA_REQ_M;
@@ -183,6 +185,7 @@ static int enable_rxq(struct ice_vfio_dev *d)
     uint32_t reg;
     int i;
 
+    /* Program one Rx context for flex descriptors and whole-frame 2 KiB packet buffers. */
     rlan.base = d->io.rx_desc_iova >> 7;
     rlan.qlen = ICE_RX_DESC_COUNT;
     rlan.dbuf = ICE_RX_BUF_SIZE >> ICE_RLAN_CTX_DBUF_S;
@@ -197,6 +200,7 @@ static int enable_rxq(struct ice_vfio_dev *d)
     rlan.lrxqthresh = 1;
     rlan.prefena = 1;
 
+    /* Select the flex descriptor profile the Rx poller expects to parse from writeback descriptors. */
     reg = reg_read32(d, QRXFLXP_CNTXT(q));
     reg &= ~QRXFLXP_CNTXT_RXDID_IDX_M;
     reg |= ((uint32_t)ICE_RXDID_FLEX_NIC << QRXFLXP_CNTXT_RXDID_IDX_S) & QRXFLXP_CNTXT_RXDID_IDX_M;
@@ -204,6 +208,7 @@ static int enable_rxq(struct ice_vfio_dev *d)
     reg |= (0x03U << QRXFLXP_CNTXT_RXDID_PRIO_S) & QRXFLXP_CNTXT_RXDID_PRIO_M;
     reg_write32(d, QRXFLXP_CNTXT(q), reg);
 
+    /* Pack the queue context into the dense QRX_CONTEXT dwords firmware/hardware consume. */
     set_ctx_bits((uint8_t *)&rlan, ctx_buf, rlan_ctx_info);
     for (i = 0; i < ICE_RXQ_CTX_SIZE_DWORDS; i++) {
         uint32_t v;
@@ -223,6 +228,7 @@ static int enable_rxq(struct ice_vfio_dev *d)
             return -1;
     }
 
+    /* Every descriptor already points at a DMA buffer, so setting QRX_TAIL to the last slot hands the full ring to hardware. */
     d->io.rx_ntc = 0;
     reg_write32(d, QRX_TAIL(q), ICE_RX_DESC_COUNT - 1);
     return 0;
@@ -251,6 +257,7 @@ static int setup_and_enable_rxq_pool(struct ice_vfio_dev *d)
     memset(d->io.rx_desc, 0, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc));
     memset(d->io.rx_pkt_bufs, 0, ICE_RX_DESC_COUNT * sizeof(*d->io.rx_pkt_bufs));
 
+    /* Reflect mode arms each Rx descriptor with a pooled pkt_buf so the completed buffer can be handed directly to Tx. */
     for (i = 0; i < ICE_RX_DESC_COUNT; i++) {
         struct pkt_buf *buf = pkt_buf_alloc(&d->reflect_pool);
 
@@ -268,6 +275,7 @@ static void tx_ring_init(struct ice_vfio_dev *d)
 {
     uint16_t i;
 
+    /* Reset software ownership for every Tx slot before reflect starts borrowing pkt_bufs into the ring. */
     for (i = 0; i < d->txq_count; i++) {
         struct txq_ctx *q = &d->txqs[i];
         memset(q->tx_desc, 0, (size_t)q->desc_count * sizeof(struct ice_tx_desc));
@@ -306,6 +314,10 @@ static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
     uint16_t used;
     uint16_t idx;
 
+    /*
+     * QTX_COMM_HEAD is the hardware consumer index. Advancing from tx_next_to_clean to HEAD means those
+     * descriptors are done, so any borrowed pkt_buf recorded in tx_pkt_buf_refs can return to reflect_pool.
+     */
     head = tx_ring_clamp(head, q->desc_count);
 
     if (head == q->tx_next_to_clean)
@@ -314,6 +326,7 @@ static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
     idx = q->tx_next_to_clean;
     while (idx != head) {
         if (q->tx_pkt_buf_refs[idx]) {
+            /* Tx completion hands ownership of that reflected buffer back to the shared pool. */
             pkt_buf_free_fast(q->tx_pkt_buf_refs[idx]);
             q->tx_pkt_buf_refs[idx] = NULL;
         }
@@ -377,6 +390,7 @@ static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t o
         if (likely(count + 1 < max_count))
             __builtin_prefetch(&d->io.rx_desc[next_idx], 0, 1);
 
+        /* Stop on the first descriptor hardware has not completed yet; the reflect loop only handles a contiguous ready burst. */
         if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)))
             break;
 
@@ -440,6 +454,7 @@ static inline void tx_prepare_desc(struct txq_ctx *q, uint16_t idx, uint64_t buf
     uint16_t cmd = ICE_TX_DESC_CMD_EOP;
     uint64_t qw1;
 
+    /* The descriptor points straight at the borrowed reflect buffer, so no payload copy happens in the Tx path. */
     q->tx_pkts_since_rs++;
     if (q->tx_pkts_since_rs >= TX_RS_THRESH) {
         /* RS cadence matches Rust so QTX_COMM_HEAD advances often enough to recycle reflected buffers. */
@@ -508,6 +523,7 @@ static uint16_t tx_reflect_enqueue_batch(struct ice_vfio_dev *d, struct txq_ctx 
 
         len = (uint16_t)buf->size;
         tx_prepare_desc(q, idx, buf->buf_addr_iova, len);
+        /* Remember which pooled buffer this Tx slot borrowed so tx_update_free() can recycle it on completion. */
         q->tx_pkt_buf_refs[idx] = buf;
         bytes += len;
         sent++;
@@ -568,6 +584,7 @@ static void rearm_rx_desc_pool_batch(struct ice_vfio_dev *d, const uint16_t idxs
         rx_desc[idx].read.rsvd2 = 0;
     }
 
+    /* Advancing QRX_TAIL to the last rewritten slot hands every replacement buffer in this burst back to hardware. */
     reg_write32(d, QRX_TAIL(d->io.rxq_id), idxs[count - 1]);
     d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
 }
@@ -597,6 +614,7 @@ static int poll_one_rx_packet(struct ice_vfio_dev *d, uint8_t *out, uint16_t out
 
 static inline void tx_ring_doorbell(struct ice_vfio_dev *d, struct txq_ctx *q)
 {
+    /* Order descriptor writes before the MMIO doorbell that tells hardware tx_next_to_use is ready. */
     __sync_synchronize();
     reg_write32(d, QTX_COMM_DBELL(q->txq_id), q->tx_next_to_use);
 }
@@ -606,6 +624,7 @@ static int tx_wait_drain(struct ice_vfio_dev *d, struct txq_ctx *q, int timeout_
     uint64_t start_ns = monotonic_ns();
     uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
 
+    /* Used at shutdown so final metrics describe transmitted packets, not descriptors still in flight. */
     while (monotonic_ns() - start_ns < timeout_ns) {
         tx_update_free(d, q);
         if (q->tx_next_to_clean == q->tx_next_to_use)
@@ -844,6 +863,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     uint32_t tx_alloc;
     uint16_t first_q, last_q, avail_q;
     uint16_t rx_mac_rule_idx = UINT16_MAX;
+    uint64_t received_pkts = 0, processed_pkts = 0;
     uint64_t rx_pkts = 0, rx_bytes = 0;
     uint64_t tx_pkts = 0, tx_bytes = 0;
     uint64_t zero_copy_pkts = 0, zero_copy_bytes = 0;
@@ -861,6 +881,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     uint64_t gorc_before, gorc_after, gotc_before, gotc_after;
     uint64_t start_ns, end_ns, now_ns;
     uint32_t time_check_countdown = 0;
+    uint16_t requested_reflect_batch = reflect_batch;
     uint16_t tx_doorbell_batch = REFLECT_TX_DOORBELL_BATCH;
     uint16_t tx_pkts_pending_db = 0;
     struct reflect_l2_ctx l2_ctx;
@@ -873,6 +894,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
                 d->txq_count);
     }
 
+    /* Discover the one hardware Rx queue and one hardware Tx queue this reflector will drive. */
     rx_alloc = reg_read32(d, PFLAN_RX_QALLOC);
     if (!(rx_alloc & PFLAN_RX_QALLOC_VALID_M)) {
         fprintf(stderr, "queue alloc not valid (RX=0x%08x)\n", rx_alloc);
@@ -895,6 +917,14 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     }
     d->txqs[0].txq_id = first_q;
 
+    /*
+     * Control-plane bring-up for reflection:
+     *   1. discover VSI/lport so rules and contexts target the right interface,
+     *   2. discover qparent_teid so ADD_TXQS can attach the Tx queue in the scheduler tree,
+     *   3. arm Rx with pooled packet objects,
+     *   4. install an Rx MAC rule so frames for our MAC reach this VSI,
+     *   5. create the Tx queue firmware object.
+     */
     if (aq_get_default_vsi_and_lport(d) < 0) {
         fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
         goto out;
@@ -918,6 +948,8 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
     tx_ring_init(d);
     q = &d->txqs[0];
+    if (reflect_batch > MAX_HOT_REFLECT_BATCH)
+        reflect_batch = MAX_HOT_REFLECT_BATCH;
     /* Share one doorbell target with Rust: never ring more often than reflect_batch or more than free space allows. */
     if (tx_doorbell_batch < reflect_batch)
         tx_doorbell_batch = reflect_batch;
@@ -925,12 +957,13 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         tx_doorbell_batch = q->tx_free;
 
     fprintf(stderr,
-            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d reflect_batch=%u tx_doorbell_batch=%u\n",
+            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d reflect_batch=%u effective_reflect_batch=%u tx_doorbell_batch=%u\n",
             d->io.vsi_num, d->io.lport, d->io.rxq_id, q->txq_id,
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms, reflect_batch,
-            tx_doorbell_batch);
+            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms, requested_reflect_batch,
+            reflect_batch, tx_doorbell_batch);
 
+    /* Precompute the Ethernet rewrite state and snapshot baseline counters before entering the hot loop. */
     reflect_l2_ctx_init(&l2_ctx, d->io.mac);
 
     gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
@@ -969,6 +1002,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             budget = (uint16_t)d->reflect_pool.free_count;
 
         if (budget == 0) {
+            /* No new burst can run until Tx frees descriptors or the pool regains replacement buffers. */
             if (tx_pkts_pending_db != 0) {
                 tx_ring_doorbell(d, q);
                 doorbells++;
@@ -982,6 +1016,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             goto report_progress;
         }
 
+        /* Poll a contiguous ready burst. The poller validates DD/EOF/RXE so the reflect loop only sees complete frames. */
         got = poll_rx_batch(d, rx_idxs, rx_lens, budget);
         if (unlikely(got < 0)) {
             rx_errors++;
@@ -1005,6 +1040,13 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             goto out;
         }
 
+        /*
+         * For each completed descriptor:
+         *   1. take ownership of the just-filled buffer,
+         *   2. swap a fresh replacement buffer back into the Rx slot,
+         *   3. rewrite Ethernet src/dst for reflection,
+         *   4. queue the borrowed buffer for Tx.
+         */
         for (i = 0; i < (uint16_t)got; i++) {
             uint16_t rx_idx = rx_idxs[i];
             uint16_t rx_len = rx_lens[i];
@@ -1020,6 +1062,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             d->io.rx_pkt_bufs[rx_idx] = replacement_bufs[i];
 
             if (rx_len < 14) {
+                /* Too short to contain a full Ethernet header, so it cannot be reflected safely. */
                 rx_short++;
                 pkt_buf_free_fast(rx_buf);
                 continue;
@@ -1036,9 +1079,12 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         /* Replacement buffers rearm Rx immediately; unlike the older zero-copy path, no deferred tailing is needed. */
         rearm_rx_desc_pool_batch(d, rx_idxs, replacement_bufs, (uint16_t)got);
 
+        received_pkts += (uint64_t)got;
+        processed_pkts += tx_count;
         rx_pkts += tx_count;
         rx_bytes += batch_rx_bytes;
 
+        /* Submit the borrowed packet objects to Tx without copying payload bytes. */
         if (tx_count > 0)
             sent = tx_reflect_enqueue_batch(d, q, tx_bufs, tx_count, &batch_tx_bytes);
 
@@ -1057,6 +1103,7 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         }
 
         if (sent < tx_count) {
+            /* Any unsent borrowed buffers never reached hardware, so software must return them to the pool immediately. */
             for (i = sent; i < tx_count; i++)
                 pkt_buf_free_fast(tx_bufs[i]);
             tx_ring_full++;
@@ -1064,12 +1111,14 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         }
 
 report_progress:
+        /* If a partial Tx batch was staged and then traffic went idle, force the doorbell so hardware sees it. */
         if (!rx_seen && tx_pkts_pending_db != 0) {
             tx_ring_doorbell(d, q);
             doorbells++;
             tx_pkts_pending_db = 0;
         }
         if (time_check_countdown == 0 || stalled || !rx_seen) {
+            /* Avoid paying for a clock read every iteration while the loop is running flat-out. */
             time_check_countdown = REFLECT_TIME_CHECK_BURSTS;
             now_ns = monotonic_ns();
             if (now_ns >= end_ns)
@@ -1130,6 +1179,7 @@ report_progress:
             usleep(1000);
     }
 
+    /* Flush the final partial batch, wait briefly for hardware completion, then compute the final reflect summary. */
     if (tx_pkts_pending_db != 0) {
         tx_ring_doorbell(d, q);
         doorbells++;
@@ -1141,6 +1191,7 @@ report_progress:
                                     GLV_GORCH(d->io.vsi_num));
     gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
                                     GLV_GOTCH(d->io.vsi_num));
+    /* Export both software-accounted traffic totals and hardware VSI byte counters so C/Rust runs remain comparable. */
     metrics.seconds_total = (double)(now_ns - start_ns) / 1e9;
     metrics.tx_wire_gbps =
         bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts, tx_bytes), now_ns - start_ns);
@@ -1150,6 +1201,8 @@ report_progress:
     metrics.rx_mpps = pkts_ns_to_mpps(rx_pkts, now_ns - start_ns);
     metrics.tx_l2_gbps = bytes_ns_to_gbps(tx_bytes, now_ns - start_ns);
     metrics.rx_l2_gbps = bytes_ns_to_gbps(rx_bytes, now_ns - start_ns);
+    metrics.received_pkts = received_pkts;
+    metrics.processed_pkts = processed_pkts;
     metrics.rx_pkts = rx_pkts;
     metrics.rx_bytes = rx_bytes;
     metrics.tx_pkts = tx_pkts;
@@ -1170,6 +1223,7 @@ report_progress:
     fprintf(stderr,
             "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
             " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
+            " received_pkts=%" PRIu64 " processed_pkts=%" PRIu64
             " rx_pkts=%" PRIu64 " rx_bytes=%" PRIu64
             " tx_pkts=%" PRIu64 " tx_bytes=%" PRIu64
             " zero_copy_pkts=%" PRIu64 " zero_copy_bytes=%" PRIu64
@@ -1184,6 +1238,8 @@ report_progress:
             metrics.rx_mpps,
             metrics.tx_l2_gbps,
             metrics.rx_l2_gbps,
+            received_pkts,
+            processed_pkts,
             rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
             tx_ring_full, rx_short, rx_errors, pool_empty, doorbells,
             tx_pkts_pending_db,

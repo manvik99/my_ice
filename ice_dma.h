@@ -24,7 +24,10 @@ static inline void pkt_buf_free_fast(struct pkt_buf *buf)
     struct pkt_mempool *pool;
     uint32_t tail;
 
-    /* Added for the reflect cleanup hot path: inline the same simple free-ring push every time. */
+    /*
+     * Return a reflected pkt_buf to the shared pool with one free-ring push.
+     * tx_update_free() calls this after hardware advances past a Tx descriptor that borrowed the buffer.
+     */
     if (!buf || !buf->mempool)
         return;
 

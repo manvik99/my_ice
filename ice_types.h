@@ -15,8 +15,10 @@
 #define ALIGN_UP(v, a) (((v) + ((a) - 1)) & ~((size_t)((a) - 1)))
 #define NS_PER_S 1000000000ULL
 #define TX_BURST_SIZE 64
-#define DEFAULT_REFLECT_BATCH 256
+#define DEFAULT_REFLECT_BATCH 128
 #define MAX_REFLECT_BATCH 256
+#define MAX_HOT_REFLECT_BATCH 128
+#define REFLECT_TX_DOORBELL_BATCH 256U
 #define TX_RS_THRESH 128
 #define ETH_WIRE_OVERHEAD_BYTES 24U
 #define ICE_PKT_BUF_DATA_SIZE \
@@ -127,6 +129,8 @@ struct rx_reflect_metrics {
     double rx_mpps;
     double tx_l2_gbps;
     double rx_l2_gbps;
+    uint64_t received_pkts;
+    uint64_t processed_pkts;
     uint64_t rx_pkts;
     uint64_t rx_bytes;
     uint64_t tx_pkts;

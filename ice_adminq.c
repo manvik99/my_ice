@@ -127,6 +127,10 @@ int aq_send_cmd(struct ice_vfio_dev *d, struct ice_aq_desc *desc, void *buf, uin
     uint16_t next;
     uint32_t head;
 
+    /*
+     * Every reflect control-plane step goes through this helper: GET_SW_CFG discovers the VSI/lport,
+     * GET_DFLT_TOPO finds the scheduler parent, ADD_SW_RULES steers packets, and ADD_TXQS creates Tx queues.
+     */
     head = reg_read32(d, PF_FW_ATQH) & 0x3ff;
     next = (uint16_t)((ntu + 1) % sq->count);
     if (next == head) {
@@ -134,6 +138,7 @@ int aq_send_cmd(struct ice_vfio_dev *d, struct ice_aq_desc *desc, void *buf, uin
         return -1;
     }
 
+    /* Copy the caller's command descriptor into the next Admin Queue slot firmware will DMA-read. */
     ring_desc = &sq->desc[ntu];
     memcpy(ring_desc, desc, sizeof(*ring_desc));
 
@@ -141,6 +146,7 @@ int aq_send_cmd(struct ice_vfio_dev *d, struct ice_aq_desc *desc, void *buf, uin
         uint64_t biova = sq->buf_iova + (uint64_t)ntu * ICE_AQ_MAX_BUF_LEN;
         uint8_t *b = sq->buf + (size_t)ntu * ICE_AQ_MAX_BUF_LEN;
 
+        /* Indirect commands carry their payload in a per-slot DMA buffer whose IOVA is written into the descriptor. */
         memcpy(b, buf, buf_size);
         ring_desc->flags = htole16(le16toh(ring_desc->flags) | ICE_AQ_FLAG_BUF);
         if (buf_size > ICE_AQ_LG_BUF)
@@ -151,12 +157,14 @@ int aq_send_cmd(struct ice_vfio_dev *d, struct ice_aq_desc *desc, void *buf, uin
     }
 
     sq->next_to_use = next;
+    /* PF_FW_ATQT is the firmware doorbell: advancing it publishes the new command to the Admin Queue. */
     reg_write32(d, PF_FW_ATQT, sq->next_to_use);
     (void)reg_read32(d, PF_FW_ATQT);
 
     if (clock_gettime(CLOCK_MONOTONIC, &start) != 0)
         die_errno("clock_gettime start");
 
+    /* Completion is observed when firmware advances PF_FW_ATQH to the same slot we just rang. */
     for (;;) {
         long elapsed_ms;
 
@@ -179,6 +187,7 @@ int aq_send_cmd(struct ice_vfio_dev *d, struct ice_aq_desc *desc, void *buf, uin
         return -1;
     }
 
+    /* Copy firmware's descriptor writeback back to the caller before command-specific parsing begins. */
     memcpy(desc, ring_desc, sizeof(*desc));
 
     if (buf && buf_size) {
@@ -186,6 +195,7 @@ int aq_send_cmd(struct ice_vfio_dev *d, struct ice_aq_desc *desc, void *buf, uin
         uint16_t copy_sz = le16toh(desc->datalen);
         if (copy_sz > buf_size)
             copy_sz = buf_size;
+        /* Indirect responses are also written into the per-slot DMA buffer, so copy them back out now. */
         memcpy(buf, b, copy_sz);
     }
 
@@ -266,6 +276,7 @@ int aq_get_default_vsi_and_lport(struct ice_vfio_dev *d)
     bool got_vsi = false;
     bool got_lport = false;
 
+    /* Walk the paged GET_SW_CFG response until firmware returns req_desc=0, harvesting the PF's default VSI and port. */
     do {
         uint16_t num_elems;
         size_t i;
@@ -294,11 +305,13 @@ int aq_get_default_vsi_and_lport(struct ice_vfio_dev *d)
                 continue;
 
             if (type == ICE_AQC_GET_SW_CONF_RESP_PHYS_PORT && !got_lport) {
+                /* lport is the ingress source field used in the MAC lookup rule and Tx queue context. */
                 d->io.lport = (uint8_t)(num & 0xff);
                 got_lport = true;
             }
 
             if (type == ICE_AQC_GET_SW_CONF_RESP_VSI && !got_vsi) {
+                /* vsi_num is the switch destination we forward matching ingress traffic into. */
                 d->io.vsi_num = num;
                 got_vsi = true;
             }
@@ -332,6 +345,7 @@ int aq_get_qparent_teid(struct ice_vfio_dev *d)
         return 0;
     }
 
+    /* ADD_TXQS needs the scheduler parent TEID above the leaf queue; GET_DFLT_TOPO tells us where to attach it. */
     memset(topo_buf, 0, sizeof(topo_buf));
     fill_dflt_direct_desc(&desc, ICE_AQC_OPC_GET_DFLT_TOPO);
     desc.params.get_topo.port_num = d->io.lport;
@@ -355,6 +369,7 @@ int aq_get_qparent_teid(struct ice_vfio_dev *d)
         return -1;
     }
 
+    /* If the last topology element is the leaf queue, its parent is the attach point for the new Tx queue. */
     if (topo[0].generic[num_elems - 1].data.elem_type == ICE_AQC_ELEM_TYPE_LEAF)
         d->io.qparent_teid = le32toh(topo[0].generic[num_elems - 2].node_teid);
     else
@@ -387,6 +402,10 @@ int aq_add_rx_mac_rule(struct ice_vfio_dev *d, uint16_t *rule_idx)
     struct ice_aq_desc desc;
     uint32_t act = 0;
 
+    /*
+     * Install a switch rule that matches our destination MAC on this ingress port and forwards matching
+     * traffic into the VSI the reflector is polling. Without this rule, packets may never reach our Rx queue.
+     */
     rule.hdr.type = htole16(ICE_AQC_SW_RULES_T_LKUP_RX);
     rule.recipe_id = htole16(ICE_SW_LKUP_MAC);
     rule.src = htole16(d->io.lport);
@@ -395,6 +414,7 @@ int aq_add_rx_mac_rule(struct ice_vfio_dev *d, uint16_t *rule_idx)
     act |= ICE_SINGLE_ACT_VSI_FORWARDING | ICE_SINGLE_ACT_VALID_BIT;
     rule.act = htole32(act);
     rule.hdr_len = htole16(ICE_DUMMY_ETH_HDR_LEN);
+    /* The firmware lookup recipe expects Ethernet-header-shaped bytes; start from a template and patch in our MAC. */
     memcpy(rule.hdr_data, dummy_eth_header, sizeof(dummy_eth_header));
     memcpy(rule.hdr_data, d->io.mac, ETHER_ADDR_LEN);
 

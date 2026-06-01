@@ -144,6 +144,7 @@ int write_rx_reflect_metrics_log(const struct ice_vfio_dev *d,
     if (!d || !metrics || d->metrics_log_path[0] == '\0')
         return 0;
 
+    /* Write to a temp file first so readers never observe a partially written reflect summary. */
     n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", d->metrics_log_path);
     if (n < 0 || n >= (int)sizeof(tmp_path)) {
         fprintf(stderr, "[my_ice] metrics log temp path too long for %s\n",
@@ -175,6 +176,8 @@ int write_rx_reflect_metrics_log(const struct ice_vfio_dev *d,
     WRITE_METRIC("rx_mpps=%.6f", metrics->rx_mpps);
     WRITE_METRIC("tx_l2_gbps=%.6f", metrics->tx_l2_gbps);
     WRITE_METRIC("rx_l2_gbps=%.6f", metrics->rx_l2_gbps);
+    WRITE_METRIC("received_pkts=%" PRIu64, metrics->received_pkts);
+    WRITE_METRIC("processed_pkts=%" PRIu64, metrics->processed_pkts);
     WRITE_METRIC("rx_pkts=%" PRIu64, metrics->rx_pkts);
     WRITE_METRIC("rx_bytes=%" PRIu64, metrics->rx_bytes);
     WRITE_METRIC("tx_pkts=%" PRIu64, metrics->tx_pkts);
@@ -190,7 +193,7 @@ int write_rx_reflect_metrics_log(const struct ice_vfio_dev *d,
     WRITE_METRIC("reflect_batch=%u", metrics->reflect_batch);
     WRITE_METRIC("gorc_delta=%" PRIu64, metrics->gorc_delta);
     WRITE_METRIC("gotc_delta=%" PRIu64, metrics->gotc_delta);
-    /* Added for the shared C-vs-Rust parser surface so final summaries and metrics logs carry the same field. */
+    /* Persist the staged-since-last-doorbell counter so offline analysis can compare batching behavior across implementations. */
     WRITE_METRIC("tx_pkts_pending_db=%" PRIu64, metrics->tx_pkts_pending_db);
 
 #undef WRITE_METRIC

@@ -15,6 +15,12 @@
 
 uint32_t reflect_pool_entry_count(const struct ice_vfio_dev *d)
 {
+    /*
+     * Reflect mode needs enough pooled packet objects for three populations at once:
+     *   1. every Rx descriptor armed up front,
+     *   2. every Tx descriptor that may still be holding a borrowed reflected buffer,
+     *   3. one extra burst of slack so the hot loop can grab replacements before freeing completions.
+     */
     return (uint32_t)ICE_RX_DESC_COUNT + (uint32_t)d->tx_desc_count + ICE_REFLECT_POOL_EXTRA;
 }
 
@@ -62,6 +68,7 @@ void pkt_pool_init(struct ice_vfio_dev *d)
     struct pkt_mempool *pool = &d->reflect_pool;
     uint32_t i;
 
+    /* Seed every pkt_buf with its DMA address and push every entry onto the free ring once at startup. */
     memset(pool->base, 0, (size_t)pool->num_entries * pool->entry_size);
     for (i = 0; i < pool->num_entries; i++) {
         struct pkt_buf *buf = pkt_pool_get_entry(pool, i);
@@ -137,7 +144,10 @@ uint32_t pkt_buf_alloc_batch_noinit(struct pkt_mempool *pool, struct pkt_buf *bu
     if (!pool || !bufs || num_bufs == 0)
         return 0;
 
-    /* This noinit variant exists for rx-reflect: callers overwrite size/header data immediately. */
+    /*
+     * This noinit variant exists for rx-reflect: the caller immediately rewrites the descriptor state
+     * and packet length, so clearing each pkt_buf again would only add hot-path stores.
+     */
     avail = pool->free_count < num_bufs ? pool->free_count : num_bufs;
     head = pool->free_head;
     for (i = 0; i < avail; i++) {
@@ -149,7 +159,7 @@ uint32_t pkt_buf_alloc_batch_noinit(struct pkt_mempool *pool, struct pkt_buf *bu
         bufs[i] = pkt_pool_get_entry(pool, idx);
     }
 
-    /* Simple hot-path fix: commit free_head/free_count once, not once per borrowed buffer. */
+    /* Commit the ring-head movement once after the burst so one reflect batch pays one allocator update. */
     pool->free_head = head;
     pool->free_count -= avail;
 
