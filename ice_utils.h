@@ -15,7 +15,6 @@ int parse_u32_hex(const char *s, uint32_t *out);
 uint64_t monotonic_ns(void);
 double bytes_ns_to_gbps(uint64_t bytes, uint64_t duration_ns);
 double pkts_ns_to_mpps(uint64_t pkts, uint64_t duration_ns);
-uint64_t l2_bytes_to_wire_bytes(uint64_t pkts, uint64_t l2_bytes);
 int copy_path_option(char dst[PATH_MAX], const char *src, const char *opt_name);
 int write_rx_reflect_metrics_log(const struct ice_vfio_dev *d,
                                  const struct rx_reflect_metrics *metrics);

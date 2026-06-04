@@ -110,11 +110,6 @@ double pkts_ns_to_mpps(uint64_t pkts, uint64_t duration_ns)
     return ((double)pkts * (double)NS_PER_S) / ((double)duration_ns * 1e6);
 }
 
-uint64_t l2_bytes_to_wire_bytes(uint64_t pkts, uint64_t l2_bytes)
-{
-    return l2_bytes + pkts * ETH_WIRE_OVERHEAD_BYTES;
-}
-
 int copy_path_option(char dst[PATH_MAX], const char *src, const char *opt_name)
 {
     int n;
@@ -170,31 +165,10 @@ int write_rx_reflect_metrics_log(const struct ice_vfio_dev *d,
     WRITE_METRIC("schema=my_ice_rx_reflect_v1");
     WRITE_METRIC("mode=rx_reflect");
     WRITE_METRIC("seconds_total=%.6f", metrics->seconds_total);
-    WRITE_METRIC("tx_wire_gbps=%.6f", metrics->tx_wire_gbps);
-    WRITE_METRIC("rx_wire_gbps=%.6f", metrics->rx_wire_gbps);
     WRITE_METRIC("tx_mpps=%.6f", metrics->tx_mpps);
     WRITE_METRIC("rx_mpps=%.6f", metrics->rx_mpps);
     WRITE_METRIC("tx_l2_gbps=%.6f", metrics->tx_l2_gbps);
     WRITE_METRIC("rx_l2_gbps=%.6f", metrics->rx_l2_gbps);
-    WRITE_METRIC("received_pkts=%" PRIu64, metrics->received_pkts);
-    WRITE_METRIC("processed_pkts=%" PRIu64, metrics->processed_pkts);
-    WRITE_METRIC("rx_pkts=%" PRIu64, metrics->rx_pkts);
-    WRITE_METRIC("rx_bytes=%" PRIu64, metrics->rx_bytes);
-    WRITE_METRIC("tx_pkts=%" PRIu64, metrics->tx_pkts);
-    WRITE_METRIC("tx_bytes=%" PRIu64, metrics->tx_bytes);
-    WRITE_METRIC("zero_copy_pkts=%" PRIu64, metrics->zero_copy_pkts);
-    WRITE_METRIC("zero_copy_bytes=%" PRIu64, metrics->zero_copy_bytes);
-    WRITE_METRIC("tx_ring_full=%" PRIu64, metrics->tx_ring_full);
-    WRITE_METRIC("rx_short=%" PRIu64, metrics->rx_short);
-    WRITE_METRIC("rx_errors=%" PRIu64, metrics->rx_errors);
-    WRITE_METRIC("pool_empty=%" PRIu64, metrics->pool_empty);
-    WRITE_METRIC("doorbells=%" PRIu64, metrics->doorbells);
-    WRITE_METRIC("vsi_num=%u", metrics->vsi_num);
-    WRITE_METRIC("reflect_batch=%u", metrics->reflect_batch);
-    WRITE_METRIC("gorc_delta=%" PRIu64, metrics->gorc_delta);
-    WRITE_METRIC("gotc_delta=%" PRIu64, metrics->gotc_delta);
-    /* Persist the staged-since-last-doorbell counter so offline analysis can compare batching behavior across implementations. */
-    WRITE_METRIC("tx_pkts_pending_db=%" PRIu64, metrics->tx_pkts_pending_db);
 
 #undef WRITE_METRIC
 

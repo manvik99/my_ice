@@ -20,7 +20,6 @@
 #define MAX_HOT_REFLECT_BATCH 128
 #define REFLECT_TX_DOORBELL_BATCH 256U
 #define TX_RS_THRESH 128
-#define ETH_WIRE_OVERHEAD_BYTES 24U
 #define ICE_PKT_BUF_DATA_SIZE \
     ((ICE_RX_BUF_SIZE > ICE_TX_PKT_BUF_SIZE) ? ICE_RX_BUF_SIZE : ICE_TX_PKT_BUF_SIZE)
 #define ICE_REFLECT_POOL_EXTRA MAX_REFLECT_BATCH
@@ -123,30 +122,10 @@ struct ice_vfio_dev {
 
 struct rx_reflect_metrics {
     double seconds_total;
-    double tx_wire_gbps;
-    double rx_wire_gbps;
     double tx_mpps;
     double rx_mpps;
     double tx_l2_gbps;
     double rx_l2_gbps;
-    uint64_t received_pkts;
-    uint64_t processed_pkts;
-    uint64_t rx_pkts;
-    uint64_t rx_bytes;
-    uint64_t tx_pkts;
-    uint64_t tx_bytes;
-    uint64_t zero_copy_pkts;
-    uint64_t zero_copy_bytes;
-    uint64_t tx_ring_full;
-    uint64_t rx_short;
-    uint64_t rx_errors;
-    uint64_t pool_empty;
-    uint64_t doorbells;
-    uint16_t vsi_num;
-    uint16_t reflect_batch;
-    uint64_t gorc_delta;
-    uint64_t gotc_delta;
-    uint64_t tx_pkts_pending_db;
 };
 
 #endif

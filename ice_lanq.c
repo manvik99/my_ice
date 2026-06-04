@@ -863,22 +863,8 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     uint32_t tx_alloc;
     uint16_t first_q, last_q, avail_q;
     uint16_t rx_mac_rule_idx = UINT16_MAX;
-    uint64_t received_pkts = 0, processed_pkts = 0;
     uint64_t rx_pkts = 0, rx_bytes = 0;
     uint64_t tx_pkts = 0, tx_bytes = 0;
-    uint64_t zero_copy_pkts = 0, zero_copy_bytes = 0;
-    uint64_t tx_ring_full = 0, pool_empty = 0;
-    uint64_t rx_short = 0, rx_errors = 0;
-    uint64_t doorbells = 0;
-    uint64_t last_report_ns, next_report_ns;
-    uint64_t prev_rx_pkts = 0, prev_rx_bytes = 0;
-    uint64_t prev_tx_pkts = 0, prev_tx_bytes = 0;
-    uint64_t prev_doorbells = 0;
-    uint64_t prev_tx_ring_full = 0;
-    uint64_t prev_pool_empty = 0;
-    uint64_t prev_rx_short = 0;
-    uint64_t prev_rx_errors = 0;
-    uint64_t gorc_before, gorc_after, gotc_before, gotc_after;
     uint64_t start_ns, end_ns, now_ns;
     uint32_t time_check_countdown = 0;
     uint16_t requested_reflect_batch = reflect_batch;
@@ -963,17 +949,11 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms, requested_reflect_batch,
             reflect_batch, tx_doorbell_batch);
 
-    /* Precompute the Ethernet rewrite state and snapshot baseline counters before entering the hot loop. */
+    /* Precompute the Ethernet rewrite state before entering the hot loop. */
     reflect_l2_ctx_init(&l2_ctx, d->io.mac);
 
-    gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                     GLV_GORCH(d->io.vsi_num));
-    gotc_before = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                     GLV_GOTCH(d->io.vsi_num));
     start_ns = monotonic_ns();
     end_ns = start_ns + (uint64_t)timeout_ms * 1000000ULL;
-    last_report_ns = start_ns;
-    next_report_ns = start_ns + NS_PER_S;
 
     while (true) {
         uint16_t rx_idxs[MAX_REFLECT_BATCH];
@@ -1005,13 +985,8 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             /* No new burst can run until Tx frees descriptors or the pool regains replacement buffers. */
             if (tx_pkts_pending_db != 0) {
                 tx_ring_doorbell(d, q);
-                doorbells++;
                 tx_pkts_pending_db = 0;
             }
-            if (q->tx_free == 0)
-                tx_ring_full++;
-            if (d->reflect_pool.free_count == 0)
-                pool_empty++;
             stalled = true;
             goto report_progress;
         }
@@ -1019,7 +994,6 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         /* Poll a contiguous ready burst. The poller validates DD/EOF/RXE so the reflect loop only sees complete frames. */
         got = poll_rx_batch(d, rx_idxs, rx_lens, budget);
         if (unlikely(got < 0)) {
-            rx_errors++;
             dump_mdet_regs(d);
             goto out;
         }
@@ -1036,7 +1010,6 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             fprintf(stderr,
                     "[my_ice] reflect pool underflow: needed=%u got=%u free_count=%u\n",
                     (uint16_t)got, replacement_count, d->reflect_pool.free_count);
-            rx_errors++;
             goto out;
         }
 
@@ -1054,7 +1027,6 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
             if (unlikely(!rx_buf)) {
                 fprintf(stderr, "[my_ice] missing rx pool buffer for descriptor %u\n", rx_idx);
-                rx_errors++;
                 goto out;
             }
 
@@ -1063,7 +1035,6 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
             if (rx_len < 14) {
                 /* Too short to contain a full Ethernet header, so it cannot be reflected safely. */
-                rx_short++;
                 pkt_buf_free_fast(rx_buf);
                 continue;
             }
@@ -1079,8 +1050,6 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         /* Replacement buffers rearm Rx immediately; unlike the older zero-copy path, no deferred tailing is needed. */
         rearm_rx_desc_pool_batch(d, rx_idxs, replacement_bufs, (uint16_t)got);
 
-        received_pkts += (uint64_t)got;
-        processed_pkts += tx_count;
         rx_pkts += tx_count;
         rx_bytes += batch_rx_bytes;
 
@@ -1091,13 +1060,9 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         if (sent > 0) {
             tx_pkts += sent;
             tx_bytes += batch_tx_bytes;
-            zero_copy_pkts += sent;
-            zero_copy_bytes += batch_tx_bytes;
-            /* Track packets staged since the last doorbell so interval/final logs match Rust's reporting. */
             tx_pkts_pending_db = (uint16_t)(tx_pkts_pending_db + sent);
             if (tx_pkts_pending_db >= tx_doorbell_batch || sent < tx_count) {
                 tx_ring_doorbell(d, q);
-                doorbells++;
                 tx_pkts_pending_db = 0;
             }
         }
@@ -1106,7 +1071,6 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             /* Any unsent borrowed buffers never reached hardware, so software must return them to the pool immediately. */
             for (i = sent; i < tx_count; i++)
                 pkt_buf_free_fast(tx_bufs[i]);
-            tx_ring_full++;
             stalled = true;
         }
 
@@ -1114,7 +1078,6 @@ report_progress:
         /* If a partial Tx batch was staged and then traffic went idle, force the doorbell so hardware sees it. */
         if (!rx_seen && tx_pkts_pending_db != 0) {
             tx_ring_doorbell(d, q);
-            doorbells++;
             tx_pkts_pending_db = 0;
         }
         if (time_check_countdown == 0 || stalled || !rx_seen) {
@@ -1123,49 +1086,6 @@ report_progress:
             now_ns = monotonic_ns();
             if (now_ns >= end_ns)
                 break;
-            if (now_ns >= next_report_ns) {
-                uint64_t interval_ns = now_ns - last_report_ns;
-                uint64_t interval_rx_pkts = rx_pkts - prev_rx_pkts;
-                uint64_t interval_rx_bytes = rx_bytes - prev_rx_bytes;
-                uint64_t interval_tx_pkts = tx_pkts - prev_tx_pkts;
-                uint64_t interval_tx_bytes = tx_bytes - prev_tx_bytes;
-
-                fprintf(stderr,
-                        "[my_ice] rx-reflect t=%.2fs interval: TX=%.3f wire-Gbps RX=%.3f wire-Gbps tx_mpps=%.3f rx_mpps=%.3f doorbells=%" PRIu64 " avg_pkts_per_db=%.3f tx_ring_full=%" PRIu64 " pool_empty=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64 " tx_pending_db=%u budget=%u tx_free=%u pool_free=%u\n",
-                        (double)(now_ns - start_ns) / (double)NS_PER_S,
-                        bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_tx_pkts, interval_tx_bytes),
-                                         interval_ns),
-                        bytes_ns_to_gbps(l2_bytes_to_wire_bytes(interval_rx_pkts, interval_rx_bytes),
-                                         interval_ns),
-                        pkts_ns_to_mpps(interval_tx_pkts, interval_ns),
-                        pkts_ns_to_mpps(interval_rx_pkts, interval_ns),
-                        doorbells - prev_doorbells,
-                        (doorbells > prev_doorbells)
-                            ? (double)interval_tx_pkts / (double)(doorbells - prev_doorbells)
-                            : 0.0,
-                        tx_ring_full - prev_tx_ring_full,
-                        pool_empty - prev_pool_empty,
-                        rx_short - prev_rx_short,
-                        rx_errors - prev_rx_errors,
-                        tx_pkts_pending_db,
-                        budget,
-                        q->tx_free,
-                        d->reflect_pool.free_count);
-
-                last_report_ns = now_ns;
-                prev_rx_pkts = rx_pkts;
-                prev_rx_bytes = rx_bytes;
-                prev_tx_pkts = tx_pkts;
-                prev_tx_bytes = tx_bytes;
-                prev_doorbells = doorbells;
-                prev_tx_ring_full = tx_ring_full;
-                prev_pool_empty = pool_empty;
-                prev_rx_short = rx_short;
-                prev_rx_errors = rx_errors;
-                next_report_ns += NS_PER_S;
-                if (next_report_ns < now_ns)
-                    next_report_ns = now_ns + NS_PER_S;
-            }
         } else {
             time_check_countdown--;
         }
@@ -1182,70 +1102,22 @@ report_progress:
     /* Flush the final partial batch, wait briefly for hardware completion, then compute the final reflect summary. */
     if (tx_pkts_pending_db != 0) {
         tx_ring_doorbell(d, q);
-        doorbells++;
         tx_pkts_pending_db = 0;
     }
     (void)tx_wait_drain(d, q, 1000);
     now_ns = end_ns;
-    gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                    GLV_GORCH(d->io.vsi_num));
-    gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                    GLV_GOTCH(d->io.vsi_num));
-    /* Export both software-accounted traffic totals and hardware VSI byte counters so C/Rust runs remain comparable. */
     metrics.seconds_total = (double)(now_ns - start_ns) / 1e9;
-    metrics.tx_wire_gbps =
-        bytes_ns_to_gbps(l2_bytes_to_wire_bytes(tx_pkts, tx_bytes), now_ns - start_ns);
-    metrics.rx_wire_gbps =
-        bytes_ns_to_gbps(l2_bytes_to_wire_bytes(rx_pkts, rx_bytes), now_ns - start_ns);
     metrics.tx_mpps = pkts_ns_to_mpps(tx_pkts, now_ns - start_ns);
     metrics.rx_mpps = pkts_ns_to_mpps(rx_pkts, now_ns - start_ns);
     metrics.tx_l2_gbps = bytes_ns_to_gbps(tx_bytes, now_ns - start_ns);
     metrics.rx_l2_gbps = bytes_ns_to_gbps(rx_bytes, now_ns - start_ns);
-    metrics.received_pkts = received_pkts;
-    metrics.processed_pkts = processed_pkts;
-    metrics.rx_pkts = rx_pkts;
-    metrics.rx_bytes = rx_bytes;
-    metrics.tx_pkts = tx_pkts;
-    metrics.tx_bytes = tx_bytes;
-    metrics.zero_copy_pkts = zero_copy_pkts;
-    metrics.zero_copy_bytes = zero_copy_bytes;
-    metrics.tx_ring_full = tx_ring_full;
-    metrics.rx_short = rx_short;
-    metrics.rx_errors = rx_errors;
-    metrics.pool_empty = pool_empty;
-    metrics.doorbells = doorbells;
-    metrics.vsi_num = d->io.vsi_num;
-    metrics.reflect_batch = reflect_batch;
-    metrics.gorc_delta = counter40_delta(gorc_after, gorc_before);
-    metrics.gotc_delta = counter40_delta(gotc_after, gotc_before);
-    /* Persist the shared parser field even when it is zero at steady state. */
-    metrics.tx_pkts_pending_db = tx_pkts_pending_db;
     fprintf(stderr,
-            "[my_ice] rx-reflect done: seconds=%.3f TX=%.3f wire-Gbps RX=%.3f wire-Gbps"
-            " tx_mpps=%.3f rx_mpps=%.3f tx_l2_gbps=%.3f rx_l2_gbps=%.3f"
-            " received_pkts=%" PRIu64 " processed_pkts=%" PRIu64
-            " rx_pkts=%" PRIu64 " rx_bytes=%" PRIu64
-            " tx_pkts=%" PRIu64 " tx_bytes=%" PRIu64
-            " zero_copy_pkts=%" PRIu64 " zero_copy_bytes=%" PRIu64
-            " tx_ring_full=%" PRIu64 " rx_short=%" PRIu64 " rx_errors=%" PRIu64
-            " pool_empty=%" PRIu64 " doorbells=%" PRIu64
-            " tx_pkts_pending_db=%u avg_pkts_per_db=%.3f"
-            " VSI%u GORC_delta=%" PRIu64 " GOTC_delta=%" PRIu64 "\n",
+            "[my_ice] rx-reflect done: seconds=%.6f tx_l2_gbps=%.6f rx_l2_gbps=%.6f tx_mpps=%.6f rx_mpps=%.6f\n",
             metrics.seconds_total,
-            metrics.tx_wire_gbps,
-            metrics.rx_wire_gbps,
-            metrics.tx_mpps,
-            metrics.rx_mpps,
             metrics.tx_l2_gbps,
             metrics.rx_l2_gbps,
-            received_pkts,
-            processed_pkts,
-            rx_pkts, rx_bytes, tx_pkts, tx_bytes, zero_copy_pkts, zero_copy_bytes,
-            tx_ring_full, rx_short, rx_errors, pool_empty, doorbells,
-            tx_pkts_pending_db,
-            doorbells ? (double)tx_pkts / (double)doorbells : 0.0,
-            d->io.vsi_num,
-            metrics.gorc_delta, metrics.gotc_delta);
+            metrics.tx_mpps,
+            metrics.rx_mpps);
 
     if (write_rx_reflect_metrics_log(d, &metrics) < 0)
         goto out;
