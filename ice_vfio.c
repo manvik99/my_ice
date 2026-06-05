@@ -41,11 +41,11 @@ int ice_vfio_init(struct ice_vfio_dev *dev)
     pkt_pool_init(dev);
     adminq_hw_init(dev);
 
-    fprintf(stderr, "[my_ice] adminq initialized, sending GET_VER\n");
+    MY_ICE_INFO("[my_ice] adminq initialized, sending GET_VER\n");
     if (aq_get_fw_ver(dev) < 0)
         return -1;
 
-    fprintf(stderr, "[my_ice] GET_VER ok, sending MANAGE_MAC_READ\n");
+    MY_ICE_INFO("[my_ice] GET_VER ok, sending MANAGE_MAC_READ\n");
     if (aq_manage_mac_read(dev) < 0)
         return -1;
 

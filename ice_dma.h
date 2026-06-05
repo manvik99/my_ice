@@ -26,20 +26,11 @@ static inline uint64_t pkt_pool_get_data_iova(const struct pkt_mempool *pool, ui
 
 static inline uint32_t pkt_pool_pop_idx_noinit(struct pkt_mempool *pool)
 {
-    uint32_t head;
-    uint32_t idx;
-
     if (pool->free_count == 0)
         return ICE_PKT_BUF_INVALID_IDX;
 
-    head = pool->free_head;
-    idx = pool->free_ring[head];
-    head++;
-    if (head == pool->num_entries)
-        head = 0;
-    pool->free_head = head;
     pool->free_count--;
-    return idx;
+    return pool->free_ring[pool->free_count];
 }
 
 static inline uint32_t pkt_pool_pop_idx(struct pkt_mempool *pool)
@@ -49,17 +40,10 @@ static inline uint32_t pkt_pool_pop_idx(struct pkt_mempool *pool)
 
 static inline void pkt_pool_push_idx(struct pkt_mempool *pool, uint32_t idx)
 {
-    uint32_t tail;
-
     if (idx == ICE_PKT_BUF_INVALID_IDX || pool->free_count >= pool->num_entries)
         return;
 
-    tail = pool->free_tail;
-    pool->free_ring[tail] = idx;
-    tail++;
-    if (tail == pool->num_entries)
-        tail = 0;
-    pool->free_tail = tail;
+    pool->free_ring[pool->free_count] = idx;
     pool->free_count++;
 }
 

@@ -102,6 +102,13 @@ static inline uint16_t rx_ring_add(uint16_t base, uint16_t add)
     return sum;
 }
 
+#if MY_ICE_RX_PREFETCH_WINDOW > 0
+static inline uint16_t rx_ring_prefetch_idx(uint16_t idx)
+{
+    return rx_ring_add(idx, MY_ICE_RX_PREFETCH_WINDOW);
+}
+#endif
+
 static inline uint16_t rx_ring_next(uint16_t idx)
 {
     return (uint16_t)((idx + 1) & ICE_RX_DESC_MASK);
@@ -142,17 +149,20 @@ static void maybe_pin_runtime_thread(const struct ice_vfio_dev *d, const char *c
     int cpus[1024];
     int count;
 
+#if !MY_ICE_ENABLE_INFO
+    (void)context;
+#endif
+
     if (!d->pin_cpus)
         return;
 
     count = build_cpu_list(cpus, (int)(sizeof(cpus) / sizeof(cpus[0])));
     if (count > 0) {
         pin_thread_to_cpu(cpus[0]);
-        fprintf(stderr, "[my_ice] %s: pinned runtime thread to CPU %d\n", context, cpus[0]);
+        MY_ICE_INFO("[my_ice] %s: pinned runtime thread to CPU %d\n", context, cpus[0]);
     } else {
-        fprintf(stderr,
-                "[my_ice] %s: failed to determine CPU affinity, running unpinned\n",
-                context);
+        MY_ICE_INFO("[my_ice] %s: failed to determine CPU affinity, running unpinned\n",
+                    context);
     }
 }
 
@@ -197,8 +207,8 @@ static int add_tx_queue(struct ice_vfio_dev *d)
     desc.params.add_txqs.num_qgrps = 1;
 
     if (aq_send_cmd(d, &desc, qg, (uint16_t)sizeof(*qg)) == 0) {
-        fprintf(stderr, "[my_ice] ADD_TXQS resp: txq_id=%u q_teid=0x%x\n",
-                le16toh(qg->txqs[0].txq_id), le32toh(qg->txqs[0].q_teid));
+        MY_ICE_INFO("[my_ice] ADD_TXQS resp: txq_id=%u q_teid=0x%x\n",
+                    le16toh(qg->txqs[0].txq_id), le32toh(qg->txqs[0].q_teid));
         rc = 0;
     }
 
@@ -513,9 +523,9 @@ static int poll_and_rearm_reflect_batch(struct ice_vfio_dev *d, uint32_t complet
         }
 
         next_idx = rx_ring_next(idx);
-#if defined(__x86_64__)
-        if (processed + 2 < count)
-            __builtin_prefetch(&rx_desc[(next_idx + 1) & ICE_RX_DESC_MASK], 0, 1);
+#if defined(__x86_64__) && MY_ICE_RX_PREFETCH_WINDOW > 0
+        if ((uint16_t)(processed + MY_ICE_RX_PREFETCH_WINDOW) < count)
+            __builtin_prefetch(&rx_desc[rx_ring_prefetch_idx(idx)], 0, 1);
 #endif
 
         replacement_buf_idx = pkt_pool_pop_idx_noinit(pool);
@@ -619,7 +629,9 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 {
     uint32_t rx_alloc;
     uint32_t tx_alloc;
+#if MY_ICE_ENABLE_INFO
     uint16_t requested_reflect_batch = reflect_batch;
+#endif
     uint16_t tx_doorbell_batch = REFLECT_TX_DOORBELL_BATCH;
     uint16_t tx_pkts_pending_db = 0;
     uint16_t rx_mac_rule_idx = UINT16_MAX;
@@ -694,12 +706,12 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     if (tx_doorbell_batch > q->tx_free)
         tx_doorbell_batch = q->tx_free;
 
-    fprintf(stderr,
-            "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d reflect_batch=%u effective_reflect_batch=%u tx_doorbell_batch=%u\n",
-            d->io.vsi_num, d->io.lport, d->io.rxq_id, q->txq_id,
-            d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms,
-            requested_reflect_batch, reflect_batch, tx_doorbell_batch);
+    MY_ICE_INFO(
+        "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d reflect_batch=%u effective_reflect_batch=%u tx_doorbell_batch=%u\n",
+        d->io.vsi_num, d->io.lport, d->io.rxq_id, q->txq_id,
+        d->io.mac[0], d->io.mac[1], d->io.mac[2],
+        d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms,
+        requested_reflect_batch, reflect_batch, tx_doorbell_batch);
 
     reflect_l2_ctx_init(&l2_ctx, d->io.mac);
     start_ns = monotonic_ns();
@@ -805,13 +817,13 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     (void)tx_wait_drain(d, q, 1000);
     tx_update_free(d, q);
 
-    fprintf(stderr,
-            "[my_ice] rx-reflect done: seconds=%.6f tx_l2_gbps=%.6f rx_l2_gbps=%.6f tx_mpps=%.6f rx_mpps=%.6f\n",
-            (double)timeout_ms / 1000.0,
-            bytes_ns_to_gbps(tx_bytes, (uint64_t)timeout_ms * 1000000ULL),
-            bytes_ns_to_gbps(rx_bytes, (uint64_t)timeout_ms * 1000000ULL),
-            pkts_ns_to_mpps(tx_pkts, (uint64_t)timeout_ms * 1000000ULL),
-            pkts_ns_to_mpps(rx_pkts, (uint64_t)timeout_ms * 1000000ULL));
+    MY_ICE_REPORT(
+        "[my_ice] rx-reflect done: seconds=%.6f tx_l2_gbps=%.6f rx_l2_gbps=%.6f tx_mpps=%.6f rx_mpps=%.6f\n",
+        (double)timeout_ms / 1000.0,
+        bytes_ns_to_gbps(tx_bytes, (uint64_t)timeout_ms * 1000000ULL),
+        bytes_ns_to_gbps(rx_bytes, (uint64_t)timeout_ms * 1000000ULL),
+        pkts_ns_to_mpps(tx_pkts, (uint64_t)timeout_ms * 1000000ULL),
+        pkts_ns_to_mpps(rx_pkts, (uint64_t)timeout_ms * 1000000ULL));
 
 out:
     free(completed_lens);

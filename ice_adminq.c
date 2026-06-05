@@ -25,6 +25,7 @@ void aq_set_topology_options(bool dump_topo, bool qparent_override_set,
     g_qparent_override = qparent_override;
 }
 
+#if MY_ICE_ENABLE_INFO
 static void dump_topo_response(const uint8_t *buf, size_t len, uint8_t num_branches)
 {
     const struct ice_aqc_get_topo_elem *topo = (const struct ice_aqc_get_topo_elem *)buf;
@@ -32,42 +33,43 @@ static void dump_topo_response(const uint8_t *buf, size_t len, uint8_t num_branc
     uint16_t b;
 
     if (max_branches == 0) {
-        fprintf(stderr, "[my_ice] topo dump: buffer too small\n");
+        MY_ICE_INFO("[my_ice] topo dump: buffer too small\n");
         return;
     }
 
     if (num_branches == 0 || num_branches > max_branches)
         num_branches = (uint8_t)max_branches;
 
-    fprintf(stderr, "[my_ice] topo dump: branches=%u (max=%zu)\n",
-            num_branches, max_branches);
+    MY_ICE_INFO("[my_ice] topo dump: branches=%u (max=%zu)\n",
+                num_branches, max_branches);
 
     for (b = 0; b < num_branches; b++) {
         uint16_t num_elems = le16toh(topo[b].hdr.num_elems);
         uint16_t i;
 
-        fprintf(stderr, "  branch %u: parent_teid=0x%08x num_elems=%u\n",
-                b, le32toh(topo[b].hdr.parent_teid), num_elems);
+        MY_ICE_INFO("  branch %u: parent_teid=0x%08x num_elems=%u\n",
+                    b, le32toh(topo[b].hdr.parent_teid), num_elems);
 
         if (num_elems > ICE_AQC_TOPO_MAX_LEVEL_NUM)
             num_elems = ICE_AQC_TOPO_MAX_LEVEL_NUM;
 
         for (i = 0; i < num_elems; i++) {
             const struct ice_aqc_txsched_elem_data *e = &topo[b].generic[i];
-            fprintf(stderr,
-                    "    [%u] type=%u node_teid=0x%08x parent_teid=0x%08x valid=0x%02x cir_prof=%u cir_alloc=%u eir_prof=%u eir_alloc=%u\n",
-                    i, e->data.elem_type, le32toh(e->node_teid), le32toh(e->parent_teid),
-                    e->data.valid_sections,
-                    le16toh(e->data.cir_bw.bw_profile_idx),
-                    le16toh(e->data.cir_bw.bw_alloc),
-                    le16toh(e->data.eir_bw.bw_profile_idx),
-                    le16toh(e->data.eir_bw.bw_alloc));
+            MY_ICE_INFO(
+                "    [%u] type=%u node_teid=0x%08x parent_teid=0x%08x valid=0x%02x cir_prof=%u cir_alloc=%u eir_prof=%u eir_alloc=%u\n",
+                i, e->data.elem_type, le32toh(e->node_teid), le32toh(e->parent_teid),
+                e->data.valid_sections,
+                le16toh(e->data.cir_bw.bw_profile_idx),
+                le16toh(e->data.cir_bw.bw_alloc),
+                le16toh(e->data.eir_bw.bw_profile_idx),
+                le16toh(e->data.eir_bw.bw_alloc));
         }
     }
 
-    fprintf(stderr, "[my_ice] topo raw (first 256 bytes):\n");
+    MY_ICE_INFO("[my_ice] topo raw (first 256 bytes):\n");
     dump_hex(buf, len, 256);
 }
+#endif
 
 
 void fill_dflt_direct_desc(struct ice_aq_desc *desc, uint16_t opcode)
@@ -211,18 +213,22 @@ int aq_send_cmd(struct ice_vfio_dev *d, struct ice_aq_desc *desc, void *buf, uin
 int aq_get_fw_ver(struct ice_vfio_dev *d)
 {
     struct ice_aq_desc desc;
-    struct ice_aqc_get_ver *v;
 
     fill_dflt_direct_desc(&desc, ICE_AQC_OPC_GET_VER);
     if (aq_send_cmd(d, &desc, NULL, 0) < 0)
         return -1;
 
-    v = &desc.params.get_ver;
-    printf("Firmware: %u.%u.%u build %u branch %u\n",
-           v->fw_major, v->fw_minor, v->fw_patch,
-           le32toh(v->fw_build), v->fw_branch);
-    printf("API: %u.%u.%u branch %u\n",
-           v->api_major, v->api_minor, v->api_patch, v->api_branch);
+#if MY_ICE_ENABLE_INFO
+    {
+        struct ice_aqc_get_ver *v = &desc.params.get_ver;
+
+    MY_ICE_INFO_OUT("Firmware: %u.%u.%u build %u branch %u\n",
+                    v->fw_major, v->fw_minor, v->fw_patch,
+                    le32toh(v->fw_build), v->fw_branch);
+    MY_ICE_INFO_OUT("API: %u.%u.%u branch %u\n",
+                    v->api_major, v->api_minor, v->api_patch, v->api_branch);
+    }
+#endif
 
     return 0;
 }
@@ -252,9 +258,9 @@ int aq_manage_mac_read(struct ice_vfio_dev *d)
         if (resp[i].addr_type == ICE_AQC_MAN_MAC_ADDR_TYPE_LAN) {
             memcpy(d->io.mac, resp[i].mac_addr, ETHER_ADDR_LEN);
             d->io.lport = resp[i].lport_num;
-            printf("MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   d->io.mac[0], d->io.mac[1], d->io.mac[2],
-                   d->io.mac[3], d->io.mac[4], d->io.mac[5]);
+            MY_ICE_INFO_OUT("MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                            d->io.mac[0], d->io.mac[1], d->io.mac[2],
+                            d->io.mac[3], d->io.mac[4], d->io.mac[5]);
             found = true;
             break;
         }
@@ -340,8 +346,8 @@ int aq_get_qparent_teid(struct ice_vfio_dev *d)
 
     if (g_qparent_override_set) {
         d->io.qparent_teid = g_qparent_override;
-        fprintf(stderr, "[my_ice] using override qparent_teid=0x%08x\n",
-                d->io.qparent_teid);
+        MY_ICE_INFO("[my_ice] using override qparent_teid=0x%08x\n",
+                    d->io.qparent_teid);
         return 0;
     }
 
@@ -356,8 +362,10 @@ int aq_get_qparent_teid(struct ice_vfio_dev *d)
     }
 
     num_branches = desc.params.get_topo.num_branches;
+#if MY_ICE_ENABLE_INFO
     if (g_dump_topo)
         dump_topo_response(topo_buf, sizeof(topo_buf), num_branches);
+#endif
     if (num_branches < 1 || num_branches > 8) {
         fprintf(stderr, "[my_ice] GET_DFLT_TOPO invalid num_branches=%u\n", num_branches);
         return -1;
@@ -374,7 +382,7 @@ int aq_get_qparent_teid(struct ice_vfio_dev *d)
         d->io.qparent_teid = le32toh(topo[0].generic[num_elems - 2].node_teid);
     else
         d->io.qparent_teid = le32toh(topo[0].generic[num_elems - 1].node_teid);
-    fprintf(stderr, "[my_ice] selected qparent_teid=0x%08x\n", d->io.qparent_teid);
+    MY_ICE_INFO("[my_ice] selected qparent_teid=0x%08x\n", d->io.qparent_teid);
     return 0;
 }
 
@@ -427,8 +435,8 @@ int aq_add_rx_mac_rule(struct ice_vfio_dev *d, uint16_t *rule_idx)
 
     if (rule_idx)
         *rule_idx = le16toh(rule.index);
-    fprintf(stderr, "[my_ice] ADD_SW_RULES RX MAC index=%u\n",
-            le16toh(rule.index));
+    MY_ICE_INFO("[my_ice] ADD_SW_RULES RX MAC index=%u\n",
+                le16toh(rule.index));
     return 0;
 }
 
@@ -452,5 +460,5 @@ void aq_remove_sw_rule_best_effort(struct ice_vfio_dev *d, uint16_t rule_type,
         fprintf(stderr, "[my_ice] warning: failed to remove switch rule %u\n",
                 rule_idx);
     else
-        fprintf(stderr, "[my_ice] removed switch rule %u\n", rule_idx);
+        MY_ICE_INFO("[my_ice] removed switch rule %u\n", rule_idx);
 }

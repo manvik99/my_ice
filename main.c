@@ -133,13 +133,13 @@ int main(int argc, char **argv)
     alloc_queue_sw_state(&d);
     aq_set_topology_options(dump_topo, qparent_override_set, qparent_override);
 
-    fprintf(stderr, "[my_ice] opening VFIO device %s\n", bdf);
+    MY_ICE_INFO("[my_ice] opening VFIO device %s\n", bdf);
     if (ice_vfio_open(&d, bdf) < 0)
         goto out;
-    fprintf(stderr, "[my_ice] vfio init done, bar0_size=0x%zx\n", d.bar0_size);
+    MY_ICE_INFO("[my_ice] vfio init done, bar0_size=0x%zx\n", d.bar0_size);
 
     if (use_hugepages) {
-        fprintf(stderr, "[my_ice] using hugepages from %s\n", huge_dir);
+        MY_ICE_INFO("[my_ice] using hugepages from %s\n", huge_dir);
         prepare_hugepage_file(&d, ice_dma_required_bytes(&d), huge_dir);
     }
 

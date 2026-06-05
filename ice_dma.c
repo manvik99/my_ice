@@ -62,11 +62,13 @@ void pkt_pool_init(struct ice_vfio_dev *d)
     struct pkt_mempool *pool = &d->reflect_pool;
     uint32_t i;
 
-    /* Seed every pkt_buf with its DMA address and push every entry onto the free ring once at startup. */
+    /*
+     * Mirror rust-unsafe's LIFO free-stack semantics so Rx/Tx recycle pooled
+     * buffers through the same ownership flow and reuse order.
+     */
     memset(pool->base, 0, (size_t)pool->num_entries * pool->entry_size);
-    for (i = 0; i < pool->num_entries; i++) {
-        pool->free_ring[i] = i;
-    }
+    for (i = 0; i < pool->num_entries; i++)
+        pool->free_ring[i] = pool->num_entries - 1 - i;
     pool->free_head = 0;
     pool->free_tail = 0;
     pool->free_count = pool->num_entries;

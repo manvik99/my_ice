@@ -3,9 +3,46 @@
 
 #include <limits.h>
 #include <stddef.h>
+#include <stdio.h>
 #include <stdint.h>
 
 #include "ice_types.h"
+
+#ifndef MY_ICE_ENABLE_INFO
+#ifdef NDEBUG
+#define MY_ICE_ENABLE_INFO 0
+#else
+#define MY_ICE_ENABLE_INFO 1
+#endif
+#endif
+
+#ifndef MY_ICE_RX_PREFETCH_WINDOW
+#define MY_ICE_RX_PREFETCH_WINDOW 2
+#endif
+
+/* Release builds compile human-oriented INFO output away entirely. */
+#if MY_ICE_ENABLE_INFO
+#define MY_ICE_INFO(...) \
+    do { \
+        fprintf(stderr, __VA_ARGS__); \
+    } while (0)
+#define MY_ICE_INFO_OUT(...) \
+    do { \
+        printf(__VA_ARGS__); \
+    } while (0)
+#else
+#define MY_ICE_INFO(...) \
+    do { \
+    } while (0)
+#define MY_ICE_INFO_OUT(...) \
+    do { \
+    } while (0)
+#endif
+
+#define MY_ICE_REPORT(...) \
+    do { \
+        fprintf(stderr, __VA_ARGS__); \
+    } while (0)
 
 void die_errno(const char *msg);
 void die_msg(const char *msg);
