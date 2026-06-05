@@ -517,6 +517,13 @@ parse_c_logs() {
     RUN_GOTC_DELTA="$(parse_metric "${final_line}" 'GOTC_delta')"
   fi
 
+  if [[ -z "${RUN_FINAL_TX_WIRE_GBPS}" ]]; then
+    RUN_FINAL_TX_WIRE_GBPS="${RUN_FINAL_TX_L2_GBPS}"
+  fi
+  if [[ -z "${RUN_FINAL_RX_WIRE_GBPS}" ]]; then
+    RUN_FINAL_RX_WIRE_GBPS="${RUN_FINAL_RX_L2_GBPS}"
+  fi
+
   RUN_AVG_PKTS_PER_DOORBELL="$(calc_avg_pkts_per_doorbell "${RUN_TX_PKTS}" "${RUN_DOORBELLS}")"
   RUN_PORT_RX_GBPS="$(calc_gbps_from_bytes_and_seconds "${RUN_GORC_DELTA}" "${RUN_SECONDS_TOTAL}")"
   RUN_PORT_TX_GBPS="$(calc_gbps_from_bytes_and_seconds "${RUN_GOTC_DELTA}" "${RUN_SECONDS_TOTAL}")"
@@ -970,7 +977,6 @@ build_command() {
   local duration_s="$2"
   local batch_size="$3"
   local -n out_ref="$4"
-  local metrics_log_path="${5:-}"
 
   out_ref=()
   case "${implementation}" in
@@ -986,9 +992,6 @@ build_command() {
   fi
   if (( USE_HUGEPAGES )); then
     out_ref+=("--hugepages" "--hugepage-dir" "${HUGEPAGE_DIR}")
-  fi
-  if [[ "${implementation}" == "c" && -n "${metrics_log_path}" ]]; then
-    out_ref+=("--metrics-log" "${metrics_log_path}")
   fi
 }
 
@@ -1050,10 +1053,7 @@ run_one() {
   local rc
 
   mkdir -p "${run_dir}"
-  if [[ "${implementation}" == "c" ]]; then
-    metrics_log="${run_dir}/metrics.log"
-  fi
-  build_command "${implementation}" "${DURATION_S}" "${batch_size}" cmd "${metrics_log}"
+  build_command "${implementation}" "${DURATION_S}" "${batch_size}" cmd
 
   if [[ "${implementation}" == "rust" ]]; then
     exec_cmd=(env RUST_LOG=info "${cmd[@]}")
@@ -1120,10 +1120,7 @@ run_perf_record_capture() {
   (( PERF_RECORD_ENABLED )) || return 0
 
   mkdir -p "${run_dir}"
-  if [[ "${implementation}" == "c" ]]; then
-    metrics_log="${run_dir}/metrics.log"
-  fi
-  build_command "${implementation}" "${PERF_RECORD_DURATION_S}" "${batch_size}" cmd "${metrics_log}"
+  build_command "${implementation}" "${PERF_RECORD_DURATION_S}" "${batch_size}" cmd
   if [[ "${implementation}" == "rust" ]]; then
     exec_cmd=(env RUST_LOG=info "${cmd[@]}")
   else

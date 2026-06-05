@@ -475,8 +475,14 @@ def _load_standalone_artifacts(base_dir: Path) -> tuple[pd.DataFrame, pd.DataFra
         row["seconds_join"] = 0.0
         row["seconds_drain"] = 0.0
         row["worker_threads"] = 1.0
-        row["steady_tx_wire_gbps"] = pd.to_numeric(c_data.get("tx_wire_gbps", c_data.get("TX")), errors="coerce")
-        row["steady_rx_wire_gbps"] = pd.to_numeric(c_data.get("rx_wire_gbps", c_data.get("RX")), errors="coerce")
+        row["steady_tx_wire_gbps"] = pd.to_numeric(
+            c_data.get("tx_wire_gbps", c_data.get("TX", c_data.get("tx_l2_gbps"))),
+            errors="coerce",
+        )
+        row["steady_rx_wire_gbps"] = pd.to_numeric(
+            c_data.get("rx_wire_gbps", c_data.get("RX", c_data.get("rx_l2_gbps"))),
+            errors="coerce",
+        )
         row["steady_tx_mpps"] = pd.to_numeric(c_data.get("tx_mpps"), errors="coerce")
         row["steady_rx_mpps"] = pd.to_numeric(c_data.get("rx_mpps"), errors="coerce")
         row["steady_tx_l2_gbps"] = pd.to_numeric(c_data.get("tx_l2_gbps"), errors="coerce")

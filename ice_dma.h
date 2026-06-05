@@ -13,37 +13,54 @@ void alloc_queue_sw_state(struct ice_vfio_dev *d);
 void dma_map(struct ice_vfio_dev *d, size_t size);
 void layout_dma(struct ice_vfio_dev *d);
 void pkt_pool_init(struct ice_vfio_dev *d);
-struct pkt_buf *pkt_buf_alloc(struct pkt_mempool *pool);
-uint32_t pkt_buf_alloc_batch(struct pkt_mempool *pool, struct pkt_buf *bufs[],
-                             uint32_t num_bufs);
-uint32_t pkt_buf_alloc_batch_noinit(struct pkt_mempool *pool, struct pkt_buf *bufs[],
-                                    uint32_t num_bufs);
 
-static inline void pkt_buf_free_fast(struct pkt_buf *buf)
+static inline struct pkt_buf *pkt_pool_get_entry(const struct pkt_mempool *pool, uint32_t idx)
 {
-    struct pkt_mempool *pool;
+    return (struct pkt_buf *)(pool->base + (size_t)idx * pool->entry_size);
+}
+
+static inline uint64_t pkt_pool_get_data_iova(const struct pkt_mempool *pool, uint32_t idx)
+{
+    return pool->base_iova + (uint64_t)idx * pool->entry_size + offsetof(struct pkt_buf, data);
+}
+
+static inline uint32_t pkt_pool_pop_idx_noinit(struct pkt_mempool *pool)
+{
+    uint32_t head;
+    uint32_t idx;
+
+    if (pool->free_count == 0)
+        return ICE_PKT_BUF_INVALID_IDX;
+
+    head = pool->free_head;
+    idx = pool->free_ring[head];
+    head++;
+    if (head == pool->num_entries)
+        head = 0;
+    pool->free_head = head;
+    pool->free_count--;
+    return idx;
+}
+
+static inline uint32_t pkt_pool_pop_idx(struct pkt_mempool *pool)
+{
+    return pkt_pool_pop_idx_noinit(pool);
+}
+
+static inline void pkt_pool_push_idx(struct pkt_mempool *pool, uint32_t idx)
+{
     uint32_t tail;
 
-    /*
-     * Return a reflected pkt_buf to the shared pool with one free-ring push.
-     * tx_update_free() calls this after hardware advances past a Tx descriptor that borrowed the buffer.
-     */
-    if (!buf || !buf->mempool)
-        return;
-
-    pool = buf->mempool;
-    if (pool->free_count >= pool->num_entries)
+    if (idx == ICE_PKT_BUF_INVALID_IDX || pool->free_count >= pool->num_entries)
         return;
 
     tail = pool->free_tail;
-    pool->free_ring[tail] = buf->mempool_idx;
+    pool->free_ring[tail] = idx;
     tail++;
     if (tail == pool->num_entries)
         tail = 0;
     pool->free_tail = tail;
     pool->free_count++;
 }
-
-void pkt_buf_free(struct pkt_buf *buf);
 
 #endif

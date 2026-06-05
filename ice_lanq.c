@@ -1,8 +1,5 @@
 #define _GNU_SOURCE
 #include <endian.h>
-#include <inttypes.h>
-#include <pthread.h>
-#include <sched.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -88,85 +85,136 @@ static const struct ice_ctx_ele tlan_ctx_info[] = {
     { 0, 0, 0, 0 },
 };
 
+struct reflect_l2_ctx {
+    uint8_t local_mac[ETHER_ADDR_LEN];
+#if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN
+    uint16_t local_mac01;
+    uint32_t local_mac25;
+#endif
+};
 
-static int add_tx_queues(struct ice_vfio_dev *d, uint16_t count)
+static inline uint16_t rx_ring_add(uint16_t base, uint16_t add)
+{
+    uint16_t sum = (uint16_t)(base + add);
+
+    if (sum >= ICE_RX_DESC_COUNT)
+        return (uint16_t)(sum - ICE_RX_DESC_COUNT);
+    return sum;
+}
+
+static inline uint16_t rx_ring_next(uint16_t idx)
+{
+    return (uint16_t)((idx + 1) & ICE_RX_DESC_MASK);
+}
+
+static inline uint16_t tx_ring_next(uint16_t idx, uint16_t desc_count)
+{
+    idx++;
+    if (idx == desc_count)
+        return 0;
+    return idx;
+}
+
+static inline uint16_t tx_ring_clamp(uint16_t idx, uint16_t desc_count)
+{
+    if (idx >= desc_count)
+        return (uint16_t)(idx - desc_count);
+    return idx;
+}
+
+static inline struct pkt_buf *reflect_buf(const struct ice_vfio_dev *d, uint32_t idx)
+{
+    return pkt_pool_get_entry(&d->reflect_pool, idx);
+}
+
+static inline uint8_t *reflect_data(const struct ice_vfio_dev *d, uint32_t idx)
+{
+    return reflect_buf(d, idx)->data;
+}
+
+static inline uint64_t reflect_data_iova(const struct ice_vfio_dev *d, uint32_t idx)
+{
+    return pkt_pool_get_data_iova(&d->reflect_pool, idx);
+}
+
+static void maybe_pin_runtime_thread(const struct ice_vfio_dev *d, const char *context)
+{
+    int cpus[1024];
+    int count;
+
+    if (!d->pin_cpus)
+        return;
+
+    count = build_cpu_list(cpus, (int)(sizeof(cpus) / sizeof(cpus[0])));
+    if (count > 0) {
+        pin_thread_to_cpu(cpus[0]);
+        fprintf(stderr, "[my_ice] %s: pinned runtime thread to CPU %d\n", context, cpus[0]);
+    } else {
+        fprintf(stderr,
+                "[my_ice] %s: failed to determine CPU affinity, running unpinned\n",
+                context);
+    }
+}
+
+static int add_tx_queue(struct ice_vfio_dev *d)
 {
     struct ice_aqc_add_tx_qgrp *qg;
     struct ice_aq_desc desc;
-    size_t qg_size;
-    uint16_t i;
+    struct txq_ctx *q = &d->txq;
+    struct ice_tlan_ctx tlan = {0};
+    int rc = -1;
 
-    if (count == 0)
-        return -1;
-    if (count > 255)
-        count = 255;
-
-    /* ADD_TXQS is the control-plane step that turns our software Tx ring into a hardware-scheduled transmit queue. */
-    qg_size = sizeof(*qg) + (size_t)(count - 1) * sizeof(struct ice_aqc_add_txqs_perq);
-    qg = calloc(1, qg_size);
+    qg = calloc(1, sizeof(*qg));
     if (!qg)
         return -1;
 
     qg->parent_teid = htole32(d->io.qparent_teid);
-    qg->num_txqs = (uint8_t)count;
+    qg->num_txqs = 1;
 
-    for (i = 0; i < count; i++) {
-        struct txq_ctx *q = &d->txqs[i];
-        struct ice_tlan_ctx tlan = {0};
+    tlan.port_num = d->io.lport;
+    tlan.qlen = d->tx_desc_count;
+    tlan.base = q->tx_desc_iova >> 7;
+    tlan.pf_num = 0;
+    tlan.vmvf_type = ICE_TLAN_CTX_VMVF_TYPE_PF;
+    tlan.src_vsi = d->io.vsi_num;
+    tlan.tso_ena = 1;
+    tlan.internal_usage_flag = 1;
+    tlan.tso_qnum = q->txq_id;
+    tlan.legacy_int = 1;
 
-        /* Describe which descriptor ring, port, and VSI firmware should bind to this Tx queue. */
-        tlan.port_num = d->io.lport;
-        tlan.qlen = d->tx_desc_count;
-        tlan.base = q->tx_desc_iova >> 7;
-        tlan.pf_num = 0;
-        tlan.vmvf_type = ICE_TLAN_CTX_VMVF_TYPE_PF;
-        tlan.src_vsi = d->io.vsi_num;
-        tlan.tso_ena = 1;
-        tlan.internal_usage_flag = 1;
-        tlan.tso_qnum = q->txq_id;
-        tlan.legacy_int = 1;
-
-        qg->txqs[i].txq_id = htole16(q->txq_id);
-        set_ctx_bits((uint8_t *)&tlan, qg->txqs[i].txq_ctx, tlan_ctx_info);
-
-        qg->txqs[i].info.valid_sections =
-            ICE_AQC_ELEM_VALID_GENERIC | ICE_AQC_ELEM_VALID_CIR | ICE_AQC_ELEM_VALID_EIR;
-        qg->txqs[i].info.generic = 0;
-        qg->txqs[i].info.cir_bw.bw_profile_idx = htole16(ICE_SCHED_DFLT_RL_PROF_ID);
-        qg->txqs[i].info.cir_bw.bw_alloc = htole16(ICE_SCHED_DFLT_BW_WT);
-        qg->txqs[i].info.eir_bw.bw_profile_idx = htole16(ICE_SCHED_DFLT_RL_PROF_ID);
-        qg->txqs[i].info.eir_bw.bw_alloc = htole16(ICE_SCHED_DFLT_BW_WT);
-    }
+    qg->txqs[0].txq_id = htole16(q->txq_id);
+    set_ctx_bits((uint8_t *)&tlan, qg->txqs[0].txq_ctx, tlan_ctx_info);
+    qg->txqs[0].info.valid_sections =
+        ICE_AQC_ELEM_VALID_GENERIC | ICE_AQC_ELEM_VALID_CIR | ICE_AQC_ELEM_VALID_EIR;
+    qg->txqs[0].info.generic = 0;
+    qg->txqs[0].info.cir_bw.bw_profile_idx = htole16(ICE_SCHED_DFLT_RL_PROF_ID);
+    qg->txqs[0].info.cir_bw.bw_alloc = htole16(ICE_SCHED_DFLT_BW_WT);
+    qg->txqs[0].info.eir_bw.bw_profile_idx = htole16(ICE_SCHED_DFLT_RL_PROF_ID);
+    qg->txqs[0].info.eir_bw.bw_alloc = htole16(ICE_SCHED_DFLT_BW_WT);
 
     fill_dflt_direct_desc(&desc, ICE_AQC_OPC_ADD_TXQS);
     desc.flags = htole16(le16toh(desc.flags) | ICE_AQ_FLAG_RD);
     desc.params.add_txqs.num_qgrps = 1;
 
-    if (aq_send_cmd(d, &desc, qg, (uint16_t)qg_size) < 0) {
-        free(qg);
-        return -1;
+    if (aq_send_cmd(d, &desc, qg, (uint16_t)sizeof(*qg)) == 0) {
+        fprintf(stderr, "[my_ice] ADD_TXQS resp: txq_id=%u q_teid=0x%x\n",
+                le16toh(qg->txqs[0].txq_id), le32toh(qg->txqs[0].q_teid));
+        rc = 0;
     }
-
-    fprintf(stderr, "[my_ice] ADD_TXQS resp:");
-    for (i = 0; i < count; i++) {
-        fprintf(stderr, " txq_id=%u q_teid=0x%x",
-                le16toh(qg->txqs[i].txq_id), le32toh(qg->txqs[i].q_teid));
-    }
-    fprintf(stderr, "\n");
 
     free(qg);
-    return 0;
+    return rc;
 }
 
 static int wait_rxq_ready(struct ice_vfio_dev *d, uint16_t rxq, uint32_t *reg)
 {
     int i;
 
-    /* QRX_CTRL is a small enable-state machine: wait until driver intent (QENA_REQ) matches hardware state (QENA_STAT). */
     for (i = 0; i < 2000; i++) {
         uint32_t qrx_ctrl = reg_read32(d, QRX_CTRL(rxq));
         uint32_t qena_req = qrx_ctrl & QRX_CTRL_QENA_REQ_M;
         uint32_t qena_stat = qrx_ctrl & QRX_CTRL_QENA_STAT_M;
+
         if (!!qena_req == !!qena_stat) {
             *reg = qrx_ctrl;
             return 0;
@@ -177,7 +225,13 @@ static int wait_rxq_ready(struct ice_vfio_dev *d, uint16_t rxq, uint32_t *reg)
     return -1;
 }
 
-static int enable_rxq(struct ice_vfio_dev *d)
+static inline void publish_rx_tail(struct ice_vfio_dev *d, uint16_t tail)
+{
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    reg_write32(d, d->io.rx_tail_reg, tail);
+}
+
+static int setup_and_enable_rxq_ctx_only(struct ice_vfio_dev *d)
 {
     struct ice_rlan_ctx rlan = {0};
     uint8_t ctx_buf[ICE_RXQ_CTX_SZ] = {0};
@@ -185,7 +239,6 @@ static int enable_rxq(struct ice_vfio_dev *d)
     uint32_t reg;
     int i;
 
-    /* Program one Rx context for flex descriptors and whole-frame 2 KiB packet buffers. */
     rlan.base = d->io.rx_desc_iova >> 7;
     rlan.qlen = ICE_RX_DESC_COUNT;
     rlan.dbuf = ICE_RX_BUF_SIZE >> ICE_RLAN_CTX_DBUF_S;
@@ -200,7 +253,6 @@ static int enable_rxq(struct ice_vfio_dev *d)
     rlan.lrxqthresh = 1;
     rlan.prefena = 1;
 
-    /* Select the flex descriptor profile the Rx poller expects to parse from writeback descriptors. */
     reg = reg_read32(d, QRXFLXP_CNTXT(q));
     reg &= ~QRXFLXP_CNTXT_RXDID_IDX_M;
     reg |= ((uint32_t)ICE_RXDID_FLEX_NIC << QRXFLXP_CNTXT_RXDID_IDX_S) & QRXFLXP_CNTXT_RXDID_IDX_M;
@@ -208,10 +260,10 @@ static int enable_rxq(struct ice_vfio_dev *d)
     reg |= (0x03U << QRXFLXP_CNTXT_RXDID_PRIO_S) & QRXFLXP_CNTXT_RXDID_PRIO_M;
     reg_write32(d, QRXFLXP_CNTXT(q), reg);
 
-    /* Pack the queue context into the dense QRX_CONTEXT dwords firmware/hardware consume. */
     set_ctx_bits((uint8_t *)&rlan, ctx_buf, rlan_ctx_info);
     for (i = 0; i < ICE_RXQ_CTX_SIZE_DWORDS; i++) {
         uint32_t v;
+
         memcpy(&v, ctx_buf + i * sizeof(uint32_t), sizeof(uint32_t));
         reg_write32(d, QRX_CONTEXT(i, q), v);
     }
@@ -228,117 +280,92 @@ static int enable_rxq(struct ice_vfio_dev *d)
             return -1;
     }
 
-    /* Every descriptor already points at a DMA buffer, so setting QRX_TAIL to the last slot hands the full ring to hardware. */
     d->io.rx_ntc = 0;
-    reg_write32(d, QRX_TAIL(q), ICE_RX_DESC_COUNT - 1);
+    d->io.rx_tail_reg = QRX_TAIL(q);
+    d->io.rx_tail = ICE_RX_DESC_COUNT - 1;
+    d->io.rx_rearmed_pending = 0;
+    publish_rx_tail(d, d->io.rx_tail);
     return 0;
-}
-
-static int setup_and_enable_rxq(struct ice_vfio_dev *d)
-{
-    int i;
-
-    memset(d->io.rx_desc, 0, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc));
-    memset(d->io.rx_bufs, 0, ICE_RX_DESC_COUNT * ICE_RX_BUF_SIZE);
-
-    for (i = 0; i < ICE_RX_DESC_COUNT; i++) {
-        uint64_t biova = d->io.rx_bufs_iova + (uint64_t)i * ICE_RX_BUF_SIZE;
-        d->io.rx_desc[i].read.pkt_addr = htole64(biova);
-        d->io.rx_desc[i].read.hdr_addr = 0;
-    }
-
-    return enable_rxq(d);
 }
 
 static int setup_and_enable_rxq_pool(struct ice_vfio_dev *d)
 {
+    struct pkt_mempool *pool = &d->reflect_pool;
+    uint32_t *rx_pkt_buf_idxs = d->io.rx_pkt_buf_idxs;
     int i;
 
-    memset(d->io.rx_desc, 0, ICE_RX_DESC_COUNT * sizeof(union ice_32b_rx_flex_desc));
-    memset(d->io.rx_pkt_bufs, 0, ICE_RX_DESC_COUNT * sizeof(*d->io.rx_pkt_bufs));
+    memset(d->io.rx_desc, 0, ICE_RX_DESC_COUNT * sizeof(*d->io.rx_desc));
+    for (i = 0; i < ICE_RX_DESC_COUNT; i++)
+        rx_pkt_buf_idxs[i] = ICE_PKT_BUF_INVALID_IDX;
 
-    /* Reflect mode arms each Rx descriptor with a pooled pkt_buf so the completed buffer can be handed directly to Tx. */
     for (i = 0; i < ICE_RX_DESC_COUNT; i++) {
-        struct pkt_buf *buf = pkt_buf_alloc(&d->reflect_pool);
+        uint32_t buf_idx = pkt_pool_pop_idx(pool);
 
-        if (!buf)
+        if (buf_idx == ICE_PKT_BUF_INVALID_IDX)
             return -1;
-        d->io.rx_pkt_bufs[i] = buf;
-        d->io.rx_desc[i].read.pkt_addr = htole64(buf->buf_addr_iova);
+        rx_pkt_buf_idxs[i] = buf_idx;
+        d->io.rx_desc[i].read.pkt_addr = htole64(reflect_data_iova(d, buf_idx));
         d->io.rx_desc[i].read.hdr_addr = 0;
+        d->io.rx_desc[i].read.rsvd1 = 0;
+        d->io.rx_desc[i].read.rsvd2 = 0;
     }
 
-    return enable_rxq(d);
+    return setup_and_enable_rxq_ctx_only(d);
 }
 
 static void tx_ring_init(struct ice_vfio_dev *d)
 {
+    struct txq_ctx *q = &d->txq;
     uint16_t i;
 
-    /* Reset software ownership for every Tx slot before reflect starts borrowing pkt_bufs into the ring. */
-    for (i = 0; i < d->txq_count; i++) {
-        struct txq_ctx *q = &d->txqs[i];
-        memset(q->tx_desc, 0, (size_t)q->desc_count * sizeof(struct ice_tx_desc));
-        memset(q->tx_pkt_buf_refs, 0, (size_t)q->desc_count * sizeof(*q->tx_pkt_buf_refs));
-        memset(q->tx_rsq, 0, (size_t)q->tx_rsq_count * sizeof(*q->tx_rsq));
-        q->tx_next_to_use = 0;
-        q->tx_next_to_clean = 0;
-        q->tx_free = (uint16_t)(q->desc_count - 1);
-        q->tx_pkts_since_rs = 0;
-        q->tx_rsq_pidx = 0;
-        q->tx_rsq_cidx = 0;
+    memset(q->tx_desc, 0, (size_t)q->desc_count * sizeof(*q->tx_desc));
+    for (i = 0; i < q->desc_count; i++)
+        q->tx_pkt_buf_idxs[i] = ICE_PKT_BUF_INVALID_IDX;
+    memset(q->tx_rsq, 0, (size_t)q->tx_rsq_count * sizeof(*q->tx_rsq));
+    q->tx_next_to_use = 0;
+    q->tx_next_to_clean = 0;
+    q->tx_free = (uint16_t)(q->desc_count - 1);
+    q->tx_pkts_since_rs = 0;
+    q->tx_rsq_pidx = 0;
+    q->tx_rsq_cidx = 0;
+    q->dbell_reg = QTX_COMM_DBELL(q->txq_id);
+    q->head_reg = QTX_COMM_HEAD(q->txq_id);
+}
+
+static int tx_init_reflect_slots(struct ice_vfio_dev *d)
+{
+    struct pkt_mempool *pool = &d->reflect_pool;
+    struct txq_ctx *q = &d->txq;
+    uint16_t idx;
+
+    for (idx = 0; idx < q->desc_count; idx++) {
+        uint32_t buf_idx = pkt_pool_pop_idx_noinit(pool);
+
+        if (buf_idx == ICE_PKT_BUF_INVALID_IDX)
+            return -1;
+        q->tx_desc[idx].buf_addr = htole64(reflect_data_iova(d, buf_idx));
+        q->tx_desc[idx].cmd_type_offset_bsz = 0;
+        q->tx_pkt_buf_idxs[idx] = buf_idx;
     }
-}
 
-static inline uint16_t tx_ring_next(uint16_t idx, uint16_t desc_count)
-{
-    /* Mirrors Rust's ring_next() so the C hot path avoids modulo/division too. */
-    idx++;
-    if (idx == desc_count)
-        return 0;
-    return idx;
-}
-
-static inline uint16_t tx_ring_clamp(uint16_t idx, uint16_t desc_count)
-{
-    /* Same single-wrap clamp as Rust update_free(): HEAD is masked to 13 bits first. */
-    if (idx >= desc_count)
-        return (uint16_t)(idx - desc_count);
-    return idx;
+    return 0;
 }
 
 static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
 {
-    uint16_t head = (uint16_t)(reg_read32(d, QTX_COMM_HEAD(q->txq_id)) & 0x1FFFU);
+    uint16_t head = (uint16_t)(reg_read32(d, q->head_reg) & 0x1FFFU);
     uint16_t ntu = q->tx_next_to_use;
     uint16_t used;
-    uint16_t idx;
 
-    /*
-     * QTX_COMM_HEAD is the hardware consumer index. Advancing from tx_next_to_clean to HEAD means those
-     * descriptors are done, so any borrowed pkt_buf recorded in tx_pkt_buf_refs can return to reflect_pool.
-     */
     head = tx_ring_clamp(head, q->desc_count);
-
     if (head == q->tx_next_to_clean)
         return;
 
-    idx = q->tx_next_to_clean;
-    while (idx != head) {
-        if (q->tx_pkt_buf_refs[idx]) {
-            /* Tx completion hands ownership of that reflected buffer back to the shared pool. */
-            pkt_buf_free_fast(q->tx_pkt_buf_refs[idx]);
-            q->tx_pkt_buf_refs[idx] = NULL;
-        }
-        idx = tx_ring_next(idx, q->desc_count);
-    }
     q->tx_next_to_clean = head;
 
     while (q->tx_rsq_cidx != q->tx_rsq_pidx) {
         uint16_t rs_slot = q->tx_rsq[q->tx_rsq_cidx];
         bool in_flight;
-
-        /* RS slots mirror Rust/FreeBSD-style completion tracking; this avoids rescanning Tx. */
 
         if (head <= ntu)
             in_flight = rs_slot >= head && rs_slot < ntu;
@@ -348,9 +375,7 @@ static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
         if (in_flight)
             break;
 
-        q->tx_rsq_cidx++;
-        if (q->tx_rsq_cidx == q->tx_rsq_count)
-            q->tx_rsq_cidx = 0;
+        q->tx_rsq_cidx = tx_ring_next(q->tx_rsq_cidx, q->tx_rsq_count);
     }
 
     if (ntu >= head)
@@ -363,260 +388,81 @@ static void tx_update_free(struct ice_vfio_dev *d, struct txq_ctx *q)
 
 static inline void tx_record_rs_slot(struct txq_ctx *q, uint16_t idx)
 {
-    /* Mirrors Rust's RS bookkeeping: remember which descriptor should advance completion state. */
     q->tx_rsq[q->tx_rsq_pidx] = idx;
-    q->tx_rsq_pidx++;
-    if (q->tx_rsq_pidx == q->tx_rsq_count)
-        q->tx_rsq_pidx = 0;
+    q->tx_rsq_pidx = tx_ring_next(q->tx_rsq_pidx, q->tx_rsq_count);
 }
 
-static int poll_rx_batch(struct ice_vfio_dev *d, uint16_t out_idxs[], uint16_t out_lens[],
-                         uint16_t max_count)
+static inline uint16_t tx_reflect_enqueue_slot_trusted(struct ice_vfio_dev *d, struct txq_ctx *q,
+                                                       uint32_t buf_idx, uint16_t len)
 {
-    uint16_t idx;
-    uint16_t count = 0;
-
-    if (max_count == 0)
-        return 0;
-
-    /* Added to mirror Rust's batched poller so both reflect loops amortize descriptor checks the same way. */
-    idx = d->io.rx_ntc;
-    while (count < max_count) {
-        union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
-        uint16_t status0 = le16toh(rxd->wb.status_error0);
-        uint16_t pkt_len;
-        uint16_t next_idx = (uint16_t)((idx + 1) & ICE_RX_DESC_MASK);
-
-        if (likely(count + 1 < max_count))
-            __builtin_prefetch(&d->io.rx_desc[next_idx], 0, 1);
-
-        /* Stop on the first descriptor hardware has not completed yet; the reflect loop only handles a contiguous ready burst. */
-        if (!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_DD_S)))
-            break;
-
-        pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
-        if (unlikely(!(status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_EOF_S)) ||
-            (status0 & BIT(ICE_RX_FLEX_DESC_STATUS0_RXE_S)) ||
-            pkt_len == 0)) {
-            fprintf(stderr,
-                    "[my_ice] rx descriptor error idx=%u status0=0x%04x pkt_len=%u\n",
-                    idx, status0, pkt_len);
-            return -1;
-        }
-
-        out_idxs[count] = idx;
-        out_lens[count] = pkt_len;
-        count++;
-        idx = next_idx;
-    }
-
-    return count;
-}
-
-static int poll_one_rx_desc(struct ice_vfio_dev *d, uint16_t *out_idx, uint16_t *out_len)
-{
-    uint16_t idx;
-    uint16_t len;
-    int count;
-
-    count = poll_rx_batch(d, &idx, &len, 1);
-    if (count <= 0)
-        return count;
-
-    *out_idx = idx;
-    *out_len = len;
-    return 1;
-}
-
-static int tx_try_reserve_slot(struct ice_vfio_dev *d, struct txq_ctx *q, uint16_t *out_idx)
-{
-    if (q->tx_free == 0) {
-        tx_update_free(d, q);
-        if (q->tx_free == 0)
-            return 1;
-    }
-
-    *out_idx = q->tx_next_to_use;
-    return 0;
-}
-
-static inline void tx_commit_slot(struct txq_ctx *q, uint16_t idx, struct pkt_buf *buf_ref)
-{
-    /* Keep slot commit tiny: record ownership, advance ring, consume one free descriptor. */
-    q->tx_pkt_buf_refs[idx] = buf_ref;
-    q->tx_next_to_use = tx_ring_next(idx, q->desc_count);
-    q->tx_free--;
-}
-
-static inline void tx_prepare_desc(struct txq_ctx *q, uint16_t idx, uint64_t buf_iova, uint16_t len)
-{
-    struct ice_tx_desc *txd = &q->tx_desc[idx];
+    struct ice_tx_desc *txd;
+    struct pkt_mempool *pool = &d->reflect_pool;
+    uint32_t old_buf_idx;
+    uint16_t idx = q->tx_next_to_use;
     uint16_t cmd = ICE_TX_DESC_CMD_EOP;
     uint64_t qw1;
 
-    /* The descriptor points straight at the borrowed reflect buffer, so no payload copy happens in the Tx path. */
     q->tx_pkts_since_rs++;
     if (q->tx_pkts_since_rs >= TX_RS_THRESH) {
-        /* RS cadence matches Rust so QTX_COMM_HEAD advances often enough to recycle reflected buffers. */
         cmd |= ICE_TX_DESC_CMD_RS;
         tx_record_rs_slot(q, idx);
         q->tx_pkts_since_rs = 0;
     }
 
-    txd->buf_addr = htole64(buf_iova);
+    txd = &q->tx_desc[idx];
+    txd->buf_addr = htole64(reflect_data_iova(d, buf_idx));
     qw1 = ((uint64_t)ICE_TX_DESC_DTYPE_DATA << ICE_TXD_QW1_DTYPE_S) |
           ((uint64_t)cmd << ICE_TXD_QW1_CMD_S) |
           ((uint64_t)len << ICE_TXD_QW1_TX_BUF_SZ_S);
     txd->cmd_type_offset_bsz = htole64(qw1);
+
+    old_buf_idx = q->tx_pkt_buf_idxs[idx];
+    if (unlikely(old_buf_idx == ICE_PKT_BUF_INVALID_IDX))
+        die_msg("missing tx parked slot");
+    pkt_pool_push_idx(pool, old_buf_idx);
+    q->tx_pkt_buf_idxs[idx] = buf_idx;
+
+    q->tx_free--;
+    q->tx_next_to_use = tx_ring_next(idx, q->desc_count);
+    return len;
 }
 
-/* Returns: 0=enqueued, 1=ring full, -1=invalid packet */
-static int tx_try_enqueue(struct ice_vfio_dev *d, struct txq_ctx *q, const uint8_t *pkt,
-                          uint16_t len, bool copy, const uint8_t *dst_mac,
-                          const uint8_t *src_mac)
+static void tx_mark_rs_on_last(struct txq_ctx *q)
 {
-    uint16_t idx;
-    uint8_t *buf;
-    int reserve_rc;
+    struct ice_tx_desc *txd;
+    volatile uint64_t *qw1_ptr;
+    uint16_t last_idx;
+    uint64_t qw1;
 
-    if (len > ICE_TX_PKT_BUF_SIZE)
-        return -1;
-
-    reserve_rc = tx_try_reserve_slot(d, q, &idx);
-    if (reserve_rc != 0)
-        return reserve_rc;
-
-    buf = q->tx_pkt_bufs + ((size_t)idx * ICE_TX_PKT_BUF_SIZE);
-    if (copy && pkt && len)
-        memcpy(buf, pkt, len);
-    if ((dst_mac || src_mac) && len < 2 * ETHER_ADDR_LEN)
-        return -1;
-    if (dst_mac)
-        memcpy(buf, dst_mac, ETHER_ADDR_LEN);
-    if (src_mac)
-        memcpy(buf + ETHER_ADDR_LEN, src_mac, ETHER_ADDR_LEN);
-
-    tx_prepare_desc(q, idx, q->tx_pkt_iova + ((uint64_t)idx * ICE_TX_PKT_BUF_SIZE), len);
-    tx_commit_slot(q, idx, NULL);
-    return 0;
-}
-
-static uint16_t tx_reflect_enqueue_batch(struct ice_vfio_dev *d, struct txq_ctx *q,
-                                         struct pkt_buf *bufs[], uint16_t num_bufs,
-                                         uint64_t *bytes_sent)
-{
-    uint16_t desc_count = q->desc_count;
-    uint16_t sent = 0;
-    uint16_t idx = q->tx_next_to_use;
-    uint64_t bytes = 0;
-
-    if (q->tx_free < num_bufs) {
-        tx_update_free(d, q);
-        if (q->tx_free < num_bufs)
-            num_bufs = q->tx_free;
-    }
-
-    /* Ported from the Rust reflect enqueue shape so both sides submit borrowed Rx buffers similarly. */
-    while (sent < num_bufs) {
-        struct pkt_buf *buf = bufs[sent];
-        uint16_t len;
-
-        len = (uint16_t)buf->size;
-        tx_prepare_desc(q, idx, buf->buf_addr_iova, len);
-        /* Remember which pooled buffer this Tx slot borrowed so tx_update_free() can recycle it on completion. */
-        q->tx_pkt_buf_refs[idx] = buf;
-        bytes += len;
-        sent++;
-        q->tx_free--;
-
-        idx++;
-        if (idx == desc_count)
-            idx = 0;
-    }
-
-    q->tx_next_to_use = idx;
-    *bytes_sent = bytes;
-    return sent;
-}
-
-static void rearm_rx_desc_batch(struct ice_vfio_dev *d, const uint16_t idxs[], uint16_t count)
-{
-    uint16_t i;
-
-    if (!count)
+    if (q->tx_pkts_since_rs == 0)
         return;
 
-    for (i = 0; i < count; i++) {
-        uint16_t idx = idxs[i];
-        uint64_t buf_iova;
-
-        if (d->io.rx_pkt_bufs && d->io.rx_pkt_bufs[idx]) {
-            d->io.rx_pkt_bufs[idx]->size = 0;
-            buf_iova = d->io.rx_pkt_bufs[idx]->buf_addr_iova;
-        } else {
-            buf_iova = d->io.rx_bufs_iova + (uint64_t)idx * ICE_RX_BUF_SIZE;
-        }
-
-        d->io.rx_desc[idx].read.pkt_addr = htole64(buf_iova);
-        d->io.rx_desc[idx].read.hdr_addr = 0;
-        d->io.rx_desc[idx].read.rsvd1 = 0;
-        d->io.rx_desc[idx].read.rsvd2 = 0;
-    }
-
-    reg_write32(d, QRX_TAIL(d->io.rxq_id), idxs[count - 1]);
-    d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
-}
-
-static void rearm_rx_desc_pool_batch(struct ice_vfio_dev *d, const uint16_t idxs[],
-                                     struct pkt_buf *const bufs[], uint16_t count)
-{
-    union ice_32b_rx_flex_desc *rx_desc = d->io.rx_desc;
-    uint16_t i;
-
-    /* This is the replacement-buffer reflect path: descriptors are rearmed with fresh pool buffers immediately. */
-    for (i = 0; i < count; i++) {
-        uint16_t idx = idxs[i];
-        struct pkt_buf *buf = bufs[i];
-
-        rx_desc[idx].read.pkt_addr = htole64(buf->buf_addr_iova);
-        rx_desc[idx].read.hdr_addr = 0;
-        rx_desc[idx].read.rsvd1 = 0;
-        rx_desc[idx].read.rsvd2 = 0;
-    }
-
-    /* Advancing QRX_TAIL to the last rewritten slot hands every replacement buffer in this burst back to hardware. */
-    reg_write32(d, QRX_TAIL(d->io.rxq_id), idxs[count - 1]);
-    d->io.rx_ntc = (uint16_t)((idxs[count - 1] + 1) & ICE_RX_DESC_MASK);
-}
-
-static void rearm_rx_desc(struct ice_vfio_dev *d, uint16_t idx)
-{
-    uint16_t one = idx;
-
-    rearm_rx_desc_batch(d, &one, 1);
-}
-
-static int poll_one_rx_packet(struct ice_vfio_dev *d, uint8_t *out, uint16_t out_sz, uint16_t *out_len)
-{
-    uint16_t idx;
-    int got = poll_one_rx_desc(d, &idx, out_len);
-
-    if (got <= 0)
-        return got;
-
-    if (*out_len > out_sz)
-        *out_len = out_sz;
-
-    memcpy(out, d->io.rx_bufs + ((size_t)idx * ICE_RX_BUF_SIZE), *out_len);
-    rearm_rx_desc(d, idx);
-    return 1;
+    last_idx = (q->tx_next_to_use == 0) ? (uint16_t)(q->desc_count - 1)
+                                        : (uint16_t)(q->tx_next_to_use - 1);
+    txd = &q->tx_desc[last_idx];
+    qw1_ptr = (volatile uint64_t *)&txd->cmd_type_offset_bsz;
+    qw1 = le64toh(*qw1_ptr);
+    qw1 |= (uint64_t)ICE_TX_DESC_CMD_RS << ICE_TXD_QW1_CMD_S;
+    *qw1_ptr = htole64(qw1);
+    tx_record_rs_slot(q, last_idx);
+    q->tx_pkts_since_rs = 0;
 }
 
 static inline void tx_ring_doorbell(struct ice_vfio_dev *d, struct txq_ctx *q)
 {
-    /* Order descriptor writes before the MMIO doorbell that tells hardware tx_next_to_use is ready. */
-    __sync_synchronize();
-    reg_write32(d, QTX_COMM_DBELL(q->txq_id), q->tx_next_to_use);
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+    reg_write32(d, q->dbell_reg, q->tx_next_to_use);
+}
+
+static void flush_reflect_tx_batch(struct ice_vfio_dev *d, struct txq_ctx *q,
+                                   uint16_t *tx_pkts_pending_db)
+{
+    if (*tx_pkts_pending_db == 0)
+        return;
+
+    tx_mark_rs_on_last(q);
+    tx_ring_doorbell(d, q);
+    *tx_pkts_pending_db = 0;
 }
 
 static int tx_wait_drain(struct ice_vfio_dev *d, struct txq_ctx *q, int timeout_ms)
@@ -624,7 +470,6 @@ static int tx_wait_drain(struct ice_vfio_dev *d, struct txq_ctx *q, int timeout_
     uint64_t start_ns = monotonic_ns();
     uint64_t timeout_ns = (uint64_t)timeout_ms * 1000000ULL;
 
-    /* Used at shutdown so final metrics describe transmitted packets, not descriptors still in flight. */
     while (monotonic_ns() - start_ns < timeout_ns) {
         tx_update_free(d, q);
         if (q->tx_next_to_clean == q->tx_next_to_use)
@@ -633,6 +478,81 @@ static int tx_wait_drain(struct ice_vfio_dev *d, struct txq_ctx *q, int timeout_
     }
 
     return -1;
+}
+
+static int poll_and_rearm_reflect_batch(struct ice_vfio_dev *d, uint32_t completed_buf_idxs[],
+                                        uint16_t completed_lens[], uint16_t max_count)
+{
+    struct pkt_mempool *pool = &d->reflect_pool;
+    uint32_t *rx_pkt_buf_idxs = d->io.rx_pkt_buf_idxs;
+    union ice_32b_rx_flex_desc *rx_desc = d->io.rx_desc;
+    uint16_t count = max_count;
+    uint16_t idx;
+    uint16_t processed = 0;
+
+    if (count == 0)
+        return 0;
+
+    idx = d->io.rx_ntc;
+    while (processed < count) {
+        union ice_32b_rx_flex_desc *rxd = &rx_desc[idx];
+        uint16_t status0 = le16toh(rxd->wb.status_error0);
+        uint16_t pkt_len = le16toh(rxd->wb.pkt_len);
+        uint16_t next_idx;
+        uint32_t replacement_buf_idx;
+        uint32_t completed_buf_idx;
+
+        if (!(status0 & (1U << ICE_RX_FLEX_DESC_STATUS0_DD_S)))
+            break;
+        if (!(status0 & (1U << ICE_RX_FLEX_DESC_STATUS0_EOF_S)) ||
+            (status0 & (1U << ICE_RX_FLEX_DESC_STATUS0_RXE_S))) {
+            fprintf(stderr,
+                    "[my_ice] rx descriptor error idx=%u status0=0x%04x pkt_len=%u\n",
+                    idx, status0, pkt_len);
+            return -1;
+        }
+
+        next_idx = rx_ring_next(idx);
+#if defined(__x86_64__)
+        if (processed + 2 < count)
+            __builtin_prefetch(&rx_desc[(next_idx + 1) & ICE_RX_DESC_MASK], 0, 1);
+#endif
+
+        replacement_buf_idx = pkt_pool_pop_idx_noinit(pool);
+        if (unlikely(replacement_buf_idx == ICE_PKT_BUF_INVALID_IDX)) {
+            fprintf(stderr, "[my_ice] reflect pool underflow during immediate rearm\n");
+            return -1;
+        }
+
+        completed_buf_idx = rx_pkt_buf_idxs[idx];
+        rx_pkt_buf_idxs[idx] = replacement_buf_idx;
+        rxd->read.pkt_addr = htole64(reflect_data_iova(d, replacement_buf_idx));
+        rxd->read.hdr_addr = 0;
+        rxd->read.rsvd1 = 0;
+        rxd->read.rsvd2 = 0;
+        completed_buf_idxs[processed] = completed_buf_idx;
+        completed_lens[processed] = pkt_len;
+
+        processed++;
+        idx = next_idx;
+    }
+
+    d->io.rx_ntc = rx_ring_add(d->io.rx_ntc, processed);
+    d->io.rx_rearmed_pending = (uint16_t)(d->io.rx_rearmed_pending + processed);
+    return (int)processed;
+}
+
+static void flush_rx_rearmed_tail(struct ice_vfio_dev *d)
+{
+    uint16_t new_tail;
+
+    if (d->io.rx_rearmed_pending == 0)
+        return;
+
+    new_tail = rx_ring_add(d->io.rx_tail, d->io.rx_rearmed_pending);
+    publish_rx_tail(d, new_tail);
+    d->io.rx_tail = new_tail;
+    d->io.rx_rearmed_pending = 0;
 }
 
 static void dump_mdet_regs(struct ice_vfio_dev *d)
@@ -658,90 +578,8 @@ static void dump_mdet_regs(struct ice_vfio_dev *d)
         fprintf(stderr, "[my_ice] PF_MDET_RX=0x%08x\n", pf_rx);
 }
 
-static void dump_rx_desc_snapshot(struct ice_vfio_dev *d)
-{
-    uint16_t i;
-
-    for (i = 0; i < 8; i++) {
-        uint16_t idx = (uint16_t)((d->io.rx_ntc + i) & ICE_RX_DESC_MASK);
-        union ice_32b_rx_flex_desc *rxd = &d->io.rx_desc[idx];
-        uint16_t status0 = le16toh(rxd->wb.status_error0);
-        uint16_t pkt_len = (uint16_t)(le16toh(rxd->wb.pkt_len) & ICE_RX_FLX_DESC_PKT_LEN_M);
-        fprintf(stderr,
-                "[my_ice] rxdesc[%u] rxdid=%u status0=0x%04x pkt_len=%u\n",
-                idx, rxd->wb.rxdid, status0, pkt_len);
-    }
-}
-
-static uint64_t read_glv_counter64(struct ice_vfio_dev *d, uint32_t lo_off, uint32_t hi_off)
-{
-    uint64_t lo = reg_read32(d, lo_off);
-    uint64_t hi = reg_read32(d, hi_off) & 0xFFU;
-    return lo | (hi << 32);
-}
-
-static uint64_t counter40_delta(uint64_t after, uint64_t before)
-{
-    const uint64_t mask_40 = (UINT64_C(1) << 40) - 1;
-    uint64_t a = after & mask_40;
-    uint64_t b = before & mask_40;
-
-    /* Matches Rust's wrap-safe 40-bit VSI counter handling so hw byte deltas compare cleanly. */
-
-    if (a >= b)
-        return a - b;
-
-    return (mask_40 + 1 - b) + a;
-}
-
-static void print_payload_dump(const uint8_t *pkt, uint16_t len)
-{
-    const uint16_t l2_len = 14;
-    const uint16_t dump_cap = 256;
-    uint16_t payload_len;
-    uint16_t n;
-    uint16_t i;
-
-    if (len <= l2_len) {
-        printf("Payload: <none>\n");
-        return;
-    }
-
-    payload_len = (uint16_t)(len - l2_len);
-    n = payload_len > dump_cap ? dump_cap : payload_len;
-
-    printf("Payload: %u bytes (showing %u)\n", payload_len, n);
-    printf("Payload ASCII: ");
-    for (i = 0; i < n; i++) {
-        uint8_t c = pkt[l2_len + i];
-        putchar((c >= 32 && c <= 126) ? (char)c : '.');
-    }
-    putchar('\n');
-
-    printf("Payload HEX:\n");
-    for (i = 0; i < n; i += 16) {
-        uint16_t j;
-        uint16_t line_end = (uint16_t)(i + 16);
-        if (line_end > n)
-            line_end = n;
-        printf("  %04x: ", i);
-        for (j = i; j < line_end; j++)
-            printf("%02x ", pkt[l2_len + j]);
-        putchar('\n');
-    }
-}
-
-struct reflect_l2_ctx {
-    uint8_t local_mac[ETHER_ADDR_LEN];
-#if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN
-    uint16_t local_mac01;
-    uint32_t local_mac25;
-#endif
-};
-
 static inline void reflect_l2_ctx_init(struct reflect_l2_ctx *ctx, const uint8_t *local_mac)
 {
-    /* Precompute the local-MAC words once, following the Rust helper, so the packet loop stays tiny. */
     memcpy(ctx->local_mac, local_mac, ETHER_ADDR_LEN);
 #if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN
     memcpy(&ctx->local_mac01, local_mac, sizeof(ctx->local_mac01));
@@ -750,16 +588,12 @@ static inline void reflect_l2_ctx_init(struct reflect_l2_ctx *ctx, const uint8_t
 #endif
 }
 
-static inline void rewrite_reflect_l2(struct pkt_buf *buf, const struct reflect_l2_ctx *ctx)
+static inline void rewrite_reflect_l2(uint8_t *data, const struct reflect_l2_ctx *ctx)
 {
 #if defined(__BYTE_ORDER) && __BYTE_ORDER == __LITTLE_ENDIAN
-    uint8_t *data = buf->data;
     uint64_t word0;
     uint64_t word1;
     uint64_t new_word0;
-
-    /* Ported from the Rust reflect fast path: rewrite the first 16 bytes in two words. */
-    /* This keeps bytes 12..15 intact while avoiding the older byte-at-a-time MAC swap. */
 
     memcpy(&word0, data, sizeof(word0));
     memcpy(&word1, data + sizeof(word0), sizeof(word1));
@@ -775,112 +609,47 @@ static inline void rewrite_reflect_l2(struct pkt_buf *buf, const struct reflect_
 #else
     uint8_t original_src[ETHER_ADDR_LEN];
 
-    memcpy(original_src, buf->data + ETHER_ADDR_LEN, ETHER_ADDR_LEN);
-    memcpy(buf->data, original_src, ETHER_ADDR_LEN);
-    memcpy(buf->data + ETHER_ADDR_LEN, ctx->local_mac, ETHER_ADDR_LEN);
+    memcpy(original_src, data + ETHER_ADDR_LEN, ETHER_ADDR_LEN);
+    memcpy(data, original_src, ETHER_ADDR_LEN);
+    memcpy(data + ETHER_ADDR_LEN, ctx->local_mac, ETHER_ADDR_LEN);
 #endif
-}
-
-int run_rx_listen(struct ice_vfio_dev *d, int timeout_ms)
-{
-    uint32_t rx_alloc;
-    uint8_t rxpkt[2048];
-    uint16_t rxlen = 0;
-    uint16_t rx_mac_rule_idx = UINT16_MAX;
-    uint64_t gorc_before, gorc_after;
-    int rc = -1;
-    int i;
-
-    rx_alloc = reg_read32(d, PFLAN_RX_QALLOC);
-    if (!(rx_alloc & PFLAN_RX_QALLOC_VALID_M)) {
-        fprintf(stderr, "queue alloc not valid (RX=0x%08x)\n", rx_alloc);
-        goto out;
-    }
-
-    d->io.rxq_id = (uint16_t)(rx_alloc & PFLAN_RX_QALLOC_FIRSTQ_M);
-
-    if (aq_get_default_vsi_and_lport(d) < 0) {
-        fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
-        goto out;
-    }
-
-    fprintf(stderr, "[my_ice] rx-listen on vsi=%u lport=%u rxq=%u mac=%02x:%02x:%02x:%02x:%02x:%02x\n",
-            d->io.vsi_num, d->io.lport, d->io.rxq_id,
-            d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5]);
-
-    if (setup_and_enable_rxq(d) < 0) {
-        fprintf(stderr, "[my_ice] setup/enable rx queue failed\n");
-        goto out;
-    }
-
-    if (aq_add_rx_mac_rule(d, &rx_mac_rule_idx) < 0) {
-        fprintf(stderr, "[my_ice] failed to add RX MAC rule\n");
-        goto out;
-    }
-
-    gorc_before = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                     GLV_GORCH(d->io.vsi_num));
-
-    for (i = 0; i < timeout_ms; i++) {
-        int got = poll_one_rx_packet(d, rxpkt, sizeof(rxpkt), &rxlen);
-        if (got < 0) {
-            dump_mdet_regs(d);
-            goto out;
-        }
-        if (got > 0) {
-            if (rxlen >= 14) {
-                printf("RXLISTEN: received %u bytes, dst=%02x:%02x:%02x:%02x:%02x:%02x src=%02x:%02x:%02x:%02x:%02x:%02x ethertype=0x%02x%02x\n",
-                       rxlen,
-                       rxpkt[0], rxpkt[1], rxpkt[2], rxpkt[3], rxpkt[4], rxpkt[5],
-                       rxpkt[6], rxpkt[7], rxpkt[8], rxpkt[9], rxpkt[10], rxpkt[11],
-                       rxpkt[12], rxpkt[13]);
-            } else {
-                printf("RXLISTEN: received %u bytes\n", rxlen);
-            }
-            print_payload_dump(rxpkt, rxlen);
-            rc = 0;
-            goto out;
-        }
-        usleep(1000);
-    }
-
-    gorc_after = read_glv_counter64(d, GLV_GORCL(d->io.vsi_num),
-                                    GLV_GORCH(d->io.vsi_num));
-    fprintf(stderr, "[my_ice] rx-listen timeout, VSI%u GORC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, counter40_delta(gorc_after, gorc_before));
-    dump_rx_desc_snapshot(d);
-    dump_mdet_regs(d);
-
-out:
-    aq_remove_sw_rule_best_effort(d, ICE_AQC_SW_RULES_T_LKUP_RX, rx_mac_rule_idx);
-    return rc;
 }
 
 int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batch)
 {
     uint32_t rx_alloc;
     uint32_t tx_alloc;
-    uint16_t first_q, last_q, avail_q;
-    uint16_t rx_mac_rule_idx = UINT16_MAX;
-    uint64_t rx_pkts = 0, rx_bytes = 0;
-    uint64_t tx_pkts = 0, tx_bytes = 0;
-    uint64_t start_ns, end_ns, now_ns;
-    uint32_t time_check_countdown = 0;
     uint16_t requested_reflect_batch = reflect_batch;
     uint16_t tx_doorbell_batch = REFLECT_TX_DOORBELL_BATCH;
     uint16_t tx_pkts_pending_db = 0;
+    uint16_t rx_mac_rule_idx = UINT16_MAX;
+    uint64_t rx_pkts = 0;
+    uint64_t rx_bytes = 0;
+    uint64_t tx_pkts = 0;
+    uint64_t tx_bytes = 0;
+    uint64_t start_ns;
+    uint64_t end_ns;
+    uint32_t time_check_countdown = 0;
+    struct pkt_mempool *pool = &d->reflect_pool;
     struct reflect_l2_ctx l2_ctx;
-    struct rx_reflect_metrics metrics;
-    struct txq_ctx *q;
+    struct txq_ctx *q = &d->txq;
+    uint32_t *completed_buf_idxs = NULL;
+    uint16_t *completed_lens = NULL;
     int rc = -1;
 
-    if (d->txq_count != 1) {
-        fprintf(stderr, "[my_ice] rx-reflect uses one TX queue, using txq[0] only (configured=%u)\n",
-                d->txq_count);
+    maybe_pin_runtime_thread(d, "rx-reflect");
+    if (reflect_batch > MAX_REFLECT_BATCH)
+        reflect_batch = MAX_REFLECT_BATCH;
+    d->reflect_batch = reflect_batch;
+
+    completed_buf_idxs = calloc(reflect_batch, sizeof(*completed_buf_idxs));
+    completed_lens = calloc(reflect_batch, sizeof(*completed_lens));
+    if (!completed_buf_idxs || !completed_lens) {
+        fprintf(stderr, "[my_ice] failed to allocate reflect scratch buffers for batch=%u\n",
+                reflect_batch);
+        goto out;
     }
 
-    /* Discover the one hardware Rx queue and one hardware Tx queue this reflector will drive. */
     rx_alloc = reg_read32(d, PFLAN_RX_QALLOC);
     if (!(rx_alloc & PFLAN_RX_QALLOC_VALID_M)) {
         fprintf(stderr, "queue alloc not valid (RX=0x%08x)\n", rx_alloc);
@@ -893,24 +662,8 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         fprintf(stderr, "queue alloc not valid (TX=0x%08x)\n", tx_alloc);
         goto out;
     }
+    q->txq_id = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
 
-    first_q = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
-    last_q = (uint16_t)((tx_alloc & PFLAN_TX_QALLOC_LASTQ_M) >> PFLAN_TX_QALLOC_LASTQ_S);
-    avail_q = (uint16_t)(last_q - first_q + 1);
-    if (avail_q == 0) {
-        fprintf(stderr, "no available TX queues (first=%u last=%u)\n", first_q, last_q);
-        goto out;
-    }
-    d->txqs[0].txq_id = first_q;
-
-    /*
-     * Control-plane bring-up for reflection:
-     *   1. discover VSI/lport so rules and contexts target the right interface,
-     *   2. discover qparent_teid so ADD_TXQS can attach the Tx queue in the scheduler tree,
-     *   3. arm Rx with pooled packet objects,
-     *   4. install an Rx MAC rule so frames for our MAC reach this VSI,
-     *   5. create the Tx queue firmware object.
-     */
     if (aq_get_default_vsi_and_lport(d) < 0) {
         fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
         goto out;
@@ -927,18 +680,17 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
         fprintf(stderr, "[my_ice] failed to add RX MAC rule\n");
         goto out;
     }
-    if (add_tx_queues(d, 1) < 0) {
-        fprintf(stderr, "[my_ice] add tx queues failed\n");
+    if (add_tx_queue(d) < 0) {
+        fprintf(stderr, "[my_ice] add tx queue failed\n");
         goto out;
     }
 
     tx_ring_init(d);
-    q = &d->txqs[0];
-    if (reflect_batch > MAX_HOT_REFLECT_BATCH)
-        reflect_batch = MAX_HOT_REFLECT_BATCH;
-    /* Share one doorbell target with Rust: never ring more often than reflect_batch or more than free space allows. */
-    if (tx_doorbell_batch < reflect_batch)
-        tx_doorbell_batch = reflect_batch;
+    if (tx_init_reflect_slots(d) < 0) {
+        fprintf(stderr, "[my_ice] reflect pool exhausted during tx descriptor setup\n");
+        goto out;
+    }
+
     if (tx_doorbell_batch > q->tx_free)
         tx_doorbell_batch = q->tx_free;
 
@@ -946,142 +698,88 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
             "[my_ice] rx-reflect on vsi=%u lport=%u rxq=%u txq=%u local-mac=%02x:%02x:%02x:%02x:%02x:%02x timeout_ms=%d reflect_batch=%u effective_reflect_batch=%u tx_doorbell_batch=%u\n",
             d->io.vsi_num, d->io.lport, d->io.rxq_id, q->txq_id,
             d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms, requested_reflect_batch,
-            reflect_batch, tx_doorbell_batch);
+            d->io.mac[3], d->io.mac[4], d->io.mac[5], timeout_ms,
+            requested_reflect_batch, reflect_batch, tx_doorbell_batch);
 
-    /* Precompute the Ethernet rewrite state before entering the hot loop. */
     reflect_l2_ctx_init(&l2_ctx, d->io.mac);
-
     start_ns = monotonic_ns();
     end_ns = start_ns + (uint64_t)timeout_ms * 1000000ULL;
+    rc = 0;
 
-    while (true) {
-        uint16_t rx_idxs[MAX_REFLECT_BATCH];
-        uint16_t rx_lens[MAX_REFLECT_BATCH];
-        struct pkt_buf *replacement_bufs[MAX_REFLECT_BATCH];
-        struct pkt_buf *tx_bufs[MAX_REFLECT_BATCH];
-        uint64_t batch_rx_bytes = 0;
-        uint64_t batch_tx_bytes = 0;
+    for (;;) {
         bool rx_seen = false;
         bool stalled = false;
-        uint16_t budget;
-        int got;
-        uint16_t tx_count = 0;
-        uint16_t replacement_count;
-        uint16_t sent = 0;
-        uint16_t i;
 
-        /* Same pre-check as Rust: refresh TX completion state before budgeting the next reflect burst. */
-        if (q->tx_free < reflect_batch || d->reflect_pool.free_count < reflect_batch)
+        if (q->tx_free < reflect_batch)
             tx_update_free(d, q);
 
-        budget = reflect_batch;
-        if (q->tx_free < budget)
-            budget = q->tx_free;
-        if (d->reflect_pool.free_count < budget)
-            budget = (uint16_t)d->reflect_pool.free_count;
-
-        if (budget == 0) {
-            /* No new burst can run until Tx frees descriptors or the pool regains replacement buffers. */
-            if (tx_pkts_pending_db != 0) {
-                tx_ring_doorbell(d, q);
-                tx_pkts_pending_db = 0;
-            }
+        if (q->tx_free == 0) {
+            if (tx_pkts_pending_db != 0)
+                flush_reflect_tx_batch(d, q, &tx_pkts_pending_db);
             stalled = true;
-            goto report_progress;
-        }
+        } else if (pool->free_count == 0) {
+            stalled = true;
+        } else {
+            int ready;
+            uint16_t budget = reflect_batch;
+            uint16_t sent = 0;
+            uint64_t sent_bytes = 0;
+            uint16_t i;
 
-        /* Poll a contiguous ready burst. The poller validates DD/EOF/RXE so the reflect loop only sees complete frames. */
-        got = poll_rx_batch(d, rx_idxs, rx_lens, budget);
-        if (unlikely(got < 0)) {
-            dump_mdet_regs(d);
-            goto out;
-        }
-        if (got == 0)
-            goto report_progress;
+            if (q->tx_free < budget)
+                budget = q->tx_free;
+            if (pool->free_count < budget)
+                budget = (uint16_t)pool->free_count;
 
-        rx_seen = true;
-
-        /* Borrow replacement buffers in a batch so the just-received buffers can move straight to Tx. */
-        replacement_count = (uint16_t)pkt_buf_alloc_batch_noinit(&d->reflect_pool,
-                                                                 replacement_bufs,
-                                                                 (uint16_t)got);
-        if (unlikely(replacement_count != (uint16_t)got)) {
-            fprintf(stderr,
-                    "[my_ice] reflect pool underflow: needed=%u got=%u free_count=%u\n",
-                    (uint16_t)got, replacement_count, d->reflect_pool.free_count);
-            goto out;
-        }
-
-        /*
-         * For each completed descriptor:
-         *   1. take ownership of the just-filled buffer,
-         *   2. swap a fresh replacement buffer back into the Rx slot,
-         *   3. rewrite Ethernet src/dst for reflection,
-         *   4. queue the borrowed buffer for Tx.
-         */
-        for (i = 0; i < (uint16_t)got; i++) {
-            uint16_t rx_idx = rx_idxs[i];
-            uint16_t rx_len = rx_lens[i];
-            struct pkt_buf *rx_buf = d->io.rx_pkt_bufs[rx_idx];
-
-            if (unlikely(!rx_buf)) {
-                fprintf(stderr, "[my_ice] missing rx pool buffer for descriptor %u\n", rx_idx);
-                goto out;
+            ready = poll_and_rearm_reflect_batch(d, completed_buf_idxs, completed_lens,
+                                                 budget);
+            if (ready < 0) {
+                dump_mdet_regs(d);
+                rc = -1;
+                ready = 0;
             }
 
-            /* Swap in the replacement buffer now; rx_buf becomes the borrowed buffer handed to Tx. */
-            d->io.rx_pkt_bufs[rx_idx] = replacement_bufs[i];
+            if (ready != 0)
+                rx_seen = true;
 
-            if (rx_len < 14) {
-                /* Too short to contain a full Ethernet header, so it cannot be reflected safely. */
-                pkt_buf_free_fast(rx_buf);
-                continue;
+            for (i = 0; i < (uint16_t)ready; i++) {
+                uint32_t completed_buf_idx = completed_buf_idxs[i];
+                uint16_t completed_len = completed_lens[i];
+
+                if (completed_len < 16) {
+                    pkt_pool_push_idx(pool, completed_buf_idx);
+                    continue;
+                }
+
+                rewrite_reflect_l2(reflect_data(d, completed_buf_idx), &l2_ctx);
+                sent_bytes += tx_reflect_enqueue_slot_trusted(d, q, completed_buf_idx,
+                                                              completed_len);
+                sent++;
             }
 
-            rx_buf->size = rx_len;
-            rewrite_reflect_l2(rx_buf, &l2_ctx);
-
-            tx_bufs[tx_count] = rx_buf;
-            batch_rx_bytes += rx_len;
-            tx_count++;
-        }
-
-        /* Replacement buffers rearm Rx immediately; unlike the older zero-copy path, no deferred tailing is needed. */
-        rearm_rx_desc_pool_batch(d, rx_idxs, replacement_bufs, (uint16_t)got);
-
-        rx_pkts += tx_count;
-        rx_bytes += batch_rx_bytes;
-
-        /* Submit the borrowed packet objects to Tx without copying payload bytes. */
-        if (tx_count > 0)
-            sent = tx_reflect_enqueue_batch(d, q, tx_bufs, tx_count, &batch_tx_bytes);
-
-        if (sent > 0) {
+            rx_pkts += sent;
+            rx_bytes += sent_bytes;
             tx_pkts += sent;
-            tx_bytes += batch_tx_bytes;
-            tx_pkts_pending_db = (uint16_t)(tx_pkts_pending_db + sent);
-            if (tx_pkts_pending_db >= tx_doorbell_batch || sent < tx_count) {
-                tx_ring_doorbell(d, q);
-                tx_pkts_pending_db = 0;
+            tx_bytes += sent_bytes;
+
+            flush_rx_rearmed_tail(d);
+
+            if (sent > 0) {
+                tx_pkts_pending_db = (uint16_t)(tx_pkts_pending_db + sent);
+                if (tx_pkts_pending_db >= tx_doorbell_batch)
+                    flush_reflect_tx_batch(d, q, &tx_pkts_pending_db);
             }
+
+            if (rc < 0)
+                break;
         }
 
-        if (sent < tx_count) {
-            /* Any unsent borrowed buffers never reached hardware, so software must return them to the pool immediately. */
-            for (i = sent; i < tx_count; i++)
-                pkt_buf_free_fast(tx_bufs[i]);
-            stalled = true;
-        }
+        if (!rx_seen && tx_pkts_pending_db != 0)
+            flush_reflect_tx_batch(d, q, &tx_pkts_pending_db);
 
-report_progress:
-        /* If a partial Tx batch was staged and then traffic went idle, force the doorbell so hardware sees it. */
-        if (!rx_seen && tx_pkts_pending_db != 0) {
-            tx_ring_doorbell(d, q);
-            tx_pkts_pending_db = 0;
-        }
         if (time_check_countdown == 0 || stalled || !rx_seen) {
-            /* Avoid paying for a clock read every iteration while the loop is running flat-out. */
+            uint64_t now_ns;
+
             time_check_countdown = REFLECT_TIME_CHECK_BURSTS;
             now_ns = monotonic_ns();
             if (now_ns >= end_ns)
@@ -1095,400 +793,29 @@ report_progress:
             usleep(50);
             continue;
         }
+
         if (!rx_seen)
             usleep(1000);
     }
 
-    /* Flush the final partial batch, wait briefly for hardware completion, then compute the final reflect summary. */
-    if (tx_pkts_pending_db != 0) {
-        tx_ring_doorbell(d, q);
-        tx_pkts_pending_db = 0;
-    }
+    if (tx_pkts_pending_db != 0)
+        flush_reflect_tx_batch(d, q, &tx_pkts_pending_db);
+
+    flush_rx_rearmed_tail(d);
     (void)tx_wait_drain(d, q, 1000);
-    now_ns = end_ns;
-    metrics.seconds_total = (double)(now_ns - start_ns) / 1e9;
-    metrics.tx_mpps = pkts_ns_to_mpps(tx_pkts, now_ns - start_ns);
-    metrics.rx_mpps = pkts_ns_to_mpps(rx_pkts, now_ns - start_ns);
-    metrics.tx_l2_gbps = bytes_ns_to_gbps(tx_bytes, now_ns - start_ns);
-    metrics.rx_l2_gbps = bytes_ns_to_gbps(rx_bytes, now_ns - start_ns);
+    tx_update_free(d, q);
+
     fprintf(stderr,
             "[my_ice] rx-reflect done: seconds=%.6f tx_l2_gbps=%.6f rx_l2_gbps=%.6f tx_mpps=%.6f rx_mpps=%.6f\n",
-            metrics.seconds_total,
-            metrics.tx_l2_gbps,
-            metrics.rx_l2_gbps,
-            metrics.tx_mpps,
-            metrics.rx_mpps);
-
-    if (write_rx_reflect_metrics_log(d, &metrics) < 0)
-        goto out;
-
-    rc = 0;
+            (double)timeout_ms / 1000.0,
+            bytes_ns_to_gbps(tx_bytes, (uint64_t)timeout_ms * 1000000ULL),
+            bytes_ns_to_gbps(rx_bytes, (uint64_t)timeout_ms * 1000000ULL),
+            pkts_ns_to_mpps(tx_pkts, (uint64_t)timeout_ms * 1000000ULL),
+            pkts_ns_to_mpps(rx_pkts, (uint64_t)timeout_ms * 1000000ULL));
 
 out:
+    free(completed_lens);
+    free(completed_buf_idxs);
     aq_remove_sw_rule_best_effort(d, ICE_AQC_SW_RULES_T_LKUP_RX, rx_mac_rule_idx);
     return rc;
-}
-
-int run_tx_send(struct ice_vfio_dev *d, const uint8_t *dst_mac, int count,
-                       int interval_ms, const char *payload)
-{
-    uint32_t tx_alloc;
-    uint16_t first_q, last_q, avail_q;
-    uint8_t pkt[ICE_TX_PKT_BUF_SIZE] = {0};
-    size_t payload_len;
-    uint16_t frame_len;
-    uint64_t gotc_before, gotc_after;
-    int i;
-    struct txq_ctx *q;
-
-    tx_alloc = reg_read32(d, PFLAN_TX_QALLOC);
-    if (!(tx_alloc & PFLAN_TX_QALLOC_VALID_M)) {
-        fprintf(stderr, "queue alloc not valid (TX=0x%08x)\n", tx_alloc);
-        return -1;
-    }
-
-    first_q = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
-    last_q = (uint16_t)((tx_alloc & PFLAN_TX_QALLOC_LASTQ_M) >> PFLAN_TX_QALLOC_LASTQ_S);
-    avail_q = (uint16_t)(last_q - first_q + 1);
-    if (avail_q == 0) {
-        fprintf(stderr, "no available TX queues (first=%u last=%u)\n", first_q, last_q);
-        return -1;
-    }
-    if (d->txq_count > avail_q) {
-        fprintf(stderr, "[my_ice] requested %u tx queues, clamping to %u available\n",
-                d->txq_count, avail_q);
-        d->txq_count = avail_q;
-    }
-    for (i = 0; i < d->txq_count; i++)
-        d->txqs[i].txq_id = (uint16_t)(first_q + i);
-
-    if (aq_get_default_vsi_and_lport(d) < 0) {
-        fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
-        return -1;
-    }
-    if (aq_get_qparent_teid(d) < 0) {
-        fprintf(stderr, "[my_ice] failed to get parent TEID\n");
-        return -1;
-    }
-    if (add_tx_queues(d, d->txq_count) < 0) {
-        fprintf(stderr, "[my_ice] add tx queues failed\n");
-        return -1;
-    }
-
-    tx_ring_init(d);
-    q = &d->txqs[0];
-
-    memcpy(pkt + 0, dst_mac, ETHER_ADDR_LEN);
-    memcpy(pkt + 6, d->io.mac, ETHER_ADDR_LEN);
-    pkt[12] = 0x88;
-    pkt[13] = 0xB5;
-
-    payload_len = payload ? strlen(payload) : 0;
-    if (payload_len > (size_t)(ICE_TX_PKT_BUF_SIZE - 14))
-        payload_len = ICE_TX_PKT_BUF_SIZE - 14;
-    if (payload_len > 0)
-        memcpy(pkt + 14, payload, payload_len);
-
-    frame_len = (uint16_t)(14 + payload_len);
-    if (frame_len < 60)
-        frame_len = 60;
-
-    fprintf(stderr,
-            "[my_ice] tx-send on vsi=%u lport=%u txq=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x count=%d interval_ms=%d payload_len=%zu frame_len=%u\n",
-            d->io.vsi_num, d->io.lport, q->txq_id,
-            d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5],
-            dst_mac[0], dst_mac[1], dst_mac[2],
-            dst_mac[3], dst_mac[4], dst_mac[5],
-            count, interval_ms, payload_len, frame_len);
-
-    gotc_before = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                     GLV_GOTCH(d->io.vsi_num));
-
-    for (i = 0; i < count; i++) {
-        int tries;
-        for (tries = 0; tries < 100000; tries++) {
-            if (q->tx_free == 0)
-                tx_update_free(d, q);
-            int enq = tx_try_enqueue(d, q, pkt, frame_len, true, NULL, NULL);
-            if (enq == 0) {
-                tx_ring_doorbell(d, q);
-                break;
-            }
-            if (enq < 0) {
-                fprintf(stderr, "[my_ice] tx-send invalid packet at %d/%d\n",
-                        i + 1, count);
-                return -1;
-            }
-        }
-        if (tries == 100000) {
-            fprintf(stderr, "[my_ice] tx-send ring full at packet %d/%d\n",
-                    i + 1, count);
-            return -1;
-        }
-        if (interval_ms > 0)
-            usleep((useconds_t)interval_ms * 1000U);
-    }
-
-    (void)tx_wait_drain(d, q, 1000);
-
-    gotc_after = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                    GLV_GOTCH(d->io.vsi_num));
-    fprintf(stderr, "[my_ice] tx-send done, VSI%u GOTC +%" PRIu64 " bytes\n",
-            d->io.vsi_num, counter40_delta(gotc_after, gotc_before));
-    return 0;
-}
-
-struct tx_bench_worker {
-    struct ice_vfio_dev *d;
-    struct txq_ctx *q;
-    uint64_t end_ns;
-    uint16_t frame_len;
-    int cpu_id;
-    uint8_t pkt[ICE_TX_PKT_BUF_SIZE];
-    int err;
-};
-
-static void *tx_bench_worker_main(void *arg)
-{
-    struct tx_bench_worker *w = arg;
-
-    if (w->cpu_id >= 0)
-        pin_thread_to_cpu(w->cpu_id);
-
-    while (true) {
-        uint16_t burst_pkts = 0;
-        int i;
-
-        if (monotonic_ns() >= w->end_ns)
-            break;
-
-        if (w->q->tx_free < TX_BURST_SIZE)
-            tx_update_free(w->d, w->q);
-
-        for (i = 0; i < TX_BURST_SIZE; i++) {
-            int enq = tx_try_enqueue(w->d, w->q, w->pkt, w->frame_len, false, NULL, NULL);
-            if (enq == 0) {
-                burst_pkts++;
-                continue;
-            }
-            if (enq < 0) {
-                w->err = -1;
-                return NULL;
-            }
-            break;
-        }
-
-        if (burst_pkts > 0) {
-            tx_ring_doorbell(w->d, w->q);
-        } else {
-            tx_update_free(w->d, w->q);
-        }
-    }
-
-    return NULL;
-}
-
-int run_tx_bench(struct ice_vfio_dev *d, const uint8_t *dst_mac, int seconds,
-                        int payload_len, bool pin_cpus)
-{
-    const uint64_t one_sec_ns = 1000000000ULL;
-    uint32_t tx_alloc;
-    uint16_t first_q, last_q, avail_q;
-    uint8_t pkt[ICE_TX_PKT_BUF_SIZE] = {0};
-    uint16_t frame_len;
-    uint64_t gotc_start, gotc_prev, gotc_now;
-    uint64_t start_ns, end_ns, now_ns, next_report_ns, last_report_ns;
-    uint16_t q_idx = 0;
-    pthread_t *threads = NULL;
-    struct tx_bench_worker *workers = NULL;
-    int cpu_list[CPU_SETSIZE];
-    int cpu_count = 0;
-
-    tx_alloc = reg_read32(d, PFLAN_TX_QALLOC);
-    if (!(tx_alloc & PFLAN_TX_QALLOC_VALID_M)) {
-        fprintf(stderr, "queue alloc not valid (TX=0x%08x)\n", tx_alloc);
-        return -1;
-    }
-
-    first_q = (uint16_t)(tx_alloc & PFLAN_TX_QALLOC_FIRSTQ_M);
-    last_q = (uint16_t)((tx_alloc & PFLAN_TX_QALLOC_LASTQ_M) >> PFLAN_TX_QALLOC_LASTQ_S);
-    avail_q = (uint16_t)(last_q - first_q + 1);
-    if (avail_q == 0) {
-        fprintf(stderr, "no available TX queues (first=%u last=%u)\n", first_q, last_q);
-        return -1;
-    }
-    if (d->txq_count > avail_q) {
-        fprintf(stderr, "[my_ice] requested %u tx queues, clamping to %u available\n",
-                d->txq_count, avail_q);
-        d->txq_count = avail_q;
-    }
-    for (q_idx = 0; q_idx < d->txq_count; q_idx++)
-        d->txqs[q_idx].txq_id = (uint16_t)(first_q + q_idx);
-    q_idx = 0;
-
-    if (aq_get_default_vsi_and_lport(d) < 0) {
-        fprintf(stderr, "[my_ice] failed to get default VSI/LPORT\n");
-        return -1;
-    }
-    if (aq_get_qparent_teid(d) < 0) {
-        fprintf(stderr, "[my_ice] failed to get parent TEID\n");
-        return -1;
-    }
-    if (add_tx_queues(d, d->txq_count) < 0) {
-        fprintf(stderr, "[my_ice] add tx queues failed\n");
-        return -1;
-    }
-
-    tx_ring_init(d);
-
-    memcpy(pkt + 0, dst_mac, ETHER_ADDR_LEN);
-    memcpy(pkt + 6, d->io.mac, ETHER_ADDR_LEN);
-    pkt[12] = 0x88;
-    pkt[13] = 0xB5;
-    if (payload_len > 0)
-        memset(pkt + 14, 'A', (size_t)payload_len);
-
-    frame_len = (uint16_t)(14 + payload_len);
-    if (frame_len < 60)
-        frame_len = 60;
-
-    for (q_idx = 0; q_idx < d->txq_count; q_idx++) {
-        struct txq_ctx *q = &d->txqs[q_idx];
-        uint16_t di;
-        for (di = 0; di < q->desc_count; di++) {
-            uint8_t *buf = q->tx_pkt_bufs + ((size_t)di * ICE_TX_PKT_BUF_SIZE);
-            memcpy(buf, pkt, frame_len);
-        }
-    }
-
-    if (pin_cpus) {
-        cpu_count = build_cpu_list(cpu_list, (int)(sizeof(cpu_list) / sizeof(cpu_list[0])));
-        if (cpu_count <= 0) {
-            fprintf(stderr, "[my_ice] warning: failed to read CPU affinity, disabling pinning\n");
-            pin_cpus = false;
-        } else {
-            fprintf(stderr, "[my_ice] pinning tx threads to CPUs (count=%d)\n", cpu_count);
-        }
-    }
-
-    fprintf(stderr,
-            "[my_ice] tx-bench on vsi=%u lport=%u txqs=%u txq_base=%u src=%02x:%02x:%02x:%02x:%02x:%02x dst=%02x:%02x:%02x:%02x:%02x:%02x seconds=%d payload_len=%d frame_len=%u\n",
-            d->io.vsi_num, d->io.lport, d->txq_count, d->txqs[0].txq_id,
-            d->io.mac[0], d->io.mac[1], d->io.mac[2],
-            d->io.mac[3], d->io.mac[4], d->io.mac[5],
-            dst_mac[0], dst_mac[1], dst_mac[2],
-            dst_mac[3], dst_mac[4], dst_mac[5],
-            seconds, payload_len, frame_len);
-
-    gotc_start = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                    GLV_GOTCH(d->io.vsi_num));
-    gotc_prev = gotc_start;
-
-    start_ns = monotonic_ns();
-    end_ns = start_ns + (uint64_t)seconds * one_sec_ns;
-    last_report_ns = start_ns;
-    next_report_ns = start_ns + one_sec_ns;
-
-    threads = calloc(d->txq_count, sizeof(*threads));
-    workers = calloc(d->txq_count, sizeof(*workers));
-    if (!threads || !workers) {
-        fprintf(stderr, "[my_ice] failed to allocate tx bench workers\n");
-        free(threads);
-        free(workers);
-        return -1;
-    }
-
-    for (q_idx = 0; q_idx < d->txq_count; q_idx++) {
-        struct tx_bench_worker *w = &workers[q_idx];
-
-        w->d = d;
-        w->q = &d->txqs[q_idx];
-        w->end_ns = end_ns;
-        w->frame_len = frame_len;
-        w->cpu_id = -1;
-        w->err = 0;
-        memcpy(w->pkt, pkt, frame_len);
-
-        if (pin_cpus && cpu_count > 0)
-            w->cpu_id = cpu_list[q_idx % cpu_count];
-
-        if (pthread_create(&threads[q_idx], NULL, tx_bench_worker_main, w) != 0) {
-            fprintf(stderr, "[my_ice] failed to create tx thread %u\n", q_idx);
-            workers[q_idx].err = -1;
-            threads[q_idx] = 0;
-        }
-    }
-
-    while (true) {
-        now_ns = monotonic_ns();
-        if (now_ns >= end_ns)
-            break;
-
-        if (now_ns >= next_report_ns) {
-            uint64_t interval_ns;
-            uint64_t interval_bytes;
-            double interval_s;
-            double gbps;
-
-            gotc_now = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                          GLV_GOTCH(d->io.vsi_num));
-            interval_ns = now_ns - last_report_ns;
-            interval_bytes = counter40_delta(gotc_now, gotc_prev);
-            interval_s = (double)interval_ns / (double)one_sec_ns;
-
-            gbps = interval_s > 0.0 ?
-                ((double)interval_bytes * 8.0) / (interval_s * 1e9) : 0.0;
-
-            fprintf(stderr,
-                    "[my_ice] tx-bench t=%.2fs interval: Gbps=%.3f\n",
-                    (double)(now_ns - start_ns) / (double)one_sec_ns,
-                    gbps);
-
-            last_report_ns = now_ns;
-            gotc_prev = gotc_now;
-            next_report_ns += one_sec_ns;
-            if (next_report_ns < now_ns)
-                next_report_ns = now_ns + one_sec_ns;
-        }
-        usleep(1000);
-    }
-
-    for (q_idx = 0; q_idx < d->txq_count; q_idx++) {
-        if (threads[q_idx])
-            pthread_join(threads[q_idx], NULL);
-    }
-
-    for (q_idx = 0; q_idx < d->txq_count; q_idx++)
-        (void)tx_wait_drain(d, &d->txqs[q_idx], 1000);
-
-    for (q_idx = 0; q_idx < d->txq_count; q_idx++) {
-        if (workers[q_idx].err) {
-            fprintf(stderr, "[my_ice] tx-bench worker %u reported error\n", q_idx);
-            free(threads);
-            free(workers);
-            return -1;
-        }
-    }
-
-    free(threads);
-    free(workers);
-
-    now_ns = monotonic_ns();
-    gotc_now = read_glv_counter64(d, GLV_GOTCL(d->io.vsi_num),
-                                  GLV_GOTCH(d->io.vsi_num));
-
-    {
-        uint64_t total_ns = now_ns - start_ns;
-        uint64_t total_bytes = counter40_delta(gotc_now, gotc_start);
-        double total_s = (double)total_ns / (double)one_sec_ns;
-        double avg_gbps = total_s > 0.0 ?
-            ((double)total_bytes * 8.0) / (total_s * 1e9) : 0.0;
-
-        fprintf(stderr,
-                "[my_ice] tx-bench done: seconds=%.3f avg_Gbps=%.3f\n",
-                total_s, avg_gbps);
-    }
-
-    return 0;
 }

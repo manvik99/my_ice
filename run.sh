@@ -20,7 +20,6 @@ fi
 RUN_TAG="batch${BATCH_SIZE}"
 
 C_PERF_CSV="${ROOT}/c_${RUN_TAG}_perf.csv"
-C_METRICS_LOG="${ROOT}/c_${RUN_TAG}_metrics.log"
 C_STDOUT_LOG="${ROOT}/c_${RUN_TAG}.stdout.log"
 C_STDERR_LOG="${ROOT}/c_${RUN_TAG}.stderr.log"
 
@@ -34,7 +33,6 @@ sudo perf stat --no-big-num -x ';' \
   "${C_BIN}" "${BDF}" \
   --rx-reflect "${DURATION_S}" \
   --reflect-batch "${BATCH_SIZE}" \
-  --metrics-log "${C_METRICS_LOG}" \
   >"${C_STDOUT_LOG}" 2>"${C_STDERR_LOG}"
 
 sudo perf stat --no-big-num -x ';' \

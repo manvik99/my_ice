@@ -17,20 +17,15 @@
 #define TX_BURST_SIZE 64
 #define DEFAULT_REFLECT_BATCH 128
 #define MAX_REFLECT_BATCH 256
-#define MAX_HOT_REFLECT_BATCH 128
 #define REFLECT_TX_DOORBELL_BATCH 256U
-#define TX_RS_THRESH 128
+#define TX_RS_THRESH 256
 #define ICE_PKT_BUF_DATA_SIZE \
     ((ICE_RX_BUF_SIZE > ICE_TX_PKT_BUF_SIZE) ? ICE_RX_BUF_SIZE : ICE_TX_PKT_BUF_SIZE)
-#define ICE_REFLECT_POOL_EXTRA MAX_REFLECT_BATCH
+#define ICE_PKT_BUF_INVALID_IDX UINT32_MAX
 
 struct pkt_mempool;
 
 struct pkt_buf {
-    uint64_t buf_addr_iova;
-    struct pkt_mempool *mempool;
-    uint32_t mempool_idx;
-    uint32_t size;
     uint8_t head_room[40];
     uint8_t data[] __attribute__((aligned(64)));
 };
@@ -73,10 +68,11 @@ struct io_ring_ctx {
 
     union ice_32b_rx_flex_desc *rx_desc;
     uint64_t rx_desc_iova;
-    uint8_t *rx_bufs;
-    uint64_t rx_bufs_iova;
-    struct pkt_buf **rx_pkt_bufs;
+    uint32_t *rx_pkt_buf_idxs;
     uint16_t rx_ntc;
+    uint16_t rx_tail;
+    uint16_t rx_rearmed_pending;
+    uint32_t rx_tail_reg;
 };
 
 struct txq_ctx {
@@ -84,17 +80,17 @@ struct txq_ctx {
     uint16_t desc_count;
     struct ice_tx_desc *tx_desc;
     uint64_t tx_desc_iova;
-    uint8_t *tx_pkt_bufs;
-    uint64_t tx_pkt_iova;
     uint16_t tx_next_to_use;
     uint16_t tx_next_to_clean;
     uint16_t tx_free;
     uint16_t tx_pkts_since_rs;
-    struct pkt_buf **tx_pkt_buf_refs;
+    uint32_t *tx_pkt_buf_idxs;
     uint16_t *tx_rsq;
     uint16_t tx_rsq_count;
     uint16_t tx_rsq_pidx;
     uint16_t tx_rsq_cidx;
+    uint32_t dbell_reg;
+    uint32_t head_reg;
 };
 
 struct ice_vfio_dev {
@@ -104,28 +100,19 @@ struct ice_vfio_dev {
     int group_id;
     int huge_fd;
     char huge_path[PATH_MAX];
-    char metrics_log_path[PATH_MAX];
     uint8_t *bar0;
     size_t bar0_size;
     size_t huge_alloc_size;
-    uint16_t txq_count;
-    uint16_t txq_alloc_count;
+    bool pin_cpus;
     uint16_t tx_desc_count;
-    struct txq_ctx *txqs;
+    uint16_t reflect_batch;
+    struct txq_ctx txq;
 
     struct dma_block dma;
     struct aq_ring_ctx atq;
     struct aq_ring_ctx arq;
     struct io_ring_ctx io;
     struct pkt_mempool reflect_pool;
-};
-
-struct rx_reflect_metrics {
-    double seconds_total;
-    double tx_mpps;
-    double rx_mpps;
-    double tx_l2_gbps;
-    double rx_l2_gbps;
 };
 
 #endif

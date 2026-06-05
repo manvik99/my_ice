@@ -20,6 +20,7 @@ void ice_vfio_dev_init(struct ice_vfio_dev *dev)
     dev->group_fd = -1;
     dev->device_fd = -1;
     dev->huge_fd = -1;
+    dev->reflect_batch = DEFAULT_REFLECT_BATCH;
 }
 
 int ice_vfio_open(struct ice_vfio_dev *dev, const char *pci_bdf)
@@ -53,8 +54,6 @@ int ice_vfio_init(struct ice_vfio_dev *dev)
 
 void ice_vfio_close(struct ice_vfio_dev *dev)
 {
-    uint16_t i;
-
     if (dev->bar0 && dev->bar0 != MAP_FAILED)
         munmap(dev->bar0, dev->bar0_size);
 
@@ -78,11 +77,8 @@ void ice_vfio_close(struct ice_vfio_dev *dev)
         close(dev->huge_fd);
     if (dev->huge_path[0] != '\0')
         unlink(dev->huge_path);
-    free(dev->io.rx_pkt_bufs);
+    free(dev->io.rx_pkt_buf_idxs);
     free(dev->reflect_pool.free_ring);
-    for (i = 0; i < dev->txq_alloc_count; i++) {
-        free(dev->txqs[i].tx_pkt_buf_refs);
-        free(dev->txqs[i].tx_rsq);
-    }
-    free(dev->txqs);
+    free(dev->txq.tx_pkt_buf_idxs);
+    free(dev->txq.tx_rsq);
 }
