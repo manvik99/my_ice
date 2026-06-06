@@ -16,12 +16,12 @@ void pkt_pool_init(struct ice_vfio_dev *d);
 
 static inline struct pkt_buf *pkt_pool_get_entry(const struct pkt_mempool *pool, uint32_t idx)
 {
-    return (struct pkt_buf *)(pool->base + (size_t)idx * pool->entry_size);
+    return (struct pkt_buf *)(pool->base + (size_t)idx * ICE_PKT_BUF_ENTRY_SIZE);
 }
 
 static inline uint64_t pkt_pool_get_data_iova(const struct pkt_mempool *pool, uint32_t idx)
 {
-    return pool->base_iova + (uint64_t)idx * pool->entry_size + offsetof(struct pkt_buf, data);
+    return pool->base_iova + (uint64_t)idx * ICE_PKT_BUF_ENTRY_SIZE + offsetof(struct pkt_buf, data);
 }
 
 static inline uint32_t pkt_pool_pop_idx_noinit(struct pkt_mempool *pool)
