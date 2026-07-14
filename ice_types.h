@@ -26,8 +26,7 @@
 struct pkt_mempool;
 
 struct pkt_buf {
-    uint8_t head_room[40];
-    uint8_t data[] __attribute__((aligned(64)));
+    uint8_t data[ICE_PKT_BUF_DATA_SIZE] __attribute__((aligned(64)));
 };
 
 struct pkt_mempool {
