@@ -1,5 +1,8 @@
 # my_ice Driver Workflow Guide
 
+> Historical C-driver workflow. It describes removed modes and a pre-split
+> source layout; use the current `--rx-reflect` path instead.
+
 ## What this program is
 
 `my_ice` is a small userspace Intel E800-series (`ice`) NIC driver prototype built directly on top of:

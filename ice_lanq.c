@@ -639,8 +639,10 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     uint64_t rx_bytes = 0;
     uint64_t tx_pkts = 0;
     uint64_t tx_bytes = 0;
+    uint64_t rx_oversize_drops = 0;
     uint64_t start_ns;
     uint64_t end_ns;
+    uint64_t active_elapsed_ns;
     uint32_t time_check_countdown = 0;
     struct pkt_mempool *pool = &d->reflect_pool;
     struct reflect_l2_ctx l2_ctx;
@@ -758,6 +760,12 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
                 uint32_t completed_buf_idx = completed_buf_idxs[i];
                 uint16_t completed_len = completed_lens[i];
 
+                if (unlikely(!ice_reflect_pkt_len_fits(completed_len))) {
+                    /* The Rx descriptor has already been rearmed; recycle only the old slot. */
+                    pkt_pool_push_idx(pool, completed_buf_idx);
+                    rx_oversize_drops++;
+                    continue;
+                }
                 if (completed_len < 16) {
                     pkt_pool_push_idx(pool, completed_buf_idx);
                     continue;
@@ -812,18 +820,21 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
 
     if (tx_pkts_pending_db != 0)
         flush_reflect_tx_batch(d, q, &tx_pkts_pending_db);
+    /* Include final submitted packets, but exclude bounded completion cleanup. */
+    active_elapsed_ns = monotonic_ns() - start_ns;
 
     flush_rx_rearmed_tail(d);
     (void)tx_wait_drain(d, q, 1000);
     tx_update_free(d, q);
 
     MY_ICE_REPORT(
-        "[my_ice] rx-reflect done: seconds=%.6f tx_l2_gbps=%.6f rx_l2_gbps=%.6f tx_mpps=%.6f rx_mpps=%.6f\n",
-        (double)timeout_ms / 1000.0,
-        bytes_ns_to_gbps(tx_bytes, (uint64_t)timeout_ms * 1000000ULL),
-        bytes_ns_to_gbps(rx_bytes, (uint64_t)timeout_ms * 1000000ULL),
-        pkts_ns_to_mpps(tx_pkts, (uint64_t)timeout_ms * 1000000ULL),
-        pkts_ns_to_mpps(rx_pkts, (uint64_t)timeout_ms * 1000000ULL));
+        "[my_ice] rx-reflect done: seconds=%.6f tx_l2_gbps=%.6f rx_l2_gbps=%.6f tx_mpps=%.6f rx_mpps=%.6f oversize_drops=%llu\n",
+        (double)active_elapsed_ns / (double)NS_PER_S,
+        bytes_ns_to_gbps(tx_bytes, active_elapsed_ns),
+        bytes_ns_to_gbps(rx_bytes, active_elapsed_ns),
+        pkts_ns_to_mpps(tx_pkts, active_elapsed_ns),
+        pkts_ns_to_mpps(rx_pkts, active_elapsed_ns),
+        (unsigned long long)rx_oversize_drops);
 
 out:
     free(completed_lens);

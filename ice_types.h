@@ -23,6 +23,12 @@
     ((ICE_RX_BUF_SIZE > ICE_TX_PKT_BUF_SIZE) ? ICE_RX_BUF_SIZE : ICE_TX_PKT_BUF_SIZE)
 #define ICE_PKT_BUF_INVALID_IDX UINT32_MAX
 
+/* The reflector may only read or transmit bytes backed by one packet slot. */
+static inline bool ice_reflect_pkt_len_fits(uint16_t pkt_len)
+{
+    return pkt_len <= ICE_PKT_BUF_DATA_SIZE;
+}
+
 struct pkt_mempool;
 
 struct pkt_buf {

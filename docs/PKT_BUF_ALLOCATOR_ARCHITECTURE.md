@@ -10,7 +10,7 @@ tracks which pooled packet buffers are free.
 If you want the full RX/TX reflect datapath around this allocator, also read:
 
 - [`RX_REFLECT_BATCHING_DEEP_DIVE.md`](RX_REFLECT_BATCHING_DEEP_DIVE.md)
-- [`DRIVER_WORKFLOW.md`](DRIVER_WORKFLOW.md)
+- [archived driver workflow](archive/DRIVER_WORKFLOW.md)
 
 ## 1. Why This Allocator Exists
 

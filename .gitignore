@@ -1,3 +1,4 @@
 my_ice
 build/
 target/
+*__pycache__*
