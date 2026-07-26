@@ -13,7 +13,7 @@
 static void print_usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s <BDF> --rx-reflect [seconds] [--tx-desc-count <n>] [--reflect-batch <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]]\n",
+            "Usage: %s <BDF> --rx-reflect [seconds] [--tx-desc-count <n>] [--reflect-batch <n>] [--pin-cpus] [--dump-topo] [--qparent-teid <hex>] [--hugepages [--hugepage-dir <dir>]] [--analysis-warmup-batches <n> --analysis-samples <n>]\n",
             prog);
     fprintf(stderr, "Example: %s 0000:17:00.0 --rx-reflect 60\n", prog);
 }
@@ -32,6 +32,9 @@ int main(int argc, char **argv)
     uint16_t reflect_batch = DEFAULT_REFLECT_BATCH;
     uint32_t qparent_override = 0;
     int rx_reflect_timeout_s = 30;
+    struct ice_analysis_config analysis = {0};
+    bool analysis_option_seen = false;
+    bool analysis_await_completion = false;
     int rc = EXIT_FAILURE;
     int i;
 
@@ -99,6 +102,25 @@ int main(int argc, char **argv)
             }
             reflect_batch = (uint16_t)v;
             i += 2;
+        } else if (strcmp(argv[i], "--analysis-warmup-batches") == 0 ||
+                   strcmp(argv[i], "--analysis-samples") == 0) {
+            int v;
+            bool is_samples = strcmp(argv[i], "--analysis-samples") == 0;
+
+            if (i + 1 >= argc || parse_int_range(argv[i + 1], 0, 1000000, &v) < 0) {
+                fprintf(stderr, "%s requires an integer in 0..1000000\n", argv[i]);
+                return EXIT_FAILURE;
+            }
+            if (is_samples)
+                analysis.samples = (uint32_t)v;
+            else
+                analysis.warmup_batches = (uint32_t)v;
+            analysis_option_seen = true;
+            i += 2;
+        } else if (strcmp(argv[i], "--analysis-await-completion") == 0) {
+            analysis_await_completion = true;
+            analysis_option_seen = true;
+            i++;
         } else if (strcmp(argv[i], "--pin-cpus") == 0) {
             pin_cpus = true;
             i++;
@@ -126,6 +148,24 @@ int main(int argc, char **argv)
         fprintf(stderr, "the only supported mode is --rx-reflect [seconds]\n");
         return EXIT_FAILURE;
     }
+#if defined(MY_ICE_ANALYSIS)
+    analysis.enabled = analysis_option_seen;
+    if (analysis.enabled && analysis.samples == 0) {
+        fprintf(stderr, "--analysis-samples must be greater than zero\n");
+        return EXIT_FAILURE;
+    }
+    if (analysis_await_completion) {
+        fprintf(stderr,
+                "--analysis-await-completion is not available: only the submission region is supported\n");
+        return EXIT_FAILURE;
+    }
+#else
+    if (analysis_option_seen) {
+        (void)analysis_await_completion;
+        fprintf(stderr, "analysis options require an ANALYSIS=1 build\n");
+        return EXIT_FAILURE;
+    }
+#endif
 
     d.pin_cpus = pin_cpus;
     d.tx_desc_count = tx_desc_count;
@@ -148,7 +188,7 @@ int main(int argc, char **argv)
         goto out;
     }
 
-    if (run_rx_reflect(&d, rx_reflect_timeout_s * 1000, reflect_batch) < 0) {
+    if (run_rx_reflect(&d, rx_reflect_timeout_s * 1000, reflect_batch, &analysis) < 0) {
         fprintf(stderr, "[my_ice] error: rx-reflect failed\n");
         goto out;
     }

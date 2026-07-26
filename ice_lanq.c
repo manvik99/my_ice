@@ -625,8 +625,13 @@ static inline void rewrite_reflect_l2(uint8_t *data, const struct reflect_l2_ctx
 #endif
 }
 
-int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batch)
+int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batch,
+                   const struct ice_analysis_config *analysis)
 {
+    bool analysis_enabled = analysis && analysis->enabled;
+    uint64_t analysis_next_id = 0;
+    uint32_t analysis_warmup_accepted = 0;
+    uint32_t analysis_accepted = 0;
     uint32_t rx_alloc;
     uint32_t tx_alloc;
 #if MY_ICE_ENABLE_INFO
@@ -654,6 +659,12 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     maybe_pin_runtime_thread(d, "rx-reflect");
     if (reflect_batch > MAX_REFLECT_BATCH)
         reflect_batch = MAX_REFLECT_BATCH;
+    if (analysis_enabled && reflect_batch != REFLECT_TX_DOORBELL_BATCH) {
+        fprintf(stderr,
+                "[my_ice-analysis] analysis requires --reflect-batch %u so each accepted region includes its doorbell\n",
+                REFLECT_TX_DOORBELL_BATCH);
+        return -1;
+    }
     d->reflect_batch = reflect_batch;
 
     completed_buf_idxs = calloc(reflect_batch, sizeof(*completed_buf_idxs));
@@ -723,6 +734,24 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
     for (;;) {
         bool rx_seen = false;
         bool stalled = false;
+        bool analysis_warmup = false;
+        bool analysis_measured = false;
+        uint64_t analysis_sample_id = 0;
+
+        /*
+         * A candidate must begin with no staged doorbell work.  Starting the
+         * marker here keeps the capacity-refresh branch inside the region.
+         */
+        if (analysis_enabled && tx_pkts_pending_db == 0 &&
+            q->tx_free >= reflect_batch && pool->free_count >= reflect_batch) {
+            if (analysis_warmup_accepted < analysis->warmup_batches) {
+                analysis_warmup = true;
+            } else if (analysis_accepted < analysis->samples) {
+                analysis_measured = true;
+                analysis_sample_id = analysis_next_id++;
+                ice_analysis_marker_begin(analysis_sample_id, reflect_batch);
+            }
+        }
 
         if (q->tx_free < reflect_batch)
             tx_update_free(d, q);
@@ -788,6 +817,35 @@ int run_rx_reflect(struct ice_vfio_dev *d, int timeout_ms, uint16_t reflect_batc
                 tx_pkts_pending_db = (uint16_t)(tx_pkts_pending_db + sent);
                 if (tx_pkts_pending_db >= tx_doorbell_batch)
                     flush_reflect_tx_batch(d, q, &tx_pkts_pending_db);
+            }
+
+            if (analysis_warmup || analysis_measured) {
+                enum ice_analysis_outcome outcome = ICE_ANALYSIS_ACCEPTED;
+
+                if (rc < 0)
+                    outcome = ICE_ANALYSIS_REJECT_ERROR;
+                else if (ready != (int)reflect_batch)
+                    outcome = ICE_ANALYSIS_REJECT_PARTIAL_RX;
+                else if (sent != reflect_batch)
+                    outcome = ICE_ANALYSIS_REJECT_PACKET;
+                else if (tx_pkts_pending_db != 0)
+                    outcome = ICE_ANALYSIS_REJECT_PENDING_DOORBELL;
+
+                if (analysis_measured) {
+                    ice_analysis_marker_end(analysis_sample_id, reflect_batch, outcome);
+                    if (outcome != ICE_ANALYSIS_ACCEPTED)
+                        ice_analysis_marker_rejected(analysis_sample_id, outcome);
+                    ice_analysis_record(stderr, analysis_sample_id, analysis_warmup_accepted,
+                                        reflect_batch, outcome);
+                    if (outcome == ICE_ANALYSIS_ACCEPTED)
+                        analysis_accepted++;
+                } else if (outcome == ICE_ANALYSIS_ACCEPTED) {
+                    analysis_warmup_accepted++;
+                }
+
+                if (analysis_measured && outcome == ICE_ANALYSIS_ACCEPTED &&
+                    analysis_accepted == analysis->samples)
+                    break;
             }
 
             if (rc < 0)
